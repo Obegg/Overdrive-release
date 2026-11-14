@@ -124,7 +124,12 @@ object KeyMapDispatcher {
      *  doubleWindowMs is the user-tunable single-vs-double disambiguation window
      *  (falls back to DOUBLE_WINDOW_MS when unset), captured per-snapshot so a live
      *  edit propagates on the next refresh without a restart. */
-    private class Snapshot(val enabled: Boolean, val bindings: List<JSONObject>, val doubleWindowMs: Long)
+    private class Snapshot(
+        val enabled: Boolean,
+        val pausedByServiceMode: Boolean,
+        val bindings: List<JSONObject>,
+        val doubleWindowMs: Long,
+    )
 
     @Volatile private var cache: Snapshot? = null
     @Volatile private var foregroundPackage: String? = null
@@ -402,6 +407,15 @@ object KeyMapDispatcher {
      * @param repeatCount KeyEvent.getRepeatCount() (>0 ⇒ held → long-press)
      */
     fun onKey(keyCode: Int, isDown: Boolean, repeatCount: Int): Boolean {
+        // Service Mode must let the OEM receive the complete physical key stream.
+        // Check this before capture mode or any binding logic: returning false for
+        // both DOWN and UP preserves the native button behaviour while paused.
+        val serviceModeSnapshot = cache
+        if (serviceModeSnapshot?.pausedByServiceMode == true) {
+            maybeRefresh()
+            return false
+        }
+
         // Capture mode: the Key Mapping "press a button to capture it" box (in the
         // WebView) can't see hardware keys — they arrive HERE, not as WebView DOM
         // keydown. While the page has armed capture, forward the keycode into the
@@ -841,13 +855,31 @@ object KeyMapDispatcher {
     private fun refresh() {
         try {
             UnifiedConfigManager.forceReload()
+            val config = UnifiedConfigManager.loadConfig()
             val enabled = UnifiedConfigManager.isKeymapEnabled()
+            val serviceMode = config.optJSONObject("serviceMode")
+            val disabledFeatures = serviceMode?.optJSONArray("disabledFeatures")
+            var pausedByServiceMode = false
+            if (serviceMode != null && serviceMode.optBoolean("enabled", false) &&
+                !serviceMode.optBoolean("ending", false) && disabledFeatures != null) {
+                for (index in 0 until disabledFeatures.length()) {
+                    if (disabledFeatures.optString(index) == "keymap") {
+                        pausedByServiceMode = true
+                        break
+                    }
+                }
+            }
             val arr = UnifiedConfigManager.getKeymapBindings()
             val list = ArrayList<JSONObject>(arr.length())
             for (i in 0 until arr.length()) {
                 arr.optJSONObject(i)?.let { list.add(it) }
             }
-            cache = Snapshot(enabled, list, UnifiedConfigManager.getKeymapDoubleTapWindowMs())
+            cache = Snapshot(
+                enabled,
+                pausedByServiceMode,
+                list,
+                UnifiedConfigManager.getKeymapDoubleTapWindowMs(),
+            )
             // Lazily toggle the instant-propagation watcher off this refresh so a
             // disabled feature holds no inotify watch (zero observer-thread wakes)
             // while an enabled one still gets the moment-the-daemon-writes push.
@@ -865,7 +897,7 @@ object KeyMapDispatcher {
             // enabled long, then drop any tracked entry outside it (all of them when
             // the feature is now disabled). Guarded by `this`, same monitor as onKey.
             synchronized(this) {
-                if (!enabled) {
+                if (!enabled || pausedByServiceMode) {
                     pending.clear(); pendingEpoch.clear(); suppressLongUntilUp.clear()
                     // Drop DOWN timestamps and the completed-cycle flags too: a
                     // disabled feature must carry no stale burst-coalesce gap or

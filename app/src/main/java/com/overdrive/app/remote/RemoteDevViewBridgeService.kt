@@ -229,6 +229,16 @@ class RemoteDevViewBridgeService : Service() {
                             ) {
                                 throw IllegalArgumentException("Invalid launcher component state")
                             }
+                            if (requestedState == PackageManager.COMPONENT_ENABLED_STATE_DISABLED && request.has("endsAtEpochMs")) {
+                                ServiceModeRecoveryReceiver.schedule(
+                                    application,
+                                    request.optLong("endsAtEpochMs", 0L),
+                                    request.optLong("endsAtElapsedRealtimeMs", 0L),
+                                    request.optInt("bootCount", -1),
+                                )
+                            } else {
+                                ServiceModeRecoveryReceiver.cancel(application)
+                            }
                             packageManager.setComponentEnabledSetting(
                                 launcher,
                                 requestedState,

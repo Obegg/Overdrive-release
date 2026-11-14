@@ -6784,9 +6784,9 @@
     "schedule_desc": "Start Service Mode immediately. Everything selected below will be restored automatically at the end of the chosen date, or sooner when you press End now.",
     "end_date": "End date",
     "visibility_title": "Hide apps from the head unit",
-    "visibility_desc": "OverDrive stays installed and its background daemon keeps the expiry timer running. Only its launcher entry is hidden.",
-    "hide_overdrive": "Hide OverDrive from the launcher",
-    "hide_overdrive_desc": "The WebUI remains available so you can end Service Mode early.",
+    "visibility_desc": "OverDrive stays installed and its background daemon keeps the expiry timer running. The optional launcher alias is hidden; MainActivity remains available as a recovery entry.",
+    "hide_overdrive": "Hide the optional OverDrive launcher alias",
+    "hide_overdrive_desc": "MainActivity remains available as a recovery entry; the WebUI also remains available to end Service Mode early.",
     "choose_apps": "Installed apps",
     "choose_apps_desc": "Select third-party launchable apps to hide temporarily.",
     "refresh_apps": "Refresh",
@@ -6808,7 +6808,7 @@
     "end_failed": "Could not restore everything yet.",
     "started": "Service Mode started.",
     "ended": "Service Mode ended. Apps and features have been restored.",
-    "detail_overdrive": "OverDrive launcher entry is hidden",
+    "detail_overdrive": "OverDrive launcher alias is hidden (MainActivity remains available)",
     "detail_app": "Hidden app: {package}",
     "detail_feature": "Paused feature: {feature}"
   }

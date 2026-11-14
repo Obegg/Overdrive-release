@@ -2594,7 +2594,12 @@ public class StatusOverlayService extends Service {
     }
 
     private Notification buildNotification() {
-        Intent intent = getPackageManager().getLaunchIntentForPackage(getPackageName());
+        // The Service Mode launcher alias may be disabled while this foreground
+        // service remains alive. getLaunchIntentForPackage() can then return null;
+        // use the stable activity component directly so notification creation can
+        // never fail because a launcher entry is temporarily hidden.
+        Intent intent = new Intent(this, com.overdrive.app.ui.MainActivity.class);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
         PendingIntent pi = PendingIntent.getActivity(this, 0, intent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         Context textContext = themedContext();

@@ -279,6 +279,10 @@
             android:configChanges="keyboardHidden"
             android:launchMode="singleTop">
             <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
                 <action android:name="com.overdrive.app.START_LOCATION_ACTIVITY" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
@@ -636,6 +640,17 @@
             android:name="com.overdrive.app.remote.RemoteDevViewBridgeService"
             android:exported="true"
             android:permission="android.permission.DUMP" />
+
+        <!-- App-process expiry fallback for the hideable launcher alias. -->
+        <receiver
+            android:name="com.overdrive.app.remote.ServiceModeRecoveryReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
         <!-- Browser push-to-talk receiver. The shell daemon launches this
              app-process service and streams authenticated PCM over a

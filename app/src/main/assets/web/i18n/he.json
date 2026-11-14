@@ -33,7 +33,8 @@
     "communicate_title": "תקשורת - OverDrive",
     "assistant_title": "עוזר - OverDrive",
     "parking_title": "חניה - OverDrive",
-    "safekeep_title": "SafeKeep - OverDrive"
+    "safekeep_title": "SafeKeep - OverDrive",
+    "service_mode_title": "מצב שירות - OverDrive"
   },
   "nav": {
     "dashboard": "לוח בקרה",
@@ -71,7 +72,8 @@
     "parking": "חניה",
     "safekeep": "SafeKeep",
     "remote_access": "קרבה",
-    "remote_dev_view": "תצוגת מפתח מרחוק"
+    "remote_dev_view": "תצוגת מפתח מרחוק",
+    "service_mode": "מצב שירות"
   },
   "parking": {
     "page_title": "חניה",
@@ -6724,5 +6726,46 @@
     "time_minutes": "לפני {n} דק'",
     "time_hours": "לפני {n} שע'",
     "time_days": "לפני {n} ימים"
+  },
+  "service_mode": {
+    "page_title": "מצב שירות",
+    "header_badge": "הגנה במהלך ביקור במוסך",
+    "status_inactive": "מצב השירות כבוי",
+    "status_inactive_desc": "האפליקציות ו-OverDrive זמינים כרגיל.",
+    "status_active": "מצב השירות פעיל",
+    "status_until": "שחזור אוטומטי: {date}",
+    "status_restoring": "משחזר…",
+    "status_restoring_desc": "הדמון מנסה שוב לשחזר חבילות שטרם שוחזרו.",
+    "schedule_title": "תזמון תאריך הסיום",
+    "schedule_desc": "מצב השירות מתחיל מיד. כל מה שנבחר למטה ישוחזר אוטומטית בסוף התאריך שנבחר, או מוקדם יותר בלחיצה על סיים עכשיו.",
+    "end_date": "תאריך סיום",
+    "visibility_title": "הסתרת אפליקציות ממערכת הרכב",
+    "visibility_desc": "OverDrive נשאר מותקן והדמון ברקע ממשיך להפעיל את טיימר התפוגה. רק קיצור ההפעלה הנפרד מוסתר; MainActivity נשארת זמינה לשחזור.",
+    "hide_overdrive": "הסתר את קיצור ההפעלה הנפרד של OverDrive",
+    "hide_overdrive_desc": "MainActivity נשארת זמינה ככניסה לשחזור, וממשק האינטרנט מאפשר לסיים את מצב השירות מוקדם.",
+    "choose_apps": "אפליקציות מותקנות",
+    "choose_apps_desc": "בחר אפליקציות צד שלישי שניתן להפעיל כדי להסתיר אותן זמנית.",
+    "refresh_apps": "רענן",
+    "loading_apps": "טוען אפליקציות מותקנות…",
+    "apps_failed": "טעינת האפליקציות נכשלה.",
+    "no_apps": "לא נמצאו אפליקציות משתמש מתאימות שניתן להפעיל.",
+    "features_title": "השבתה זמנית של תכונות OverDrive",
+    "features_desc": "בחירות אלה משהות את התכונה שנבחרה בלי למחוק את ההגדרות או התצורה השמורה.",
+    "feature_automations": "אוטומציות",
+    "feature_automations_desc": "השהה הרצות אוטומטיות וידניות של אוטומציות, כולל קבוצות פעולות.",
+    "feature_keymap": "מיפוי מקשים",
+    "feature_keymap_desc": "השהה פעולות ממקשים פיזיים בלי לחסום את פעולת המקשים המקורית של הרכב.",
+    "warning": "בחר רק אפליקציות שבטוח להשבית זמנית. הימנע ממפעילי מסך הבית, מקלדות ואפליקציות הנדרשות לשליטה ברכב. אפליקציות שכבר הושבתו לפני הפעלת מצב השירות יישארו מושבתות בסיומו.",
+    "start_now": "התחל עכשיו",
+    "end_now": "סיים עכשיו",
+    "choose_end_date": "בחר תאריך סיום תקין.",
+    "end_date_future": "תאריך הסיום חייב להיות היום או מאוחר יותר.",
+    "start_failed": "הפעלת מצב השירות נכשלה.",
+    "end_failed": "עדיין לא ניתן לשחזר את כל הפריטים.",
+    "started": "מצב השירות הופעל.",
+    "ended": "מצב השירות הסתיים. האפליקציות והתכונות שוחזרו.",
+    "detail_overdrive": "קיצור ההפעלה של OverDrive מוסתר (MainActivity נשארת זמינה)",
+    "detail_app": "אפליקציה מוסתרת: {package}",
+    "detail_feature": "תכונה מושהית: {feature}"
   }
 }

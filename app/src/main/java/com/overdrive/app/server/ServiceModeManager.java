@@ -2,6 +2,8 @@ package com.overdrive.app.server;
 
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.os.SystemClock;
+import android.provider.Settings;
 
 import com.overdrive.app.automation.Automations;
 import com.overdrive.app.config.UnifiedConfigManager;
@@ -85,7 +87,7 @@ public final class ServiceModeManager {
         long endsAt = state.optLong("endsAtEpochMs", 0L);
         boolean enabled = state.optBoolean("enabled", false);
         boolean restoring = enabled && (state.optBoolean("ending", false)
-                || endsAt <= System.currentTimeMillis());
+                || isExpired(state));
 
         JSONObject result = new JSONObject();
         result.put("success", true);
@@ -123,9 +125,8 @@ public final class ServiceModeManager {
         synchronized (LOCK) {
             JSONObject existing = readSection();
             if (existing.optBoolean("enabled", false)) {
-                long currentEnd = existing.optLong("endsAtEpochMs", 0L);
                 if (existing.optBoolean("ending", false)
-                        || currentEnd <= System.currentTimeMillis()) {
+                        || isExpired(existing)) {
                     JSONObject restored = restoreLocked(existing);
                     if (!restored.optBoolean("success", false)) {
                         restored.put("error",
@@ -190,11 +191,13 @@ public final class ServiceModeManager {
             state.put("ending", false);
             state.put("startedAtEpochMs", now);
             state.put("endsAtEpochMs", endsAtEpochMs);
+            setMonotonicDeadline(state, endsAtEpochMs - now);
             state.put("hideOverdrive", hideOverdrive);
             state.put("hiddenPackages", hiddenPackages);
             state.put("disabledFeatures", disabledFeatures);
             state.put("originalStates", originalStates);
             state.put("launcherOriginalState", launcherOriginalState);
+            state.put("launcherRecoveryScheduledEndsAtEpochMs", 0L);
             state.put("lastError", "");
 
             // Persist original state before the first external package-manager action.
@@ -233,9 +236,9 @@ public final class ServiceModeManager {
                     return;
                 }
 
-                long endsAt = state.optLong("endsAtEpochMs", 0L);
+                if (!state.optBoolean("ending", false)) ensureMonotonicDeadline(state);
                 if (state.optBoolean("ending", false)
-                        || endsAt <= System.currentTimeMillis()) {
+                        || isExpired(state)) {
                     if (!state.optBoolean("ending", false)) {
                         state.put("ending", true);
                         persist(state);
@@ -310,16 +313,24 @@ public final class ServiceModeManager {
             int currentState = getLauncherStateFromAppProcess();
             if (currentState < 0) {
                 failures.add("OverDrive launcher: app-process bridge is unavailable");
-            } else if (currentState != LAUNCHER_DISABLED) {
+            } else {
                 int originalState = state.optInt("launcherOriginalState", -1);
-                if (originalState < 0) {
+                if (currentState != LAUNCHER_DISABLED && originalState < 0) {
                     state.put("launcherOriginalState", currentState);
                     persist(state);
                 }
-                if (!setLauncherStateInAppProcess(LAUNCHER_DISABLED)) {
-                    failures.add("OverDrive launcher: app-process component update failed");
-                } else {
-                    logger.info("Hidden OverDrive launcher alias in the app process");
+                boolean needsRecoverySchedule = currentState != LAUNCHER_DISABLED
+                        || state.optLong("launcherRecoveryScheduledEndsAtEpochMs", 0L)
+                        != state.optLong("endsAtEpochMs", 0L);
+                if (needsRecoverySchedule) {
+                    if (!setLauncherStateInAppProcess(LAUNCHER_DISABLED, state)) {
+                        failures.add("OverDrive launcher: app-process component update failed");
+                    } else {
+                        state.put("launcherRecoveryScheduledEndsAtEpochMs",
+                                state.optLong("endsAtEpochMs", 0L));
+                        persist(state);
+                        logger.info("Hidden OverDrive launcher alias in the app process");
+                    }
                 }
             }
         }
@@ -373,8 +384,7 @@ public final class ServiceModeManager {
             int currentState = getLauncherStateFromAppProcess();
             if (currentState < 0) {
                 failures.add("OverDrive launcher: app-process bridge is unavailable");
-            } else if (currentState != launcherOriginalState
-                    && !setLauncherStateInAppProcess(launcherOriginalState)) {
+            } else if (!setLauncherStateInAppProcess(launcherOriginalState, null)) {
                 failures.add("OverDrive launcher: app-process component restore failed");
             }
         }
@@ -385,11 +395,14 @@ public final class ServiceModeManager {
             cleared.put("ending", false);
             cleared.put("startedAtEpochMs", 0L);
             cleared.put("endsAtEpochMs", 0L);
+            cleared.put("endsAtElapsedRealtimeMs", 0L);
+            cleared.put("bootCount", -1);
             cleared.put("hideOverdrive", false);
             cleared.put("hiddenPackages", new JSONArray());
             cleared.put("disabledFeatures", new JSONArray());
             cleared.put("originalStates", new JSONArray());
             cleared.put("launcherOriginalState", -1);
+            cleared.put("launcherRecoveryScheduledEndsAtEpochMs", 0L);
             cleared.put("lastError", "");
             persist(cleared);
             refreshFeatureGates(cleared);
@@ -446,11 +459,17 @@ public final class ServiceModeManager {
         }
     }
 
-    private static boolean setLauncherStateInAppProcess(int state) {
+    private static boolean setLauncherStateInAppProcess(int state, JSONObject modeState) {
         try {
             JSONObject request = new JSONObject()
                     .put("command", "serviceModeLauncher")
                     .put("state", state);
+            if (modeState != null) {
+                request.put("endsAtEpochMs", modeState.optLong("endsAtEpochMs", 0L));
+                request.put("endsAtElapsedRealtimeMs",
+                        modeState.optLong("endsAtElapsedRealtimeMs", 0L));
+                request.put("bootCount", modeState.optInt("bootCount", -1));
+            }
             RemoteDevViewBridgeClient.Response response =
                     APP_BRIDGE.sendWithServiceStart(request, 1000, 3000, true);
             return response != null && response.metadata.optBoolean("success", false)
@@ -458,6 +477,45 @@ public final class ServiceModeManager {
         } catch (Throwable error) {
             logger.warn("Could not update launcher state in app process: " + error.getMessage());
             return false;
+        }
+    }
+
+    /** Store a same-boot monotonic deadline alongside the local-date epoch deadline. */
+    private static void setMonotonicDeadline(JSONObject state, long remainingMs)
+            throws JSONException {
+        int bootCount = currentBootCount();
+        state.put("bootCount", bootCount);
+        state.put("endsAtElapsedRealtimeMs", bootCount >= 0
+                ? SystemClock.elapsedRealtime() + Math.max(0L, remainingMs) : 0L);
+    }
+    /** Rebase the monotonic deadline after reboot or for state written by an older build. */
+    private static void ensureMonotonicDeadline(JSONObject state) throws Exception {
+        int bootCount = currentBootCount();
+        if (bootCount < 0) return;
+        if (state.optInt("bootCount", -1) != bootCount
+                || state.optLong("endsAtElapsedRealtimeMs", 0L) <= 0L) {
+            state.put("launcherRecoveryScheduledEndsAtEpochMs", 0L);
+            setMonotonicDeadline(state,
+                    state.optLong("endsAtEpochMs", 0L) - System.currentTimeMillis());
+            persist(state);
+        }
+    }
+    /** Prefer elapsedRealtime within the same boot; wall time is only the reboot fallback. */
+    private static boolean isExpired(JSONObject state) {
+        int bootCount = currentBootCount();
+        long deadline = state.optLong("endsAtElapsedRealtimeMs", 0L);
+        if (bootCount >= 0 && state.optInt("bootCount", -1) == bootCount && deadline > 0L) {
+            return SystemClock.elapsedRealtime() >= deadline;
+        }
+        return state.optLong("endsAtEpochMs", 0L) <= System.currentTimeMillis();
+    }
+    private static int currentBootCount() {
+        try {
+            return Settings.Global.getInt(requireContext().getContentResolver(),
+                    Settings.Global.BOOT_COUNT, -1);
+        } catch (Throwable error) {
+            logger.warn("Could not read Android boot count: " + error.getMessage());
+            return -1;
         }
     }
 

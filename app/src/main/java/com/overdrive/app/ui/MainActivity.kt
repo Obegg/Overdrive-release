@@ -200,6 +200,14 @@ open class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // MainActivity remains the permanent launcher/recovery entry. If the
+        // daemon did not start or missed expiry, reconcile the hideable alias here.
+        try {
+            com.overdrive.app.remote.ServiceModeRecoveryReceiver.recoverNow(applicationContext)
+        } catch (error: Throwable) {
+            android.util.Log.w("MainActivity", "Service Mode launcher recovery deferred: ${error.message}")
+        }
+
         remoteDevSession = this is RemoteMainActivity &&
             intent?.getBooleanExtra(EXTRA_REMOTE_DEV_SESSION, false) == true
 

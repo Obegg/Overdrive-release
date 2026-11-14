@@ -997,6 +997,10 @@ public class HttpServer {
                 if (!serveStaticFile(out, "local/safekeep.html")) {
                     HttpResponse.sendError(out, 404, "safekeep.html not found");
                 }
+            } else if (pathOnly.equals("/service-mode.html") || pathOnly.equals("/service-mode")) {
+                if (!serveStaticFile(out, "local/service-mode.html")) {
+                    HttpResponse.sendError(out, 404, "service-mode.html not found");
+                }
             } else if (path.equals("/byd-cloud.html") || path.equals("/byd-cloud")) {
                 if (!serveStaticFile(out, "local/byd-cloud.html")) {
                     HttpResponse.sendError(out, 404, "byd-cloud.html not found");
