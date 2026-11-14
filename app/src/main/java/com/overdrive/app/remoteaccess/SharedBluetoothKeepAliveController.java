@@ -22,6 +22,8 @@ public final class SharedBluetoothKeepAliveController {
     private static final String OWNED = "radioOwned";
     private static final String SAFE_ZONE_DISABLED = "safeZoneDisabled";
     private static final String SAFE_ZONE_OFF_CONFIRMED = "safeZoneOffConfirmed";
+    private static final String SAFE_ZONE_MANUAL_OVERRIDE = "safeZoneManualOverride";
+    private static final String SAFE_ZONE_LOCK_CONFIRMED = "safeZoneLockConfirmed";
     private static final String SAFE_ZONE_DIRECTIVE = "safeZoneDirective";
     private static final String SAFE_ZONE_DIRECTIVE_AT = "safeZoneDirectiveAtElapsedMs";
     private static final long SAFE_ZONE_DIRECTIVE_MAX_AGE_MS = 15_000L;
@@ -55,7 +57,7 @@ public final class SharedBluetoothKeepAliveController {
         // The 10-second watchdog and settings callers do not own the camera daemon's
         // location decision. They preserve its last authenticated directive until it
         // is refreshed or its short lease expires.
-        return reconcile(context, vehicleOff, vehicleOn, forceDisable, false, false);
+        return reconcile(context, vehicleOff, vehicleOn, forceDisable, false, false, SystemClock.elapsedRealtime(), true);
     }
 
     /**
@@ -66,7 +68,7 @@ public final class SharedBluetoothKeepAliveController {
             Context context, boolean vehicleOff, boolean vehicleOn, boolean forceDisable,
             boolean safeZoneDirectiveKnown, boolean safeZoneDisable) {
         return reconcile(context, vehicleOff, vehicleOn, forceDisable,
-                safeZoneDirectiveKnown, safeZoneDisable, SystemClock.elapsedRealtime());
+                safeZoneDirectiveKnown, safeZoneDisable, SystemClock.elapsedRealtime(), true);
     }
 
     /** Timestamped form rejects delayed relay responses that predate a newer camera-daemon decision. */
@@ -74,16 +76,39 @@ public final class SharedBluetoothKeepAliveController {
             Context context, boolean vehicleOff, boolean vehicleOn, boolean forceDisable,
             boolean safeZoneDirectiveKnown, boolean safeZoneDisable,
             long safeZoneDirectiveAtElapsedMs) {
+        return reconcile(context, vehicleOff, vehicleOn, forceDisable,
+                safeZoneDirectiveKnown, safeZoneDisable, safeZoneDirectiveAtElapsedMs, true);
+    }
+
+    public static synchronized JSONObject reconcile(
+            Context context, boolean vehicleOff, boolean vehicleOn, boolean forceDisable,
+            boolean safeZoneDirectiveKnown, boolean safeZoneDisable,
+            long safeZoneDirectiveAtElapsedMs, boolean safeZoneLockConfirmed) {
         try {
             SharedPreferences lease = lease(context);
             long now = SystemClock.elapsedRealtime();
             loadSafeZoneDirective(lease, now);
             if (safeZoneDirectiveKnown && safeZoneDirectiveAtElapsedMs >= 0
                     && safeZoneDirectiveAtElapsedMs <= now
-                    && safeZoneDirectiveAtElapsedMs >= lastSafeZoneDirectiveAtElapsedMs
-                    && !writeSafeZoneDirective(lease, safeZoneDisable, safeZoneDirectiveAtElapsedMs)) {
-                lastError = "safe_zone_directive_write_failed";
-                return runtime(context);
+                    && safeZoneDirectiveAtElapsedMs >= lastSafeZoneDirectiveAtElapsedMs) {
+                boolean manualOverride = lease.getBoolean(SAFE_ZONE_MANUAL_OVERRIDE, false);
+                boolean previousLockConfirmed = lease.getBoolean(SAFE_ZONE_LOCK_CONFIRMED, false);
+                if (manualOverride && (vehicleOn || (previousLockConfirmed && !safeZoneLockConfirmed))) {
+                    if (!writeSafeZoneManualOverride(lease, false)) {
+                        lastError = "safe_zone_manual_override_write_failed";
+                        return runtime(context);
+                    }
+                    manualOverride = false;
+                }
+                if (!writeSafeZoneLockConfirmed(lease, safeZoneLockConfirmed)) {
+                    lastError = "safe_zone_lock_state_write_failed";
+                    return runtime(context);
+                }
+                boolean effectiveSafeZoneDisable = safeZoneDisable && !manualOverride;
+                if (!writeSafeZoneDirective(lease, effectiveSafeZoneDisable, safeZoneDirectiveAtElapsedMs)) {
+                    lastError = "safe_zone_directive_write_failed";
+                    return runtime(context);
+                }
             }
             boolean safeZoneDirective = lastSafeZoneDirectiveValue;
             long directiveAt = lastSafeZoneDirectiveAtElapsedMs;
@@ -209,9 +234,17 @@ public final class SharedBluetoothKeepAliveController {
                 lastError = "superseded_intent";
                 return false;
             }
+            long now = SystemClock.elapsedRealtime();
+            loadSafeZoneDirective(lease, now);
+            int power = VehiclePowerReader.readNow(context);
+            boolean manualSafeZoneOverride = enabled && power == 0
+                    && (lease.getBoolean(SAFE_ZONE_DISABLED, false)
+                    || lastSafeZoneDirectiveValue
+                    && now - lastSafeZoneDirectiveAtElapsedMs <= SAFE_ZONE_DIRECTIVE_MAX_AGE_MS);
             if (!writeSafeZoneDirective(lease, false, SystemClock.elapsedRealtime())
                     || !writeSafeZoneDisabled(lease, false)
-                    || !writeSafeZoneOffConfirmed(lease, false)) {
+                    || !writeSafeZoneOffConfirmed(lease, false)
+                    || !writeSafeZoneManualOverride(lease, manualSafeZoneOverride)) {
                 lastError = "safe_zone_lease_write_failed";
                 return false;
             }
@@ -220,7 +253,6 @@ public final class SharedBluetoothKeepAliveController {
                 lastError = "adapter_unavailable";
                 return false;
             }
-            int power = VehiclePowerReader.readNow(context);
             int state = adapter.getState();
             boolean targetAlreadyReached = enabled
                     ? state == BluetoothAdapter.STATE_ON : state == BluetoothAdapter.STATE_OFF;
@@ -268,11 +300,15 @@ public final class SharedBluetoothKeepAliveController {
             int state = adapter == null ? -1 : adapter.getState();
             boolean owned = lease.getBoolean(OWNED, false);
             boolean safeZoneDisabled = lease.getBoolean(SAFE_ZONE_DISABLED, false);
-            long directiveAt = lease.getLong(SAFE_ZONE_DIRECTIVE_AT, -1L);
-            long directiveAge = SystemClock.elapsedRealtime() - directiveAt;
-            boolean safeZoneDirective = lease.getBoolean(SAFE_ZONE_DIRECTIVE, false)
+            long now = SystemClock.elapsedRealtime();
+            loadSafeZoneDirective(lease, now);
+            long directiveAt = lastSafeZoneDirectiveAtElapsedMs;
+            long directiveAge = directiveAt < 0 ? Long.MAX_VALUE : now - directiveAt;
+            boolean safeZoneDirective = lastSafeZoneDirectiveValue
                     && directiveAt >= 0 && directiveAge >= 0
                     && directiveAge <= SAFE_ZONE_DIRECTIVE_MAX_AGE_MS;
+            boolean manualOverride = lease.getBoolean(SAFE_ZONE_MANUAL_OVERRIDE, false);
+            boolean lockConfirmed = lease.getBoolean(SAFE_ZONE_LOCK_CONFIRMED, false);
             boolean pending = owned && (safeZoneDisabled || !consent.enabled || consent.onOnly)
                     && state != BluetoothAdapter.STATE_OFF;
             result.put("enabled", consent.enabled)
@@ -281,6 +317,8 @@ public final class SharedBluetoothKeepAliveController {
                     .put("safeZoneDisabled", safeZoneDisabled)
                     .put("safeZoneDirectiveActive", safeZoneDirective)
                     .put("safeZoneDirectiveAgeMs", directiveAt < 0 ? JSONObject.NULL : Math.max(0, directiveAge))
+                    .put("safeZoneManualOverride", manualOverride)
+                    .put("safeZoneLockConfirmed", lockConfirmed)
                     .put("cleanupPending", pending)
                     .put("state", state)
                     .put("bluetoothEnabled", state == BluetoothAdapter.STATE_ON)
@@ -352,13 +390,25 @@ public final class SharedBluetoothKeepAliveController {
 
     private static boolean writeSafeZoneDirective(SharedPreferences lease, boolean disabled, long at) {
         if (at < 0) return false;
+        boolean changed = lease.getBoolean(SAFE_ZONE_DIRECTIVE, false) != disabled;
         lastSafeZoneDirectiveAtElapsedMs = at;
         lastSafeZoneDirectiveValue = disabled;
+        if (!changed) return true;
         // apply() updates the process-visible preference immediately without making
         // every 1 Hz phone observation wait for a synchronous disk commit.
         lease.edit().putBoolean(SAFE_ZONE_DIRECTIVE, disabled)
                 .putLong(SAFE_ZONE_DIRECTIVE_AT, at).apply();
         return true;
+    }
+
+    private static boolean writeSafeZoneManualOverride(SharedPreferences lease, boolean enabled) {
+        if (lease.getBoolean(SAFE_ZONE_MANUAL_OVERRIDE, false) == enabled) return true;
+        return lease.edit().putBoolean(SAFE_ZONE_MANUAL_OVERRIDE, enabled).commit();
+    }
+
+    private static boolean writeSafeZoneLockConfirmed(SharedPreferences lease, boolean confirmed) {
+        if (lease.getBoolean(SAFE_ZONE_LOCK_CONFIRMED, false) == confirmed) return true;
+        return lease.edit().putBoolean(SAFE_ZONE_LOCK_CONFIRMED, confirmed).commit();
     }
 
     private static Consent freshConsent() {

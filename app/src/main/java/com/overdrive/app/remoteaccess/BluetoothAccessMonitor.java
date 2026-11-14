@@ -45,6 +45,7 @@ public final class BluetoothAccessMonitor {
     private volatile boolean running = true;
     private volatile boolean safeZoneBluetoothDisable;
     private volatile long safeZoneBluetoothDirectiveAtElapsedMs = -1L;
+    private volatile boolean safeZoneLockConfirmed;
 
     private BluetoothAccessMonitor(Context context, JSONObject config) {
         this.config = config;
@@ -432,6 +433,7 @@ public final class BluetoothAccessMonitor {
             if (!response.optBoolean("success")) return false;
             safeZoneBluetoothDisable = response.optBoolean("safeZoneBluetoothDisable", false);
             safeZoneBluetoothDirectiveAtElapsedMs = response.optLong("safeZoneBluetoothDirectiveAtElapsedMs", -1L);
+            safeZoneLockConfirmed = response.optBoolean("safeZoneLockConfirmed", false);
             return safeZoneBluetoothDirectiveAtElapsedMs >= 0;
         } catch (Exception ignored) {
             // Daemon loss is unknown, never a departure. Only enabled ticks retry.
@@ -448,7 +450,8 @@ public final class BluetoothAccessMonitor {
         int power = VehiclePowerReader.readNow(context);
         JSONObject after = SharedBluetoothKeepAliveController.reconcile(
                 context, power == 0, power > 0, false, directiveKnown, safeZoneDisable,
-                directiveKnown ? safeZoneBluetoothDirectiveAtElapsedMs : -1L);
+                directiveKnown ? safeZoneBluetoothDirectiveAtElapsedMs : -1L,
+                safeZoneLockConfirmed);
         if (before.optBoolean("safeZoneDisabled") && !after.optBoolean("safeZoneDisabled"))
             reconnect.radioRestored();
     }

@@ -26,7 +26,8 @@ var RemoteAccess = (function () {
         'raUnlockOnArrival', 'raLockOnDeparture', 'raKeepBluetoothOn',
         'raNotifyPush', 'raNotifyTelegram', 'raAdvancedMode', 'raUnlockTrigger', 'raKeyFobEnabled', 'raKeyFobLockEnabled',
         'raKeyFobLockSamples', 'raLockWaitsForKeyAbsence',
-        'raKeyFobLockSeconds', 'raRestrictLockSafeZones', 'raRestrictUnlockSafeZones', 'raCloudFallback',
+        'raKeyFobLockSeconds', 'raRestrictLockSafeZones', 'raRestrictUnlockSafeZones',
+        'raRestrictParkedBluetoothSafeZones', 'raCloudFallback',
         'raConfirmWithVehicle', 'raRelockGraceSeconds', 'raPostLockQuietSeconds',
         'raKeyFobUnlockNear'
     ];
@@ -217,6 +218,7 @@ var RemoteAccess = (function () {
         el('raLockOnDeparture').checked = !!config.lockEnabled;
         el('raRestrictLockSafeZones').checked = config.restrictLockToOutsideSafeZones === true;
         el('raRestrictUnlockSafeZones').checked = config.restrictUnlockToOutsideSafeZones === true;
+        el('raRestrictParkedBluetoothSafeZones').checked = config.restrictParkedBluetoothToSafeZones === true;
         state.safeZoneIds = Array.isArray(config.proximitySafeZoneIds) ? config.proximitySafeZoneIds.slice(0, 10) : [];
         el('raNotifyPush').checked = !!config.notifyPush;
         el('raNotifyTelegram').checked = !!config.notifyTelegram;
@@ -271,7 +273,8 @@ var RemoteAccess = (function () {
         });
     }
     function safeZoneRestrictionsDraft() {
-        return el('raRestrictLockSafeZones').checked || el('raRestrictUnlockSafeZones').checked;
+        return el('raRestrictLockSafeZones').checked || el('raRestrictUnlockSafeZones').checked ||
+            el('raRestrictParkedBluetoothSafeZones').checked;
     }
     function syncSafeZoneSelection() {
         var choices = el('raSafeZoneChoices');
@@ -387,7 +390,7 @@ var RemoteAccess = (function () {
         var restrictLock = config.restrictLockToOutsideSafeZones === true && lockConfigured;
         var restrictUnlock = config.restrictUnlockToOutsideSafeZones === true && config.unlockEnabled === true;
         var restrictBluetooth = config.lockEnabled === true
-            && config.restrictUnlockToOutsideSafeZones === true && config.keepBluetoothOn === true;
+            && config.restrictParkedBluetoothToSafeZones === true && config.keepBluetoothOn === true;
         var active = restrictLock || restrictUnlock || restrictBluetooth;
         var geofence = state.status && state.status.safeZones || {};
         var parkedBluetooth = state.status && state.status.parkedBluetooth || {};
@@ -662,6 +665,7 @@ var RemoteAccess = (function () {
             lockEnabled: el('raLockOnDeparture').checked,
             restrictLockToOutsideSafeZones: el('raRestrictLockSafeZones').checked,
             restrictUnlockToOutsideSafeZones: el('raRestrictUnlockSafeZones').checked,
+            restrictParkedBluetoothToSafeZones: el('raRestrictParkedBluetoothSafeZones').checked,
             proximitySafeZoneIds: state.safeZoneIds.slice()
         };
         config.notifyPush = el('raNotifyPush').checked;
@@ -731,7 +735,8 @@ var RemoteAccess = (function () {
             throw new Error(tr('error_keyfob_window_range', 'Use a 5–300 second keyfob locking window in 5-second steps.'));
         if ([1, 2, 3].indexOf(config.keyFobLockSamples) < 0)
             throw new Error(tr('error_keyfob_samples', 'Choose 1, 2 or 3 keyfob absence results.'));
-        if ((config.restrictLockToOutsideSafeZones || config.restrictUnlockToOutsideSafeZones) && !config.proximitySafeZoneIds.length) {
+        if ((config.restrictLockToOutsideSafeZones || config.restrictUnlockToOutsideSafeZones ||
+                config.restrictParkedBluetoothToSafeZones) && !config.proximitySafeZoneIds.length) {
             var selectionError = new Error(tr('safe_zones_choose_required', 'Choose at least one safe location before saving a restriction.'));
             selectionError.field = 'safe_zones';
             throw selectionError;
@@ -773,6 +778,9 @@ var RemoteAccess = (function () {
             !el('raLockOnDeparture').checked && !fobLock && !el('raRestrictLockSafeZones').checked;
         el('raRestrictUnlockSafeZones').disabled = !state.ready || state.saving ||
             !el('raUnlockOnArrival').checked && !el('raRestrictUnlockSafeZones').checked;
+        el('raRestrictParkedBluetoothSafeZones').disabled = !state.ready || state.saving ||
+            (!el('raLockOnDeparture').checked || !el('raKeepBluetoothOn').checked) &&
+            !el('raRestrictParkedBluetoothSafeZones').checked;
         text('raKeyFobLockDetail', !supports('keyFob') || !supports('keyFobLock') ?
             tr('keyfob_lock_unsupported', 'Keyfob departure locking is unsupported on this car. A saved rule can be switched off.') :
             !fobDraft ? tr('keyfob_lock_requires_detection', 'Enable Keyfob detection above to use departure locking. Automatic lock must also be on.') :
@@ -1778,6 +1786,7 @@ var RemoteAccess = (function () {
             changes.keyFobLockEnabled = pending.keyFobLockEnabled;
             changes.restrictLockToOutsideSafeZones = pending.restrictLockToOutsideSafeZones;
             changes.restrictUnlockToOutsideSafeZones = pending.restrictUnlockToOutsideSafeZones;
+            changes.restrictParkedBluetoothToSafeZones = pending.restrictParkedBluetoothToSafeZones;
             changes.proximitySafeZoneIds = pending.proximitySafeZoneIds;
             changes.phones = pending.phones;
             changes.nearThreshold = pending.nearThreshold; changes.awayThreshold = pending.awayThreshold;
