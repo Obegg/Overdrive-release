@@ -3,17 +3,35 @@ package com.overdrive.app.audio;
 import android.util.Log;
 
 /**
- * JNI front-end (libvoice_frontend, SpeexDSP): the car's microphones averaged, the speaker echo
- * cancelled against the reference channels, low rumble high-passed and noise suppressed, one 10 ms
- * frame at a time. Loaded only when the car-microphone input is selected.
+ * JNI front-end (libvoice_frontend), one 10 ms frame at a time. Default (balanced): SpeexDSP's
+ * double-talk robust MDF echo canceller on the mic average, its references aligned by WebRTC AEC3's
+ * delay estimator (no fixed-tail limit on the echo delay), 200 Hz high-pass, Speex residual-echo and
+ * noise suppression; while the references are idle, a blind adaptive 2-mic beam instead. Other modes
+ * (AEC3 with its suppressor, AEC3 linear only) are for evaluation. Loaded only when the car-microphone
+ * input is selected.
  */
 final class VoiceFrontend implements AutoCloseable {
 
     private static final String TAG = "VoiceFrontend";
-    /** Echo tail the canceller models: 128 ms at 16 kHz covers the cabin's speaker-to-mic path. */
-    static final int FILTER_SAMPLES = 2048;
-    static final int SUPPRESS_DB = -25;
-    static final int HIGH_PASS_HZ = 200;
+    /** WebRTC noise suppression level for the AEC3 modes: 0..3 = 6/12/18/21 dB. */
+    static final int NS_LEVEL = 1;
+    /** Echo modes (vfe.h): AEC3 + suppressor, aligned MDF (default), AEC3 linear, AEC3 linear + post-filter. */
+    static final int MODE_SUPPRESS_FULL = 0;
+    static final int MODE_SUPPRESS_BALANCED = 1;
+    static final int MODE_LINEAR_ONLY = 2;
+    static final int MODE_LINEAR_POSTFILTER = 3;
+    static final int DEFAULT_MODE = MODE_SUPPRESS_BALANCED;
+    /** Per-frame diagnostics written by {@link #process(short[], short[], float[], short[])} (vfe.h). */
+    static final int STATS = 16;
+    static final int STAT_ECHO_SCORE = 0;
+    static final int STAT_OUT_ENERGY = 1;
+    static final int STAT_ERLE_DB = 2;
+    static final int STAT_LINEAR_ERLE_DB = 3;
+    static final int STAT_DELAY_MS = 4;
+    static final int STAT_REF_ACTIVE = 5;
+    static final int STAT_CONVERGED = 6;
+    static final int STAT_RESIDUAL_ECHO = 7;
+    static final int STAT_BEAM_CONFIDENCE = 8;
 
     private static volatile Boolean loaded;
 
@@ -48,16 +66,25 @@ final class VoiceFrontend implements AutoCloseable {
 
     /** {@code mics} microphone channels followed by {@code refs} speaker-reference channels; null when it cannot start. */
     static VoiceFrontend create(int rate, int frame, int mics, int refs) {
+        return create(rate, frame, mics, refs, DEFAULT_MODE);
+    }
+
+    static VoiceFrontend create(int rate, int frame, int mics, int refs, int mode) {
         if (!isAvailable()) return null;
-        long h = nativeCreate(rate, frame, FILTER_SAMPLES, mics, refs, SUPPRESS_DB, HIGH_PASS_HZ);
+        long h = nativeCreate(rate, frame, mics, refs, NS_LEVEL, mode);
         return h == 0 ? null : new VoiceFrontend(h, frame, mics + refs);
     }
 
     /** One interleaved frame ({@code frame * channels} samples) in, {@code frame} mono samples out. */
     boolean process(short[] interleaved, short[] mono) {
+        return process(interleaved, mono, null, null);
+    }
+
+    /** As above; {@code stats} ({@link #STATS}) and {@code taps} (AEC output by mic, then the beam: frame*3) may be null. */
+    boolean process(short[] interleaved, short[] mono, float[] stats, short[] taps) {
         long h = handle;
         return h != 0 && interleaved.length >= frame * channels && mono.length >= frame
-                && nativeProcess(h, interleaved, channels, mono);
+                && nativeProcess(h, interleaved, channels, frame, mono, stats, taps);
     }
 
     @Override
@@ -67,10 +94,10 @@ final class VoiceFrontend implements AutoCloseable {
         if (h != 0) nativeDestroy(h);
     }
 
-    private static native long nativeCreate(int rate, int frame, int filterLen, int mics, int refs,
-                                            int suppressDb, int hpfHz);
+    private static native long nativeCreate(int rate, int frame, int mics, int refs, int nsLevel, int mode);
 
-    private static native boolean nativeProcess(long handle, short[] in, int channels, short[] out);
+    private static native boolean nativeProcess(long handle, short[] in, int channels, int frame, short[] out,
+                                                float[] stats, short[] taps);
 
     private static native void nativeDestroy(long handle);
 }

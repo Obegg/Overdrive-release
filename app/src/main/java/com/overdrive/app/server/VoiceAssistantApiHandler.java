@@ -419,6 +419,18 @@ public final class VoiceAssistantApiHandler {
             for (int i = 0; i < 4; i++) out.put(clamp(levels.optInt(i, -100), -100, 0));
             clean.put("arrayChannelsDb", out);
         }
+        // The car input's echo canceller: reference activity, ERLE, delay, residual echo, overruns.
+        JSONObject echo = input.optJSONObject("arrayEcho");
+        if (echo != null) {
+            JSONObject e = new JSONObject();
+            e.put("ref", echo.optBoolean("ref"));
+            e.put("erleDb", clamp(echo.optInt("erleDb"), -20, 80));
+            e.put("delayMs", clamp(echo.optInt("delayMs", -1), -1, 2000));
+            e.put("residualPct", clamp(echo.optInt("residualPct"), 0, 100));
+            e.put("healthy", echo.optBoolean("healthy"));
+            e.put("overruns", clamp(echo.optInt("overruns"), 0, 1_000_000));
+            clean.put("arrayEcho", e);
+        }
         Long lastWakeAt = optNonNegative(input, "lastWakeAt");
         if (lastWakeAt != null) clean.put("lastWakeAt", lastWakeAt);
 
@@ -724,6 +736,18 @@ public final class VoiceAssistantApiHandler {
             if (levels != null) {
                 line.append(", car mics ").append(levels.optInt(0)).append('/').append(levels.optInt(1))
                         .append(" refs ").append(levels.optInt(2)).append('/').append(levels.optInt(3)).append(" dBFS");
+            }
+            JSONObject echo = clean.optJSONObject("arrayEcho");
+            if (echo != null) {
+                line.append(", echo ");
+                if (echo.optBoolean("ref")) {
+                    line.append("erle ").append(echo.optInt("erleDb")).append(" dB delay ")
+                            .append(echo.optInt("delayMs")).append(" ms res ").append(echo.optInt("residualPct"))
+                            .append('%').append(echo.optBoolean("healthy") ? "" : " unhealthy");
+                } else {
+                    line.append("idle");
+                }
+                line.append(" ovr ").append(echo.optInt("overruns"));
             }
         }
         return line.toString();
