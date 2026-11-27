@@ -435,8 +435,9 @@ final class VoiceEngine implements PcmSink {
     private String sessionProvider = "";
 
     // Hybrid end of speech (Gemini): Silero silence, then Smart Turn on the turn's last <= 8 s.
-    private static final long EOS_CANDIDATE_SAMPLES = 300L * RATE / 1000;
-    private static final long EOS_NO_SMART_TURN_SAMPLES = 1000L * RATE / 1000;
+    // Candidate pause and the second check's offset: the eval sweep's safest (sweep_endpoint.py).
+    private static final long EOS_CANDIDATE_SAMPLES = 400L * RATE / 1000;
+    private static final long EOS_SECOND_CHECK_SAMPLES = 300L * RATE / 1000;
     /** Lead sent ahead of speech that resumes after an end of speech (the provider's prefix padding). */
     private static final int REOPEN_LEAD_SAMPLES = RATE / 2;
     private static final int SMART_TURN_MAX_SAMPLES = RATE * 8;
@@ -451,6 +452,9 @@ final class VoiceEngine implements PcmSink {
     private long gatedAtSample;
     /** lastSpeechSample a Smart Turn check was asked for (one per pause), -1 none. */
     private long smartTurnAskedFor = -1;
+    /** Checks of the current pause at or above the threshold; -1 once one fell below it. */
+    private int smartTurnHits;
+    private boolean smartTurnSecondAsked;
     /** Wall clock the current user segment's speech began, for the continuous-speech ceiling. */
     private long segmentStartedAt;
     private boolean fullDuplexTurn;
@@ -2520,9 +2524,9 @@ final class VoiceEngine implements PcmSink {
     }
 
     /**
-     * Hybrid end of speech: at a Silero pause of >= 300 ms Smart Turn scores the turn's last <= 8 s
-     * on the worker; a likely end sends it at once, otherwise it is sent after the maximum silence.
-     * Without Smart Turn a 1 s pause ends it; 8 s of speech with no pause (noise) ends it too.
+     * Hybrid end of speech: endOfSpeechMaxMs of Silero silence ends the turn. With smartTurnChecks > 0
+     * Smart Turn scores the last <= 8 s on the worker 400 ms into a pause (and again 300 ms later for
+     * 2) and may end it sooner. 8 s of speech with no pause (noise) ends it too.
      */
     private void checkEndOfSpeech(long now) {
         long silence = turnSamples - lastSpeechSample;
@@ -2535,13 +2539,23 @@ final class VoiceEngine implements PcmSink {
             return;
         }
         segmentStartedAt = 0;
-        SmartTurn st = smartTurn;
+        long maxSilence = (long) config.endOfSpeechMaxMs * RATE / 1000;
+        int checks = config.smartTurnChecks;
+        SmartTurn st = checks > 0 ? smartTurn : null;
         if (st == null) {
-            if (silence >= EOS_NO_SMART_TURN_SAMPLES) endpoint(now, "silence", silence);
+            if (silence >= maxSilence) endpoint(now, "silence", silence);
             return;
         }
-        if (smartTurnAskedFor != lastSpeechSample) askSmartTurn(st, lastSpeechSample);
-        if (silence >= (long) config.endOfSpeechMaxMs * RATE / 1000) endpoint(now, "max_silence", silence);
+        if (smartTurnAskedFor != lastSpeechSample) {
+            smartTurnHits = 0;
+            smartTurnSecondAsked = false;
+            askSmartTurn(st, lastSpeechSample);
+        } else if (checks >= 2 && smartTurnHits == 1 && !smartTurnSecondAsked
+                && silence >= EOS_CANDIDATE_SAMPLES + EOS_SECOND_CHECK_SAMPLES) {
+            smartTurnSecondAsked = true;
+            askSmartTurn(st, lastSpeechSample);
+        }
+        if (silence >= maxSilence) endpoint(now, "max_silence", silence);
     }
 
     private void askSmartTurn(SmartTurn st, long key) {
@@ -2564,7 +2578,13 @@ final class VoiceEngine implements PcmSink {
     private void onSmartTurn(int forTurn, long key, float p) {
         if (forTurn != turn || phase != CLOUD || endpointSent || key != lastSpeechSample) return;
         turnSmartTurnP = p;
-        if (!Float.isNaN(p) && p >= config.smartTurnThreshold) {
+        if (Float.isNaN(p) || p < config.smartTurnThreshold) {
+            smartTurnHits = -1;
+            return;
+        }
+        if (smartTurnHits < 0) return;
+        // Two checks (smartTurnChecks 2) must agree: a single one ends mid-sentence hesitations.
+        if (++smartTurnHits >= config.smartTurnChecks) {
             endpoint(SystemClock.elapsedRealtime(), "smart_turn", turnSamples - lastSpeechSample);
         }
     }
