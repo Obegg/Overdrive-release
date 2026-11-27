@@ -615,7 +615,6 @@ public final class VoiceAssistantApiHandler {
         copyToken(turn, t, "holdWhy", "[a-z_]{1,16}");
         copyToken(turn, t, "eosBy", "[a-z_]{1,16}");
         copyClamped(turn, t, "eosMs", 0, 60_000);
-        t.putOpt("stp", probability(turn, "stp"));
         if (Boolean.TRUE.equals(turn.opt("duplex"))) t.put("duplex", true);
         copyClamped(turn, t, "interrupts", 0, 100);
         copyClamped(turn, t, "inChars", 0, 10_000);
@@ -681,7 +680,6 @@ public final class VoiceAssistantApiHandler {
                 + (t.has("erleDb") ? " " + t.optInt("erleDb") + " dB" : ""));
         if (t.has("eosBy")) items.add("end " + t.optString("eosBy")
                 + (t.has("eosMs") ? " after " + t.optInt("eosMs") + " ms" : ""));
-        if (t.has("stp")) items.add(String.format(java.util.Locale.US, "smart turn %.2f", t.optDouble("stp")));
         if (t.has("duplex")) items.add("full duplex");
         if (t.has("interrupts")) items.add("barge-in " + t.optInt("interrupts"));
         if (t.has("inChars")) items.add("heard " + t.optInt("inChars") + " chars");

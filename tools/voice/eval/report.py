@@ -218,7 +218,7 @@ def render(S):
     w('## Endpointing (end of a command after the wake word)\n')
     w('Latency = endpoint minus the true end of speech (negative = cut early); premature = endpoint more than '
       '150 ms before the true end. `silero_H` = Silero VAD (CommandVad settings) plus an H ms hang (700 = the '
-      'local command window today); `smart_turn` = Smart Turn v3 checked 200 ms into each pause, every 300 ms '
+      'local command window, 1000 = the cloud turn\'s end of speech); `smart_turn` = Smart Turn v3 (offline comparison only) checked 200 ms into each pause, every 300 ms '
       'after, fallback 1.5 s.\n')
     w('| front-end | material | policy | n | median ms | p90 ms | premature | never ended |')
     w('|---|---|---|---|---|---|---|---|')

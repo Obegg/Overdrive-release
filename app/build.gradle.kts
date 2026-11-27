@@ -648,11 +648,6 @@ android {
     }
     kotlinOptions { jvmTarget = "11" }
     
-    // Smart Turn barely deflates (0.87); stored, it maps straight from the APK (SmartTurn.load).
-    androidResources {
-        noCompress += listOf("smart-turn-v3.2-cpu.onnx")
-    }
-
     packaging {
         resources {
             excludes += listOf(

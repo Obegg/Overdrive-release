@@ -1,6 +1,5 @@
 """End-of-speech detection on processed command audio: Silero VAD (the app's CommandVad settings,
 through sherpa-onnx) with fixed hangs, and Smart Turn v3 (when its ONNX file is available)."""
-import glob
 import os
 import time
 
@@ -10,11 +9,9 @@ RATE = 16000
 WINDOW = 512
 
 
-def find_smart_turn(repo=None):
-    """$SMART_TURN_ONNX, the repo's shipped asset, else the harness download."""
+def find_smart_turn():
+    """$SMART_TURN_ONNX, else the harness download (fetch_data.sh smart_turn; the app no longer ships it)."""
     cands = [os.environ.get('SMART_TURN_ONNX', '')]
-    if repo:
-        cands += sorted(glob.glob(os.path.join(repo, 'app/src/main/assets/voice/turn/*.onnx')))
     cands.append(os.path.expanduser(os.path.join(os.environ.get('VOICE_EVAL_DATA', '~/voice-eval-data'),
                                                  'models', 'smart-turn-v3.2-cpu.onnx')))
     for c in cands:
@@ -116,7 +113,7 @@ class SmartTurn:
         return float(np.ravel(out)[0])
 
 
-def endpoints(pcm, flags, true_end, after, hangs=(300, 500, 700), smart=None, st_first_ms=200, st_step_ms=300,
+def endpoints(pcm, flags, true_end, after, hangs=(300, 500, 700, 1000), smart=None, st_first_ms=200, st_step_ms=300,
               st_fallback_ms=1500, st_threshold=0.5):
     """Endpoint sample per policy for one command: Silero with each hang, and Smart Turn.
     ``after``: speech before this sample (the wake word) does not count."""

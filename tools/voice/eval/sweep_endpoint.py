@@ -1,6 +1,8 @@
-"""Sweep of the engine's cloud-turn end-of-speech rule (VoiceEngine.checkEndOfSpeech) on in-car commands.
+"""Sweep of cloud-turn end-of-speech rules on in-car commands (offline comparison tool).
 
-Rule replayed: at each Silero pause of >= C ms Smart Turn scores the last <= 8 s on the worker; its
+The app ends a cloud turn after endOfSpeechMaxMs of Silero silence (the silero_H rows); this sweep
+showed Smart Turn (offline download, fetch_data.sh) adding no safe gain, so the app dropped it.
+Smart Turn rule replayed: at each Silero pause of >= C ms Smart Turn scores the last <= 8 s on the worker; its
 result arrives L ms later and ends the turn when p >= threshold and speech has not resumed (with
 --two, a second check C+300 ms into the same pause must agree); otherwise the turn ends after
 endOfSpeechMaxMs of silence. Positives are the eval "OverDrive <command>" clips, natural and with a
@@ -152,7 +154,7 @@ def main():
     ap.add_argument('--out', default=os.path.expanduser('~/voice-eval-data/results/sweep_endpoint.json'))
     a = ap.parse_args()
     import endpoint
-    smart = endpoint.find_smart_turn(a.repo)
+    smart = endpoint.find_smart_turn()
     man = [json.loads(line) for line in open(os.path.join(a.data, 'tts', 'manifest.jsonl'))]
     cmds = [m for m in man if m['split'] == 'eval' and m['kind'] in ('wake_cmd_runon', 'wake_cmd_pause')]
     os.makedirs(a.tmp, exist_ok=True)

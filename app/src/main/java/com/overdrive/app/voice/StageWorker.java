@@ -8,7 +8,7 @@ import java.util.Iterator;
 
 /**
  * The engine's one worker thread for everything too slow for the real-time consumer: stage-2 wake
- * verification, speech-to-text, Smart Turn and denoising for ASR. Tasks get copied buffers and
+ * verification, speech-to-text and denoising for ASR. Tasks get copied buffers and
  * post their results back to the engine, which drops stale ones by turn. A newer wake check
  * replaces one still waiting (latest wins), so a burst of triggers never builds a queue.
  */

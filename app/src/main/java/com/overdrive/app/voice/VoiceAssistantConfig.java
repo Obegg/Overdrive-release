@@ -97,9 +97,6 @@ public final class VoiceAssistantConfig {
     public final boolean denoiseSpeech;
     /** Barge-in (full duplex) while the car array's echo canceller is measurably healthy. */
     public final boolean fullDuplex;
-    public final double smartTurnThreshold;
-    /** Smart Turn checks that must agree to end a turn before endOfSpeechMaxMs: 0 off, 1, or 2 in a row. */
-    public final int smartTurnChecks;
     public final int endOfSpeechMaxMs;
     public final double echoRejectLikeness;
     /** Measured ERLE (references playing) a turn needs before barge-in opens, so our reply can't interrupt itself. */
@@ -134,17 +131,10 @@ public final class VoiceAssistantConfig {
      * Hidden tuning knobs (POST /api/voice/config only, not in the UI); docs/VOICE_ASSISTANT.md.
      * Defaults are starting points for the EVAL harness and the car.
      */
-    /** Smart Turn end-of-turn probability that ends a cloud turn at a candidate silence. */
-    public static final double SMART_TURN_THRESHOLD_MIN = 0.30;
-    public static final double SMART_TURN_THRESHOLD_MAX = 0.90;
-    public static final double SMART_TURN_THRESHOLD_DEFAULT = 0.50;
-    /** Silence after which a cloud turn's end of speech is sent whatever Smart Turn said. */
+    /** Silero silence after which a cloud turn's end of speech is sent (in-car eval: 0.5 % early cuts at 1 s). */
     public static final int END_OF_SPEECH_MAX_MS_MIN = 800;
     public static final int END_OF_SPEECH_MAX_MS_MAX = 2500;
     public static final int END_OF_SPEECH_MAX_MS_DEFAULT = 1000;
-    /** Off by default: on in-car eval with mid-sentence pauses any early end cut > 1 % of turns. */
-    public static final int SMART_TURN_CHECKS_MAX = 2;
-    public static final int SMART_TURN_CHECKS_DEFAULT = 0;
     /** Echo-likeness of a trigger window (under media) at or above which it is rejected unchecked. */
     public static final double ECHO_REJECT_MIN = 0.50;
     public static final double ECHO_REJECT_MAX = 1.00;
@@ -168,7 +158,7 @@ public final class VoiceAssistantConfig {
                                  java.util.List<PersonalVoice> personalVoices, String enrollRequestVoice,
                                  String enrollRequestName, double personalMediaCutoff,
                                  boolean wakeInputDenoised, boolean denoiseSpeech, boolean fullDuplex,
-                                 double smartTurnThreshold, int smartTurnChecks, int endOfSpeechMaxMs,
+                                 int endOfSpeechMaxMs,
                                  double echoRejectLikeness, double bargeInMinErleDb) {
         this.enabled = enabled;
         this.mode = mode;
@@ -197,8 +187,6 @@ public final class VoiceAssistantConfig {
         this.wakeInputDenoised = wakeInputDenoised;
         this.denoiseSpeech = denoiseSpeech;
         this.fullDuplex = fullDuplex;
-        this.smartTurnThreshold = smartTurnThreshold;
-        this.smartTurnChecks = smartTurnChecks;
         this.endOfSpeechMaxMs = endOfSpeechMaxMs;
         this.echoRejectLikeness = echoRejectLikeness;
         this.bargeInMinErleDb = bargeInMinErleDb;
@@ -253,9 +241,6 @@ public final class VoiceAssistantConfig {
                 section.optBoolean("wakeInputDenoised", false),
                 section.optBoolean("denoiseSpeech", true),
                 section.optBoolean("fullDuplex", true),
-                clampDouble(section.optDouble("smartTurnThreshold", SMART_TURN_THRESHOLD_DEFAULT),
-                        SMART_TURN_THRESHOLD_MIN, SMART_TURN_THRESHOLD_MAX, SMART_TURN_THRESHOLD_DEFAULT),
-                clamp(section.optInt("smartTurnChecks", SMART_TURN_CHECKS_DEFAULT), 0, SMART_TURN_CHECKS_MAX),
                 clamp(section.optInt("endOfSpeechMaxMs", END_OF_SPEECH_MAX_MS_DEFAULT),
                         END_OF_SPEECH_MAX_MS_MIN, END_OF_SPEECH_MAX_MS_MAX),
                 clampDouble(section.optDouble("echoRejectLikeness", MediaWakeGate.ECHO_REJECT_DEFAULT),
@@ -456,8 +441,6 @@ public final class VoiceAssistantConfig {
             json.put("wakeInputDenoised", wakeInputDenoised);
             json.put("denoiseSpeech", denoiseSpeech);
             json.put("fullDuplex", fullDuplex);
-            json.put("smartTurnThreshold", smartTurnThreshold);
-            json.put("smartTurnChecks", smartTurnChecks);
             json.put("endOfSpeechMaxMs", endOfSpeechMaxMs);
             json.put("echoRejectLikeness", echoRejectLikeness);
             json.put("bargeInMinErleDb", bargeInMinErleDb);
@@ -568,14 +551,6 @@ public final class VoiceAssistantConfig {
             }
             for (String key : new String[] {"wakeInputDenoised", "denoiseSpeech", "fullDuplex"}) {
                 if (patch.has(key)) out.put(key, requireBoolean(patch, key));
-            }
-            if (patch.has("smartTurnThreshold")) {
-                out.put("smartTurnThreshold", requireRange(patch, "smartTurnThreshold",
-                        SMART_TURN_THRESHOLD_MIN, SMART_TURN_THRESHOLD_MAX));
-            }
-            if (patch.has("smartTurnChecks")) {
-                out.put("smartTurnChecks", (int) Math.round(requireRange(patch, "smartTurnChecks",
-                        0, SMART_TURN_CHECKS_MAX)));
             }
             if (patch.has("endOfSpeechMaxMs")) {
                 out.put("endOfSpeechMaxMs", (int) Math.round(requireRange(patch, "endOfSpeechMaxMs",

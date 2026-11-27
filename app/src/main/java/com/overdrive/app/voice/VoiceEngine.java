@@ -17,7 +17,6 @@ import com.overdrive.app.voice.local.CommandTranscriber;
 import com.overdrive.app.voice.local.CommandVad;
 import com.overdrive.app.voice.local.LocalCommandSpotter;
 import com.overdrive.app.voice.local.PhoneDecoder;
-import com.overdrive.app.voice.local.SmartTurn;
 import com.overdrive.app.voice.local.SpeechDenoiser;
 import com.overdrive.app.voice.local.WakeEnrollment;
 import com.overdrive.app.voice.ui.VoiceOrbView;
@@ -45,7 +44,7 @@ import java.util.concurrent.locks.LockSupport;
 /**
  * One ACC session of the voice assistant: wake detection, the command turn and its feedback.
  * Turn state is owned by the engine thread, a real-time consumer that only runs stage 1, Silero
- * endpointing, the uplink and window bookkeeping; stage-2 checks, speech-to-text and Smart Turn run
+ * endpointing, the uplink and window bookkeeping; stage-2 checks and speech-to-text run
  * on {@link StageWorker} over copied buffers and post back by turn. Other threads only post events.
  */
 final class VoiceEngine implements PcmSink {
@@ -434,15 +433,13 @@ final class VoiceEngine implements PcmSink {
     /** Provider the daemon named for the session ("gemini" | "openai"), "" until then. */
     private String sessionProvider = "";
 
-    // Hybrid end of speech (Gemini): Silero silence, then Smart Turn on the turn's last <= 8 s.
-    // Candidate pause and the second check's offset: the eval sweep's safest (sweep_endpoint.py).
-    private static final long EOS_CANDIDATE_SAMPLES = 400L * RATE / 1000;
-    private static final long EOS_SECOND_CHECK_SAMPLES = 300L * RATE / 1000;
+    // Hybrid end of speech (Gemini): endOfSpeechMaxMs of Silero silence (tools/voice/eval/sweep_endpoint.py).
+    /** A pause this long ends a speech segment for the continuous-speech ceiling. */
+    private static final long SEGMENT_GAP_SAMPLES = 300L * RATE / 1000;
     /** Lead sent ahead of speech that resumes after an end of speech (the provider's prefix padding). */
     private static final int REOPEN_LEAD_SAMPLES = RATE / 2;
-    private static final int SMART_TURN_MAX_SAMPLES = RATE * 8;
-    /** Uplinked turn audio (denoised when the model is present), for Smart Turn and the reopen lead. */
-    private final short[] cloudPcm = new short[RATE * 8];
+    /** Uplinked turn audio (denoised when the model is present), for the reopen lead. */
+    private final short[] cloudPcm = new short[RATE * 2];
     private int cloudPcmPos;
     private boolean cloudPcmFull;
     /** The end of speech went to the provider for the current user turn. */
@@ -450,17 +447,11 @@ final class VoiceEngine implements PcmSink {
     /** After it, the uplink waits for the next speech (Silero) instead of streaming music or noise. */
     private boolean uplinkGated;
     private long gatedAtSample;
-    /** lastSpeechSample a Smart Turn check was asked for (one per pause), -1 none. */
-    private long smartTurnAskedFor = -1;
-    /** Checks of the current pause at or above the threshold; -1 once one fell below it. */
-    private int smartTurnHits;
-    private boolean smartTurnSecondAsked;
     /** Wall clock the current user segment's speech began, for the continuous-speech ceiling. */
     private long segmentStartedAt;
     private boolean fullDuplexTurn;
 
     // Models the worker or the consumer use; loaded off the consumer, absent ones change nothing.
-    private SmartTurn smartTurn;
     /** Consumer-side streaming denoiser (cloud uplink, optional wake input); worker-side one for ASR. */
     private SpeechDenoiser liveDenoiser;
     private SpeechDenoiser asrDenoiser;
@@ -506,7 +497,6 @@ final class VoiceEngine implements PcmSink {
     private long turnMaxLagSamples;
     private String eosBy;
     private int eosMs = -1;
-    private float turnSmartTurnP = Float.NaN;
     private int turnInterrupts;
     private int turnInputChars;
     private int turnToolCalls;
@@ -935,22 +925,20 @@ final class VoiceEngine implements PcmSink {
         }
     }
 
-    /** Smart Turn and the two denoisers load on the io executor; absent ones keep today's paths. */
+    /** The two denoisers load on the io executor; absent ones keep today's paths. */
     private void startSpeechModelsLoad() {
         try {
             io.execute(() -> {
-                SmartTurn st = null;
                 SpeechDenoiser live = null;
                 SpeechDenoiser asr = null;
                 try {
-                    st = SmartTurn.load(app);
                     live = SpeechDenoiser.load(app);
                     asr = live == null ? null : SpeechDenoiser.load(app);
                 } catch (Throwable t) {
                     Log.w(TAG, "Speech models failed to load: " + t.getMessage());
                 }
                 // Handed over through a reference so releaseAll() closes them even if never adopted.
-                loadedSpeech.set(new AutoCloseable[] {st, live, asr});
+                loadedSpeech.set(new AutoCloseable[] {live, asr});
                 if (!running) {
                     closeAll(loadedSpeech.getAndSet(null));
                     return;
@@ -958,11 +946,9 @@ final class VoiceEngine implements PcmSink {
                 post(() -> {
                     AutoCloseable[] m = loadedSpeech.getAndSet(null);
                     if (m == null) return;
-                    smartTurn = (SmartTurn) m[0];
-                    liveDenoiser = (SpeechDenoiser) m[1];
-                    asrDenoiser = (SpeechDenoiser) m[2];
-                    Log.i(TAG, "Smart Turn " + (smartTurn != null ? "on" : "absent") + ", denoiser "
-                            + (liveDenoiser != null ? "on" : "absent"));
+                    liveDenoiser = (SpeechDenoiser) m[0];
+                    asrDenoiser = (SpeechDenoiser) m[1];
+                    Log.i(TAG, "Denoiser " + (liveDenoiser != null ? "on" : "absent"));
                 });
             });
         } catch (java.util.concurrent.RejectedExecutionException ignored) {
@@ -1928,7 +1914,6 @@ final class VoiceEngine implements PcmSink {
         turnMaxLagSamples = 0;
         eosBy = null;
         eosMs = -1;
-        turnSmartTurnP = Float.NaN;
         turnInterrupts = 0;
         turnInputChars = 0;
         turnToolCalls = 0;
@@ -2514,7 +2499,6 @@ final class VoiceEngine implements PcmSink {
         endpointSent = false;
         uplinkGated = false;
         gatedAtSample = 0;
-        smartTurnAskedFor = -1;
         segmentStartedAt = 0;
     }
 
@@ -2524,13 +2508,12 @@ final class VoiceEngine implements PcmSink {
     }
 
     /**
-     * Hybrid end of speech: endOfSpeechMaxMs of Silero silence ends the turn. With smartTurnChecks > 0
-     * Smart Turn scores the last <= 8 s on the worker 400 ms into a pause (and again 300 ms later for
-     * 2) and may end it sooner. 8 s of speech with no pause (noise) ends it too.
+     * Hybrid end of speech: endOfSpeechMaxMs of Silero silence ends the turn (Gemini's own VAD may end
+     * it first); 8 s of speech with no pause (noise) ends it too.
      */
     private void checkEndOfSpeech(long now) {
         long silence = turnSamples - lastSpeechSample;
-        if (silence < EOS_CANDIDATE_SAMPLES) {
+        if (silence < SEGMENT_GAP_SAMPLES) {
             if (segmentStartedAt == 0) {
                 segmentStartedAt = now;
             } else if (now - segmentStartedAt > CloudDeadline.CONTINUOUS_SPEECH_MS) {
@@ -2539,54 +2522,7 @@ final class VoiceEngine implements PcmSink {
             return;
         }
         segmentStartedAt = 0;
-        long maxSilence = (long) config.endOfSpeechMaxMs * RATE / 1000;
-        int checks = config.smartTurnChecks;
-        SmartTurn st = checks > 0 ? smartTurn : null;
-        if (st == null) {
-            if (silence >= maxSilence) endpoint(now, "silence", silence);
-            return;
-        }
-        if (smartTurnAskedFor != lastSpeechSample) {
-            smartTurnHits = 0;
-            smartTurnSecondAsked = false;
-            askSmartTurn(st, lastSpeechSample);
-        } else if (checks >= 2 && smartTurnHits == 1 && !smartTurnSecondAsked
-                && silence >= EOS_CANDIDATE_SAMPLES + EOS_SECOND_CHECK_SAMPLES) {
-            smartTurnSecondAsked = true;
-            askSmartTurn(st, lastSpeechSample);
-        }
-        if (silence >= maxSilence) endpoint(now, "max_silence", silence);
-    }
-
-    private void askSmartTurn(SmartTurn st, long key) {
-        smartTurnAskedFor = key;
-        final short[] pcm = cloudTail(SMART_TURN_MAX_SAMPLES);
-        final int at = turn;
-        worker.submit(StageWorker.KIND_OTHER, q -> {
-            float p;
-            try {
-                p = st.endOfTurnProbability(pcm, 0, pcm.length);
-            } catch (Throwable t) {
-                p = Float.NaN;
-            }
-            final float fp = p;
-            post(() -> onSmartTurn(at, key, fp));
-        });
-    }
-
-    /** A Smart Turn score for the pause after {@code key}; stale when speech resumed meanwhile. */
-    private void onSmartTurn(int forTurn, long key, float p) {
-        if (forTurn != turn || phase != CLOUD || endpointSent || key != lastSpeechSample) return;
-        turnSmartTurnP = p;
-        if (Float.isNaN(p) || p < config.smartTurnThreshold) {
-            smartTurnHits = -1;
-            return;
-        }
-        if (smartTurnHits < 0) return;
-        // Two checks (smartTurnChecks 2) must agree: a single one ends mid-sentence hesitations.
-        if (++smartTurnHits >= config.smartTurnChecks) {
-            endpoint(SystemClock.elapsedRealtime(), "smart_turn", turnSamples - lastSpeechSample);
-        }
+        if (silence >= (long) config.endOfSpeechMaxMs * RATE / 1000) endpoint(now, "silence", silence);
     }
 
     /**
@@ -2595,7 +2531,6 @@ final class VoiceEngine implements PcmSink {
      */
     private void endpoint(long now, String why, long silenceSamples) {
         endpointSent = true;
-        smartTurnAskedFor = -1;
         segmentStartedAt = 0;
         eosBy = why;
         eosMs = (int) Math.min(60_000L, Math.max(0L, silenceSamples) * 1000 / RATE);
@@ -2616,7 +2551,6 @@ final class VoiceEngine implements PcmSink {
         endpointSent = false;
         // The client holds its uplink after audioStreamEnd; local speech releases it.
         if (session != null) session.userSpeechResumed();
-        smartTurnAskedFor = -1;
         segmentStartedAt = 0;
         deadline.userResumed();
         if (!replySpeaking) {
@@ -2636,8 +2570,7 @@ final class VoiceEngine implements PcmSink {
                 deadline.reset();
                 endpointSent = false;
                 segmentStartedAt = 0;
-                smartTurnAskedFor = -1;
-                lastCloudActivityAt = now;
+                        lastCloudActivityAt = now;
             } else if (now > followUpUntil) {
                 closeSession("cloud");
             }
@@ -4610,10 +4543,6 @@ final class VoiceEngine implements PcmSink {
             try { vad.close(); } catch (Throwable ignored) {}
             vad = null;
         }
-        if (smartTurn != null) {
-            try { smartTurn.close(); } catch (Throwable ignored) {}
-            smartTurn = null;
-        }
         if (liveDenoiser != null) {
             try { liveDenoiser.close(); } catch (Throwable ignored) {}
             liveDenoiser = null;
@@ -4775,10 +4704,9 @@ final class VoiceEngine implements PcmSink {
                 if (!Float.isNaN(turnErleDb)) t.put("erleDb", Math.round(turnErleDb));
             }
             if (turnHoldWhy != null) t.put("holdWhy", turnHoldWhy);
-            // Cloud end of speech: how, after how much silence, and Smart Turn's last score.
+            // Cloud end of speech: how, and after how much silence.
             if (eosBy != null) t.put("eosBy", eosBy);
             if (eosMs >= 0) t.put("eosMs", eosMs);
-            if (!Float.isNaN(turnSmartTurnP)) t.put("stp", round2(turnSmartTurnP));
             if (fullDuplexTurn) t.put("duplex", true);
             if (turnInterrupts > 0) t.put("interrupts", turnInterrupts);
             if (turnInputChars > 0) t.put("inChars", turnInputChars);

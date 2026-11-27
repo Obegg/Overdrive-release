@@ -5,7 +5,7 @@ package com.overdrive.app.voice;
  * the per-provider rules are testable without the engine.
  *
  * <p>Gemini has no server-side turn detection the client can see, so the wait starts from the
- * engine's own end of speech (Silero + Smart Turn, sent as audioStreamEnd), or after 8 s of what
+ * engine's own end of speech (Silero silence, sent as audioStreamEnd), or after 8 s of what
  * looks like continuous speech, since cabin noise can read as endless talking. OpenAI reports its own {@code speech_stopped}; anchoring the wait
  * there keeps a long request from being ended as "offline" while the user is still talking.
  */

@@ -91,7 +91,7 @@ def main():
     res['stage2_stt_ms_per_check'] = best(lambda: [s2.transcribe(clip) for _ in range(5)]) * 200
     vad = endpoint.Silero(a.repo)
     res['vad_silero_ms_per_s'] = best(lambda: vad.flags(mono_raw[:20 * RATE])) * 1000 / 20
-    st_path = endpoint.find_smart_turn(a.repo)
+    st_path = endpoint.find_smart_turn()
     if st_path:
         st = endpoint.SmartTurn(st_path)
         st.prob(mono_raw[:8 * RATE])
