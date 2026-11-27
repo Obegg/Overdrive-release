@@ -13,7 +13,7 @@ sherpa-onnx v2.0.3 (lib/arm64-v8a/libsherpa-onnx-jni.so, com.k2fsa.sherpa.onnx K
   kaldi-native-io, kaldi-hmm-gmm, kaldi-decoder, kaldifst, simple-sentencepiece, OpenFst (Apache
   License 2.0), KISS FFT (BSD-3-Clause), utf8proc (MIT), nlohmann/json (MIT) and Eigen (MPL 2.0).
 
-ONNX Runtime 1.28.2 (statically linked into libsherpa-onnx-jni.so)
+ONNX Runtime 1.28.2, reduced-operator build (statically linked into libsherpa-onnx-jni.so)
   Copyright Microsoft Corporation. MIT License.
 
 Keyword model voice/kws/ (sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20)

@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Builds the slim libsherpa-onnx-jni.so (arm64-v8a) shipped in app/src/main/jniLibs.
 # Only KWS, online/offline ASR, Silero VAD, speech denoiser JNI and the OrtSession runner
-# are compiled; ONNX Runtime is the full static build (all ONNX + contrib ops).
+# are compiled. The shipped .so links the reduced-operator ORT from build_ort_reduced.sh:
+#   OD_ORT_DIR=$(tools/voice/native/build_ort_reduced.sh | sed -n 's/.*-> //p') tools/voice/native/build_sherpa.sh
 #
 # Usage: tools/voice/native/build_sherpa.sh [output.so]
 # Env:   OD_ANDROID_NDK (else sdk.dir from local.properties / ANDROID_HOME + ndk/<OD_NDK_VERSION>)
 #        OD_SHERPA_WORK (default /tmp/od-sherpa-build), JOBS (default: cpu count)
+#        OD_ORT_DIR: a static ORT install (include/, lib/libonnxruntime.a) from build_ort_reduced.sh;
+#        unset, the pinned prebuilt full ORT is downloaded instead.
 set -euo pipefail
 
 SHERPA_TAG=v2.0.3
@@ -49,12 +52,20 @@ fi
 git -C "$SRC" checkout -q -- sherpa-onnx/jni/CMakeLists.txt cmake/onnxruntime-android-aarch64-static.cmake \
   sherpa-onnx/csrc/online-speech-denoiser-stft-impl.h
 
-BUILD=$WORK/build-arm64-v8a-ort$ORT_VERSION
-mkdir -p "$BUILD"
-if [ ! -f "$BUILD/$ORT_ZIP" ] || [ "$(sha256 "$BUILD/$ORT_ZIP")" != "$ORT_SHA256" ]; then
-  curl -fsSL --retry 8 --retry-all-errors -C - -o "$BUILD/$ORT_ZIP" "$ORT_URL" || curl -fsSL --retry 8 -o "$BUILD/$ORT_ZIP" "$ORT_URL"
+if [ -n "${OD_ORT_DIR:-}" ]; then
+  [ -f "$OD_ORT_DIR/lib/libonnxruntime.a" ] || { echo "no libonnxruntime.a in $OD_ORT_DIR" >&2; exit 1; }
+  export SHERPA_ONNXRUNTIME_LIB_DIR=$OD_ORT_DIR/lib SHERPA_ONNXRUNTIME_INCLUDE_DIR=$OD_ORT_DIR/include
+  ORT_VERSION=$ORT_VERSION-$(basename "$OD_ORT_DIR" | sed 's/.*-//')
+  BUILD=$WORK/build-arm64-v8a-ort$ORT_VERSION
+  mkdir -p "$BUILD"
+else
+  BUILD=$WORK/build-arm64-v8a-ort$ORT_VERSION
+  mkdir -p "$BUILD"
+  if [ ! -f "$BUILD/$ORT_ZIP" ] || [ "$(sha256 "$BUILD/$ORT_ZIP")" != "$ORT_SHA256" ]; then
+    curl -fsSL --retry 8 --retry-all-errors -C - -o "$BUILD/$ORT_ZIP" "$ORT_URL" || curl -fsSL --retry 8 -o "$BUILD/$ORT_ZIP" "$ORT_URL"
+  fi
+  [ "$(sha256 "$BUILD/$ORT_ZIP")" = "$ORT_SHA256" ] || { echo "ORT checksum mismatch" >&2; exit 1; }
 fi
-[ "$(sha256 "$BUILD/$ORT_ZIP")" = "$ORT_SHA256" ] || { echo "ORT checksum mismatch" >&2; exit 1; }
 
 # Trim the JNI target to the wrappers OverDrive ships, add the OrtSession runner, and link
 # with section GC + a version script that exports only the JNI entry points.
