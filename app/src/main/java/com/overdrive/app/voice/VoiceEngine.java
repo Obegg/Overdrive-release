@@ -234,7 +234,8 @@ final class VoiceEngine implements PcmSink {
     // verdict depends on where its audio starts (offline: +3 points recall, no added false wakes).
     private static final int VERIFY_SHORT_SAMPLES = RATE * 18 / 10;
     // Stage 2 waits for the rest of the word: a permissive stage 1 can fire before "…drive" ends.
-    private static final int VERIFY_DELAY_SAMPLES = RATE * 4 / 10;
+    // The 2026-11 model fires ~100 ms earlier; +250 ms was best of 0/80/150/250 on the eval harness.
+    private static final int VERIFY_DELAY_SAMPLES = RATE * 65 / 100;
     private static final int CANDIDATE_VERIFY_DELAY_SAMPLES = RATE / 10;
     // A weak candidate (below the model's own cutoff) quieter than this is cabin residue, not a voice.
     private static final float WEAK_CANDIDATE_MIN_LEVEL = 58f;
@@ -901,6 +902,7 @@ final class VoiceEngine implements PcmSink {
             try {
                 wake = WakeWordDetector.load(app, WakeWordDetector.DEFAULT_ASSET_BASE);
                 wake.setSensitivity(c.sensitivity);
+                nearMiss.setFloor(wake.toModel(WakeNearMiss.FLOOR));
                 wakeLoaded = true;
             } catch (Throwable t) {
                 Log.w(TAG, "Wake model failed to load: " + t.getMessage());
@@ -1035,8 +1037,15 @@ final class VoiceEngine implements PcmSink {
             spotter.setPersonalWake(String.join("/", usable));
         }
         if (wake != null) {
-            wake.setCutoffOverride(Double.isNaN(cfg.personalWakeCutoff) ? Float.NaN : (float) cfg.personalWakeCutoff);
+            double personal = personalCutoff(cfg, false);
+            wake.setCutoffOverride(Double.isNaN(personal) ? Float.NaN : (float) personal);
         }
+    }
+
+    /** The lowest enrolled cutoff (reference units) of the voices measured on the loaded wake model, or NaN. */
+    private double personalCutoff(VoiceAssistantConfig cfg, boolean media) {
+        WakeWordDetector w = wake;
+        return w == null ? Double.NaN : VoiceAssistantConfig.lowestCutoff(cfg.personalVoices, media, w.modelId());
     }
 
     // ── Audio + timers ────────────────────────────────────────────────────
@@ -3846,7 +3855,8 @@ final class VoiceEngine implements PcmSink {
         float p = 0f;
         if (wake != null) {
             wake.process(chunk, 0, n);
-            p = wake.lastChunkPeak();
+            // Reference units: the stored cutoff is rescaled to whichever model loads it.
+            p = wake.toReference(wake.lastChunkPeak());
         }
         if (enrollLen < 0 || muted) return;
         boolean loud = rms > Math.max(noiseFloor * 3f, 150f);
@@ -4113,6 +4123,7 @@ final class VoiceEngine implements PcmSink {
         JSONObject body = new JSONObject();
         try {
             body.put("id", id);
+            if (wake != null) body.put("model", wake.modelId());
             if (result != null && result.ok() && music) {
                 body.put("action", "save")
                         .put("mediaCutoff", result.cutoff)
@@ -4468,7 +4479,7 @@ final class VoiceEngine implements PcmSink {
         if (wake != null) {
             VoiceAssistantConfig c = config;
             double underMedia = highSensitivity(c, c.wakeCutoffUnderMedia);
-            double personal = highSensitivity(c, c.personalMediaCutoff);
+            double personal = highSensitivity(c, personalCutoff(c, true));
             // With a measured-healthy echo canceller the music is removed: no lowering beyond a
             // voice's own Train-with-music cutoff. Otherwise today's bounded media cutoff.
             wake.setMediaCutoff(MediaWakeGate.stage1MediaCutoff(mediaActive, underMedia, echoHealthy(), personal));

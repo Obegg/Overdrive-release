@@ -177,6 +177,8 @@ public final class VoiceAssistantApiHandler {
                         && current.personalVoices.size() >= VoiceAssistantConfig.PERSONAL_WAKE_MAX_VOICES) {
                     return error(409, "voices_full", "Four voices are trained. Forget one first.");
                 }
+                String model = input.optString("model", "");
+                if (!VoiceAssistantConfig.isModelId(model)) model = "";
                 if ("save".equals(action) && current.enrollRequestMusic) {
                     double c = input.optDouble("mediaCutoff", Double.NaN);
                     if (Double.isNaN(c) || c < VoiceAssistantConfig.WAKE_CUTOFF_UNDER_MEDIA_MIN
@@ -184,11 +186,13 @@ public final class VoiceAssistantApiHandler {
                         return error(400, "invalid_enrollment", "The music calibration could not be read.");
                     }
                     double media = Math.round(c * 100.0) / 100.0;
+                    // A cutoff measured on another wake model is dropped, the lines are kept.
+                    boolean sameModel = prior != null && prior.model.equals(model);
                     VoiceAssistantConfig.PersonalVoice voice = new VoiceAssistantConfig.PersonalVoice(
                             current.enrollRequestVoice, name,
                             prior == null ? java.util.Collections.<String>emptyList() : prior.lines,
-                            prior == null ? Double.NaN : prior.cutoff, media,
-                            prior == null ? System.currentTimeMillis() : prior.trainedAt);
+                            sameModel ? prior.cutoff : Double.NaN, media,
+                            prior == null ? System.currentTimeMillis() : prior.trainedAt, model);
                     patch.put("personalWake", VoiceAssistantConfig.personalWakeJson(
                             withVoice(current.personalVoices, voice)));
                     summary = "over music saved: cutoff under media " + media
@@ -205,7 +209,8 @@ public final class VoiceAssistantApiHandler {
                     VoiceAssistantConfig.PersonalVoice voice = new VoiceAssistantConfig.PersonalVoice(
                             current.enrollRequestVoice, name, lines,
                             personal.has("cutoff") ? personal.getDouble("cutoff") : Double.NaN,
-                            prior == null ? Double.NaN : prior.mediaCutoff, personal.getLong("trainedAt"));
+                            prior != null && prior.model.equals(model) ? prior.mediaCutoff : Double.NaN,
+                            personal.getLong("trainedAt"), model);
                     patch.put("personalWake", VoiceAssistantConfig.personalWakeJson(
                             withVoice(current.personalVoices, voice)));
                     summary = "saved: " + learned.length() + " lines, cutoff "

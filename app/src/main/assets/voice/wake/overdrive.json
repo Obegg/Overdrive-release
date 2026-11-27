@@ -4,6 +4,7 @@
   "author": "irshsay",
   "website": "https://github.com/yourname",
   "model": "overdrive.tflite",
+  "model_id": "overdrive-r4-20261128",
   "trained_languages": [
     "en"
   ],

@@ -22,15 +22,17 @@ public class WakeCutoffSelectionTest {
 
     @Test
     public void theMediaCutoffOnlyEverLowersTheCutoffInForce() {
-        assertEquals(0.45f, WakeWordDetector.withMediaCutoff(0.45f, Float.NaN), 0f);
-        assertEquals(0.35f, WakeWordDetector.withMediaCutoff(0.45f, 0.35f), 1e-6f);
+        float floor = WakeWordDetector.MIN_MEDIA_CUTOFF;
+        assertEquals(0.45f, WakeWordDetector.withMediaCutoff(0.45f, Float.NaN, floor), 0f);
+        assertEquals(0.35f, WakeWordDetector.withMediaCutoff(0.45f, 0.35f, floor), 1e-6f);
         // Low sensitivity raises the normal cutoff; the media cutoff still lowers it.
-        assertEquals(0.35f, WakeWordDetector.withMediaCutoff(0.47f, 0.35f), 1e-6f);
+        assertEquals(0.35f, WakeWordDetector.withMediaCutoff(0.47f, 0.35f, floor), 1e-6f);
         // Never raises a cutoff that is already lower (an override or high sensitivity).
-        assertEquals(0.30f, WakeWordDetector.withMediaCutoff(0.30f, 0.35f), 1e-6f);
-        // Never below the floor.
-        assertEquals(WakeWordDetector.MIN_MEDIA_CUTOFF, WakeWordDetector.withMediaCutoff(0.45f, 0.05f), 0f);
+        assertEquals(0.30f, WakeWordDetector.withMediaCutoff(0.30f, 0.35f, floor), 1e-6f);
+        // Never below the floor (reference units, scaled to the loaded model's cutoff).
+        assertEquals(floor, WakeWordDetector.withMediaCutoff(0.45f, 0.05f, floor), 0f);
         assertEquals(0.20f, WakeWordDetector.MIN_MEDIA_CUTOFF, 0f);
+        assertEquals(0.45f, WakeWordDetector.REFERENCE_CUTOFF, 0f);
     }
 
     @Test
@@ -39,13 +41,14 @@ public class WakeCutoffSelectionTest {
         assertEquals(0.20, manifest.getJSONObject("micro").getDouble("probability_cutoff"), 1e-9);
         assertEquals(5, manifest.getJSONObject("micro").getInt("sliding_window_size"));
         String detector = read("src/main/java/com/overdrive/app/voice/wake/WakeWordDetector.java");
-        assertTrue(detector.contains("return withMediaCutoff(normalCutoff(), mediaCutoff);"));
+        assertTrue(detector.contains("return withMediaCutoff(normalCutoff(), mediaCutoff, minMediaCutoff);"));
         assertTrue(detector.contains("private volatile float mediaCutoff = Float.NaN;"));
         String normal = detector.substring(detector.indexOf("    private float normalCutoff() {"));
         normal = normal.substring(0, normal.indexOf("\n    }\n"));
-        // The sensitivity mapping is today's, unchanged.
-        assertTrue(normal.contains("return Math.min(MAX_CUTOFF, manifestCutoff + LOW_DELTA);"));
-        assertTrue(normal.contains("return Math.max(MIN_CUTOFF, manifestCutoff - HIGH_DELTA);"));
+        // The sensitivity mapping is today's, its steps and floor scaled to the model's cutoff.
+        assertTrue(normal.contains("return Math.min(MAX_CUTOFF, manifestCutoff + lowDelta);"));
+        assertTrue(normal.contains("return Math.max(minCutoff, manifestCutoff - highDelta);"));
+        assertTrue(detector.contains("scale = manifestCutoff / REFERENCE_CUTOFF;"));
         assertTrue(normal.contains("return manifestCutoff;"));
         assertFalse(normal.contains("mediaCutoff"));
     }

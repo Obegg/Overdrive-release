@@ -47,8 +47,9 @@ public final class VoiceAssistantConfig {
 
     /**
      * Stage-1 wake cutoff while media genuinely plays (a measurement knob set through POST
-     * /api/voice/config, not shown in the UI). The normal cutoff stays the wake model's own
-     * (0.45 in overdrive.json); {@link #WAKE_CUTOFF_UNDER_MEDIA_MAX} means no change under media.
+     * /api/voice/config, not shown in the UI). The normal cutoff stays the wake model's own.
+     * Every stored cutoff is in reference units where 0.45 is the model's own cutoff
+     * (WakeWordDetector.REFERENCE_CUTOFF, rescaled to the loaded model); the MAX means no change under media.
      */
     public static final double WAKE_CUTOFF_UNDER_MEDIA_MIN = 0.20;
     public static final double WAKE_CUTOFF_UNDER_MEDIA_MAX = 0.45;
@@ -260,15 +261,18 @@ public final class VoiceAssistantConfig {
         /** Stage-1 cutoff under media from their Train with music, or NaN. */
         public final double mediaCutoff;
         public final long trainedAt;
+        /** Wake model (manifest {@code model_id}) the cutoffs were measured on; "" before ids existed. */
+        public final String model;
 
         public PersonalVoice(String id, String name, java.util.List<String> lines, double cutoff,
-                             double mediaCutoff, long trainedAt) {
+                             double mediaCutoff, long trainedAt, String model) {
             this.id = id;
             this.name = name;
             this.lines = lines;
             this.cutoff = cutoff;
             this.mediaCutoff = mediaCutoff;
             this.trainedAt = trainedAt;
+            this.model = isModelId(model) ? model : "";
         }
 
         /** The persisted form inside {@code personalWake.voices}. */
@@ -279,6 +283,7 @@ public final class VoiceAssistantConfig {
                 if (!Double.isNaN(cutoff)) out.put("cutoff", cutoff);
                 if (!Double.isNaN(mediaCutoff)) out.put("mediaCutoff", mediaCutoff);
                 if (trainedAt > 0) out.put("trainedAt", trainedAt);
+                if (!model.isEmpty()) out.put("model", model);
             } catch (Exception ignored) {
             }
             return out;
@@ -318,7 +323,7 @@ public final class VoiceAssistantConfig {
         long trainedAt = Math.max(0L, v.optLong("trainedAt", 0L));
         // A training that needed nothing learned still names the voice on the settings page.
         if (lines.isEmpty() && Double.isNaN(cutoff) && Double.isNaN(media) && trainedAt == 0L) return null;
-        return new PersonalVoice(id, name, lines, cutoff, media, trainedAt);
+        return new PersonalVoice(id, name, lines, cutoff, media, trainedAt, v.optString("model", ""));
     }
 
     public static PersonalVoice findVoice(java.util.List<PersonalVoice> voices, String id) {
@@ -346,6 +351,22 @@ public final class VoiceAssistantConfig {
             if (!Double.isNaN(c) && (Double.isNaN(out) || c < out)) out = c;
         }
         return out;
+    }
+
+    /**
+     * As {@link #lowestCutoff(java.util.List, boolean)} over the voices measured on {@code modelId}:
+     * cutoffs from another wake model's scores do not transfer (the voice keeps its lines).
+     */
+    public static double lowestCutoff(java.util.List<PersonalVoice> voices, boolean media, String modelId) {
+        java.util.List<PersonalVoice> same = new java.util.ArrayList<>();
+        for (PersonalVoice v : voices) {
+            if (v.model.equals(modelId == null ? "" : modelId)) same.add(v);
+        }
+        return lowestCutoff(same, media);
+    }
+
+    public static boolean isModelId(String id) {
+        return id != null && id.matches("[A-Za-z0-9._-]{0,40}");
     }
 
     private static long latestTraining(java.util.List<PersonalVoice> voices) {

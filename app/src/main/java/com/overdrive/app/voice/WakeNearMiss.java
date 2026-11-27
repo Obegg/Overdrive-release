@@ -10,8 +10,11 @@ package com.overdrive.app.voice;
  */
 final class WakeNearMiss {
 
+    /** Reference units (WakeWordDetector.REFERENCE_CUTOFF); {@link #setFloor} takes the loaded model's. */
     static final float FLOOR = 0.20f;
     static final long MIN_INTERVAL_MS = 2000;
+
+    private float floor = FLOOR;
 
     private float bumpPeak;
     private float waiting = Float.NaN;
@@ -27,6 +30,11 @@ final class WakeNearMiss {
      * @param fired   the chunk completed a detection
      * @return the near-miss probability to report now, or NaN
      */
+    /** The floor on the loaded wake model's score scale. */
+    void setFloor(float modelFloor) {
+        floor = modelFloor;
+    }
+
     float onChunk(float peak, float current, float cutoff, boolean media, boolean fired, long now) {
         if (fired || !media) {
             // A hit is not a miss, and without media nothing is tracked.
@@ -34,8 +42,8 @@ final class WakeNearMiss {
             if (!media) waiting = Float.NaN;
             return Float.NaN;
         }
-        if (peak >= FLOOR && peak > bumpPeak) bumpPeak = peak;
-        if (current < FLOOR && bumpPeak >= FLOOR) {
+        if (peak >= floor && peak > bumpPeak) bumpPeak = peak;
+        if (current < floor && bumpPeak >= floor) {
             // The bump is over: a near miss when it never reached the cutoff.
             if (bumpPeak < cutoff && (Float.isNaN(waiting) || bumpPeak > waiting)) waiting = bumpPeak;
             bumpPeak = 0f;
