@@ -30,12 +30,11 @@ data class VadModelConfig(
     var debug: Boolean = false,
 )
 
-class SpeechSegment(val start: Int, val samples: FloatArray)
+class SpeechSegment(val start: Long, val samples: FloatArray)
 
 /**
- * Voice activity detector (sherpa-onnx v1.13.8 API). Only externals exported by the shipped
- * libsherpa-onnx-jni.so are declared, and only the ones this app uses; config fields are the
- * ones that native build reads, so newer upstream fields are deliberately absent.
+ * Voice activity detector (sherpa-onnx v2.0.3 API). Only the externals this app uses are
+ * declared; config fields are exactly the ones the native build reads.
  */
 class Vad(
     assetManager: AssetManager? = null,
