@@ -39,7 +39,11 @@ public class GenAiVoiceWebSocketTest {
         assertEquals("models/gemini-3.1-flash-live-preview",
                 setup.getString("model"));
         assertTrue(setup.has("outputAudioTranscription"));
+        // Near-field (the Assistant page) keeps the server's default VAD and no input transcript.
         assertFalse(setup.has("inputAudioTranscription"));
+        assertFalse(setup.has("realtimeInputConfig"));
+        assertEquals("{\"realtimeInput\":{\"audioStreamEnd\":true}}",
+                GenAiVoiceWebSocket.geminiAudioStreamEnd().toString());
         assertEquals("propose_overdrive_action",
                 setup.getJSONArray("tools").getJSONObject(0)
                         .getJSONArray("functionDeclarations")

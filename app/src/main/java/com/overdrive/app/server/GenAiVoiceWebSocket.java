@@ -61,6 +61,18 @@ public final class GenAiVoiceWebSocket {
     private static final long CONTEXT_APPROVAL_MS = 60 * 1000L;
     // No HTTP 101 from the provider within this: the route accepted TCP but relays nothing.
     static final long CONNECT_TIMEOUT_MS = 5_000;
+    // Far-field: one quick re-dial of the same route after such a timeout, before any direct fallback.
+    static final long FAST_RETRY_CONNECT_TIMEOUT_MS = 3_000;
+    // Far-field Gemini VAD (ai.google.dev live-api capabilities): music leaks into a cabin mic, so a
+    // start needs clear speech and the end comes readily; the client's audioStreamEnd ends it sooner.
+    static final String GEMINI_START_SENSITIVITY = "START_SENSITIVITY_LOW";
+    static final String GEMINI_END_SENSITIVITY = "END_SENSITIVITY_HIGH";
+    static final int GEMINI_PREFIX_PADDING_MS = 160;
+    static final int GEMINI_SILENCE_DURATION_MS = 600;
+    // goAway reconnects per session; client audio held while resuming (ms of input).
+    static final int MAX_RESUMES = 3;
+    static final int RESUME_BACKLOG_MS = 3_000;
+    private static final int INPUT_TRANSCRIPT_LOG_CHARS = 60;
     // Measured from the socket open; no setupComplete / session.updated by then is a provider fault.
     // Below the hands-free client's 8 s live window (VoiceSessionClient.LIVE_TIMEOUT_MS) so the daemon
     // reports the phase it was in before the app gives up and labels the turn itself.
@@ -219,13 +231,64 @@ public final class GenAiVoiceWebSocket {
      */
     static String setupDecision(String failure, long providerOpenedAt, int attempt, int readyAttempt, long now,
                                 long connectStartedAt, boolean directAllowed, boolean triedDirect) {
+        return setupDecision(failure, providerOpenedAt, attempt, readyAttempt, now, connectStartedAt,
+                CONNECT_TIMEOUT_MS, false, directAllowed, triedDirect);
+    }
+
+    /**
+     * Adds {@code "retry_same"}: a connect timeout with no socket open re-dials the same route once
+     * (when {@code sameRouteRetry}) before the opt-in direct retry. Failures never re-dial the route.
+     */
+    static String setupDecision(String failure, long providerOpenedAt, int attempt, int readyAttempt, long now,
+                                long connectStartedAt, long connectTimeoutMs, boolean sameRouteRetry,
+                                boolean directAllowed, boolean triedDirect) {
         boolean beforeOpen = providerOpenedAt == 0;
         boolean canRetry = beforeOpen && directAllowed && !triedDirect;
         if (failure != null) return canRetry ? "retry" : (beforeOpen ? "fail:connect_failed" : "fail:setup_failed");
         if (readyAttempt == attempt) return "live";
-        if (beforeOpen && now - connectStartedAt > CONNECT_TIMEOUT_MS) return canRetry ? "retry" : "connect_timeout";
+        if (beforeOpen && now - connectStartedAt > connectTimeoutMs) {
+            return sameRouteRetry ? "retry_same" : (canRetry ? "retry" : "connect_timeout");
+        }
         if (!beforeOpen && now - providerOpenedAt > SETUP_TIMEOUT_MS) return "setup_timeout";
         return "wait";
+    }
+
+    /** Log-safe goAway timeLeft (a protobuf Duration, JSON "12.5s"), or "?" when absent or odd. */
+    static String durationForLog(Object value) {
+        String text = value == null ? "" : String.valueOf(value).trim();
+        return text.matches("[0-9]{1,9}(\\.[0-9]{1,9})?s") ? text : "?";
+    }
+
+    /** Lowercase letters, digits and spaces only, capped: what a user transcript may put in the log. */
+    static String transcriptForLog(String raw, int max) {
+        String plain = (raw == null ? "" : raw).toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9 ]", " ")
+                .replaceAll(" +", " ").trim();
+        return plain.length() > max ? plain.substring(0, max) : plain;
+    }
+
+    /** Provider call ids for the log: id-shaped tokens only. */
+    static String idsForLog(JSONArray ids) {
+        StringBuilder out = new StringBuilder();
+        for (int i = 0; ids != null && i < ids.length() && i < 8; i++) {
+            String id = ids.optString(i, "");
+            if (out.length() > 0) out.append(',');
+            out.append(id.matches("[A-Za-z0-9_.:-]{1,64}") ? id : "invalid");
+        }
+        return "[" + out + "]";
+    }
+
+    /** {@code realtimeInputConfig} for far-field Gemini: automatic VAD tuned for a cabin microphone. */
+    static JSONObject geminiRealtimeInputConfig() throws Exception {
+        return new JSONObject().put("automaticActivityDetection", new JSONObject()
+                .put("startOfSpeechSensitivity", GEMINI_START_SENSITIVITY)
+                .put("endOfSpeechSensitivity", GEMINI_END_SENSITIVITY)
+                .put("prefixPaddingMs", GEMINI_PREFIX_PADDING_MS)
+                .put("silenceDurationMs", GEMINI_SILENCE_DURATION_MS));
+    }
+
+    /** Client control {@code audio_stream_end} in Gemini's shape. */
+    static JSONObject geminiAudioStreamEnd() throws Exception {
+        return new JSONObject().put("realtimeInput", new JSONObject().put("audioStreamEnd", true));
     }
 
     /**
@@ -464,7 +527,7 @@ public final class GenAiVoiceWebSocket {
         JSONArray tools = new JSONArray().put(new JSONObject()
                 .put("functionDeclarations", declarations));
         if (googleSearch) tools.put(new JSONObject().put("googleSearch", new JSONObject()));
-        return new JSONObject().put("setup", new JSONObject()
+        JSONObject setup = new JSONObject().put("setup", new JSONObject()
                 .put("model", resource)
                 .put("generationConfig", new JSONObject()
                         .put("responseModalities",
@@ -482,9 +545,16 @@ public final class GenAiVoiceWebSocket {
                                                         .GenAiWebSearch.realtimeGuidance()
                                                 : instructions))))
                 .put("tools", tools)
-                // Output transcript aids accessibility. Input transcription is
-                // intentionally absent: voice remains native audio-to-audio.
+                // Output transcript aids accessibility; audio stays native audio-to-audio.
                 .put("outputAudioTranscription", new JSONObject()));
+        if (farField) {
+            // Hands-free: tuned VAD, the user's words for endpointing and logs, and goAway resumption.
+            setup.getJSONObject("setup")
+                    .put("realtimeInputConfig", geminiRealtimeInputConfig())
+                    .put("inputAudioTranscription", new JSONObject())
+                    .put("sessionResumption", new JSONObject());
+        }
+        return setup;
     }
 
     /**
@@ -537,6 +607,36 @@ public final class GenAiVoiceWebSocket {
         private volatile int speechStarts;
         private volatile int responses;
         private volatile int audioChunks;
+        // Post-setup event counts for the session summary.
+        private volatile int interruptions;
+        private volatile int turnCompletes;
+        private volatile int generationCompletes;
+        private volatile int goAways;
+        private volatile int toolCancellations;
+        private volatile int streamEnds;
+        private volatile int resumes;
+        private volatile long uplinkBytes;
+        private volatile int uplinkRate = 16_000;
+        // Earliest end-of-speech mark of the current user turn (client audioStreamEnd or provider VAD).
+        private volatile long endOfSpeechAt;
+        private volatile long firstReplyMs = -1;
+        private volatile long lastTotalTokens = -1;
+        // A user turn is open from its first speech signal until the model's turn completes.
+        private volatile boolean userTurnOpen;
+        private volatile boolean openAiResponseActive;
+        // Listener thread only: the current user turn's transcript (final chunks, then the interim).
+        private final StringBuilder userTranscript = new StringBuilder();
+        private String userInterim = "";
+        // Gemini session resumption: the newest resumable handle, and a goAway asking to use it.
+        private volatile String resumeHandle;
+        private volatile boolean resumeRequested;
+        private volatile String resumeWith;
+        private boolean resuming;
+        private boolean streamEndAfterResume;
+        private int resumeBacklogBytes;
+        private final java.util.ArrayDeque<byte[]> resumeBacklog = new java.util.ArrayDeque<>();
+        private long connectTimeoutMs = CONNECT_TIMEOUT_MS;
+        private boolean triedSameRoute;
         // The model's first spoken words: the only trace of why a hands-free turn did not act.
         private final StringBuilder replyHead = new StringBuilder();
         private volatile String provider = "";
@@ -596,6 +696,13 @@ public final class GenAiVoiceWebSocket {
                     + " mic=" + (farField ? "far" : "near")
                     + " speechStarts=" + speechStarts + " responses=" + responses
                     + " audioChunks=" + audioChunks
+                    + " interrupted=" + interruptions + " turnComplete=" + turnCompletes
+                    + " generationComplete=" + generationCompletes + " goAway=" + goAways
+                    + " resumed=" + resumes + " toolCancels=" + toolCancellations
+                    + " streamEnds=" + streamEnds
+                    + " uplinkMs=" + uplinkBytes * 1000L / (2L * Math.max(1, uplinkRate))
+                    + " firstReplyMs=" + firstReplyMs
+                    + (lastTotalTokens >= 0 ? " tokens=" + lastTotalTokens : "")
                     + " reason=" + (failure != null ? failure : stopReason)
                     + " route=" + route + " connectMs=" + connectMs() + " setupMs=" + setupMs
                     + " code=" + code
@@ -684,6 +791,7 @@ public final class GenAiVoiceWebSocket {
                     config.provider);
             provider = String.valueOf(config.provider);
             int inputRate = openAi ? 24_000 : 16_000;
+            uplinkRate = inputRate;
             sendJson(new JSONObject()
                     .put("type", "connected")
                     .put("provider", config.provider)
@@ -722,7 +830,8 @@ public final class GenAiVoiceWebSocket {
                 String failure = providerFailure;
                 if (!live) {
                     String decision = setupDecision(failure, providerOpenedAt, providerAttempt, readyAttempt,
-                            now, connectStartedAt, directAllowed, triedDirect);
+                            now, connectStartedAt, connectTimeoutMs, farField && !triedSameRoute,
+                            directAllowed, triedDirect);
                     if ("live".equals(decision)) {
                         live = true;
                         socket.setSoTimeout(1_000);
@@ -744,13 +853,22 @@ public final class GenAiVoiceWebSocket {
                                 .put("inputSampleRate", inputRate)
                                 .put("outputSampleRate", 24_000));
                         if (briefing != null && briefing.asks()) sendBriefingKickoff(openAi);
+                    } else if ("retry_same".equals(decision)) {
+                        logger.warn(connectTimedOut(now) + "; re-dialling the same route once ("
+                                + FAST_RETRY_CONNECT_TIMEOUT_MS + " ms limit)");
+                        retrySameRoute(openAi, instructions, now);
+                        continue;
                     } else if ("retry".equals(decision)) {
                         if (failure == null) logger.warn(connectTimedOut(now));
                         retryDirect(openAi, instructions, now);
                         continue;
                     } else if ("connect_timeout".equals(decision)) {
-                        logger.warn(connectTimedOut(now));
-                        failAndClose("AI voice could not connect (no answer from the network route within 5 s)",
+                        logger.warn(connectTimedOut(now) + "; failing (direct fallback "
+                                + (triedDirect ? "already tried" : farField && !"direct".equals(route)
+                                        ? "off: realtimeDirectFallback=false" : "not applicable") + ")");
+                        failAndClose("AI voice could not connect (no answer from the network route within "
+                                + connectTimeoutMs / 1000 + " s" + (providerAttempt > 1
+                                        ? ", " + providerAttempt + " attempts" : "") + ")",
                                 1011, "connect_timeout");
                         return;
                     } else if ("setup_timeout".equals(decision)) {
@@ -782,7 +900,25 @@ public final class GenAiVoiceWebSocket {
                         return;
                     }
                 } else {
-                    if (failure != null) {
+                    // A goAway with a resumable handle re-dials before the old socket is cut.
+                    if (resumeRequested && !resuming) {
+                        resumeRequested = false;
+                        startResume(openAi, instructions);
+                        continue;
+                    }
+                    if (resuming) {
+                        String decision = setupDecision(failure, providerOpenedAt, providerAttempt, readyAttempt,
+                                now, connectStartedAt, connectTimeoutMs, false, false, true);
+                        if ("live".equals(decision)) {
+                            finishResume(openAi, inputRate);
+                        } else if (!"wait".equals(decision)) {
+                            logger.warn("Realtime provider resume failed (" + decision + "): "
+                                    + (failure != null ? failure : "no setupComplete"));
+                            failAndClose(failure != null ? failure : "Realtime provider could not resume",
+                                    1011, providerFailureCode != null ? providerFailureCode : "provider_closed");
+                            return;
+                        }
+                    } else if (failure != null) {
                         failAndClose(failure, 1011,
                                 providerFailureCode != null ? providerFailureCode : "provider_failed");
                         return;
@@ -826,6 +962,11 @@ public final class GenAiVoiceWebSocket {
                     preLiveAudioFrames++;
                     continue;
                 }
+                if (resuming) {
+                    holdForResume(frame.payload, inputRate);
+                    lastAudioAt = now;
+                    continue;
+                }
                 // The provider died since the top-of-loop check: drop the frame, the next pass reports it.
                 if (providerFailure != null) continue;
                 try {
@@ -859,6 +1000,18 @@ public final class GenAiVoiceWebSocket {
                         "reason", "Stopped by user"));
                 return;
             }
+            if ("audio_stream_end".equals(type)) {
+                // Hybrid VAD: the client's endpointer ends the turn; OpenAI's semantic_vad needs nothing.
+                if (GenAiConfig.PROVIDER_OPENAI.equals(config.provider)) return;
+                if (resuming) {
+                    streamEndAfterResume = true;
+                } else {
+                    sendAudioStreamEnd();
+                }
+                return;
+            }
+            // A resuming socket takes nothing before its setup; the resumed state predates any open call.
+            if (resuming) return;
             if ("action_result".equals(type)) {
                 String actionType = control.optString("actionType", "");
                 boolean success = control.optBoolean("success", false);
@@ -1361,6 +1514,7 @@ public final class GenAiVoiceWebSocket {
                 throw new IOException(
                         "Realtime provider stopped accepting audio");
             }
+            uplinkBytes += pcm.length;
         }
 
         void requestStop(String reason) {
@@ -1417,6 +1571,7 @@ public final class GenAiVoiceWebSocket {
             providerFailure = null;
             providerFailureCode = null;
             providerOpenedAt = 0;
+            connectTimeoutMs = CONNECT_TIMEOUT_MS;
             connectStartedAt = System.currentTimeMillis();
             try {
                 providerSocket = runtime.openRealtimeWebSocket(providerUrl(config),
@@ -1439,9 +1594,94 @@ public final class GenAiVoiceWebSocket {
             openProvider(openAi, instructions, true);
         }
 
+        /** Far-field, once: a route that accepted TCP and relayed nothing often answers a fresh dial. */
+        private void retrySameRoute(boolean openAi, String instructions, long now) throws Exception {
+            triedSameRoute = true;
+            sendJson(retryingMessage("same", now - connectStartedAt));
+            openProvider(openAi, instructions, "direct (fallback)".equals(route));
+            connectTimeoutMs = FAST_RETRY_CONNECT_TIMEOUT_MS;
+        }
+
         private String connectTimedOut(long now) {
-            return "Realtime provider connect timed out after " + (now - connectStartedAt) + " ms (route="
-                    + route + "): no socket open; the proxy accepted TCP but relayed nothing";
+            return "Realtime provider connect timed out after " + (now - connectStartedAt) + " ms (limit "
+                    + connectTimeoutMs + " ms, route=" + route + ", attempt=" + providerAttempt
+                    + "): no socket open; the route accepted TCP but relayed nothing";
+        }
+
+        /** Session thread. Re-dials with the newest handle; the old socket is closed by openProvider. */
+        private void startResume(boolean openAi, String instructions) throws Exception {
+            resuming = true;
+            resumes++;
+            resumeWith = resumeHandle;
+            logger.info("Realtime provider resuming after goAway (resume " + resumes + "/" + MAX_RESUMES
+                    + ", route=" + route + ")");
+            openProvider(openAi, instructions, "direct (fallback)".equals(route));
+        }
+
+        /** The resumed socket is ready: replay the held mic audio, then any deferred stream end. */
+        private void finishResume(boolean openAi, int inputRate) throws Exception {
+            resuming = false;
+            resumeWith = null;
+            logger.info("Realtime provider resumed after " + (System.currentTimeMillis() - connectStartedAt)
+                    + " ms (held " + resumeBacklogBytes * 1000L / (2L * inputRate) + " ms of audio)");
+            while (!resumeBacklog.isEmpty()) sendProviderAudio(resumeBacklog.pollFirst(), openAi, inputRate);
+            resumeBacklogBytes = 0;
+            if (streamEndAfterResume) {
+                streamEndAfterResume = false;
+                sendAudioStreamEnd();
+            }
+        }
+
+        /** Newest audio kept; the oldest is dropped beyond {@link #RESUME_BACKLOG_MS}. */
+        private void holdForResume(byte[] pcm, int inputRate) {
+            int cap = inputRate * 2 * RESUME_BACKLOG_MS / 1000;
+            resumeBacklog.addLast(pcm);
+            resumeBacklogBytes += pcm.length;
+            while (resumeBacklogBytes > cap && resumeBacklog.size() > 1) {
+                resumeBacklogBytes -= resumeBacklog.pollFirst().length;
+            }
+        }
+
+        private void sendAudioStreamEnd() throws Exception {
+            WebSocket provider = providerSocket;
+            if (provider == null || !provider.send(geminiAudioStreamEnd().toString())) return;
+            streamEnds++;
+            if (endOfSpeechAt == 0) endOfSpeechAt = System.currentTimeMillis();
+            logger.info("Realtime event: audioStreamEnd sent (client end of speech)");
+        }
+
+        /** First reply audio after an end-of-speech mark: one latency line per user turn. */
+        private void noteReplyAudio() {
+            long mark = endOfSpeechAt;
+            if (mark == 0) return;
+            endOfSpeechAt = 0;
+            long ms = System.currentTimeMillis() - mark;
+            if (firstReplyMs < 0) firstReplyMs = ms;
+            logger.info("Realtime event: first reply audio " + ms + " ms after end of speech");
+        }
+
+        private void sendInputTranscript(String text, boolean done) throws IOException {
+            try {
+                sendJson(new JSONObject().put("type", "input_transcript").put("text", text).put("done", done));
+            } catch (org.json.JSONException ignored) {
+            }
+        }
+
+        /** The user's whole turn: to the client, and (capped, never for a briefing) to the log. */
+        private void finishInputTranscript(String text) throws IOException {
+            if (briefing == null) {
+                logger.info("Realtime event: inputTranscription \""
+                        + transcriptForLog(text, INPUT_TRANSCRIPT_LOG_CHARS) + "\"");
+            }
+            sendInputTranscript(text, true);
+        }
+
+        /** A user-speech signal (VAD start, transcript, barge-in): counts once per user turn. */
+        private void noteUserSpeech() {
+            if (userTurnOpen) return;
+            userTurnOpen = true;
+            speechStarts++;
+            endOfSpeechAt = 0;
         }
 
         /**
@@ -1542,6 +1782,7 @@ public final class GenAiVoiceWebSocket {
 
         private void sendBinary(byte[] bytes) throws IOException {
             audioChunks++;
+            noteReplyAudio();
             sendFrame(0x2, bytes);
         }
 
@@ -1586,6 +1827,10 @@ public final class GenAiVoiceWebSocket {
                             : geminiSetup(
                                     config.realtimeModel, instructions, farField,
                                     searchThisAttempt, searchFunctionThisAttempt);
+                    String handle = resumeWith;
+                    JSONObject resumption = openAi ? null
+                            : setup.getJSONObject("setup").optJSONObject("sessionResumption");
+                    if (resumption != null && handle != null) resumption.put("handle", handle);
                     if (!webSocket.send(setup.toString())) {
                         providerFailed(
                                 "Realtime provider rejected setup", "setup_failed");
@@ -1726,11 +1971,34 @@ public final class GenAiVoiceWebSocket {
                 }
                 if ("input_audio_buffer.speech_started".equals(type)) {
                     speechStarts++;
+                    endOfSpeechAt = 0;
+                    boolean bargeIn = openAiResponseActive;
                     sendJson(new JSONObject().put("type", "clear"));
+                    if (bargeIn) {
+                        // semantic_vad's interrupt_response cancels the reply server-side.
+                        interruptions++;
+                        logger.info("Realtime event: interrupted (speech during a response)");
+                        sendJson(new JSONObject().put("type", "interrupted"));
+                    }
                     sendJson(new JSONObject()
                             .put("type", "state")
                             .put("state", "listening"));
                     return;
+                }
+                if ("conversation.item.input_audio_transcription.delta".equals(type)) {
+                    userTranscript.append(event.optString("delta", ""));
+                    sendInputTranscript(userTranscript.toString(), false);
+                    return;
+                }
+                if ("conversation.item.input_audio_transcription.completed".equals(type)) {
+                    userTranscript.setLength(0);
+                    finishInputTranscript(event.optString("transcript", ""));
+                    return;
+                }
+                if ("input_audio_buffer.speech_stopped".equals(type)) {
+                    if (endOfSpeechAt == 0) endOfSpeechAt = System.currentTimeMillis();
+                } else if ("response.created".equals(type)) {
+                    openAiResponseActive = true;
                 }
                 if ("input_audio_buffer.speech_stopped".equals(type)
                         || "response.created".equals(type)) {
@@ -1745,6 +2013,18 @@ public final class GenAiVoiceWebSocket {
                 }
                 if ("response.done".equals(type)) {
                     responses++;
+                    openAiResponseActive = false;
+                    turnCompletes++;
+                    generationCompletes++;
+                    JSONObject done = event.optJSONObject("response");
+                    JSONObject usage = done == null ? null : done.optJSONObject("usage");
+                    if (usage != null) lastTotalTokens = usage.optLong("total_tokens", lastTotalTokens);
+                    String status = done == null ? "" : done.optString("status", "");
+                    logger.info("Realtime event: response.done status="
+                            + (status.matches("[a-z_]{1,24}") ? status : "?")
+                            + (usage == null ? "" : " tokens(in=" + usage.optLong("input_tokens", -1)
+                                    + ",out=" + usage.optLong("output_tokens", -1)
+                                    + ",total=" + usage.optLong("total_tokens", -1) + ")"));
                     if (handleOpenAiToolCalls(event)) return;
                     sendJson(new JSONObject()
                             .put("type", "state")
@@ -1931,19 +2211,49 @@ public final class GenAiVoiceWebSocket {
                     providerFailed(error, live ? "provider_failed" : "setup_rejected");
                     return;
                 }
-                if (handleGeminiToolCalls(event)) return;
-                if (cancelSearchCalls(event.optJSONObject("toolCallCancellation"))) return;
-                JSONObject content = event.optJSONObject(
-                        "serverContent");
-                if (content == null) {
-                    if (event.has("goAway")) {
-                        providerFailed(
-                                "Gemini Live requested a reconnect", "provider_closed");
-                    }
+                noteGeminiUsage(event.optJSONObject("usageMetadata"));
+                noteVoiceActivity(event.optJSONObject("voiceActivity"));
+                JSONObject resumption = event.optJSONObject("sessionResumptionUpdate");
+                if (resumption != null) {
+                    String handle = resumption.optString("newHandle", "");
+                    if (resumption.optBoolean("resumable", false) && !handle.isEmpty()) resumeHandle = handle;
                     return;
                 }
+                if (event.has("goAway")) {
+                    onGoAway(event.optJSONObject("goAway"));
+                    return;
+                }
+                if (handleGeminiToolCalls(event)) return;
+                JSONObject cancellation = event.optJSONObject("toolCallCancellation");
+                if (cancellation != null) {
+                    toolCancellations++;
+                    logger.info("Realtime event: toolCallCancellation ids="
+                            + idsForLog(cancellation.optJSONArray("ids")));
+                }
+                if (cancelSearchCalls(cancellation)) return;
+                JSONObject content = event.optJSONObject(
+                        "serverContent");
+                if (content == null) return;
                 if (content.optBoolean("interrupted", false)) {
+                    interruptions++;
+                    noteUserSpeech();
+                    endOfSpeechAt = 0;
+                    logger.info("Realtime event: interrupted");
                     sendJson(new JSONObject().put("type", "clear"));
+                    sendJson(new JSONObject().put("type", "interrupted"));
+                }
+                JSONObject heard = content.optJSONObject("inputTranscription");
+                if (heard != null && !heard.optString("text", "").isEmpty()) {
+                    noteUserSpeech();
+                    userTranscript.append(heard.optString("text", ""));
+                    userInterim = "";
+                    sendInputTranscript(userTranscript.toString(), false);
+                }
+                JSONObject interim = content.optJSONObject("interimInputTranscription");
+                if (interim != null && !interim.optString("text", "").isEmpty()) {
+                    noteUserSpeech();
+                    userInterim = interim.optString("text", "");
+                    sendInputTranscript(userTranscript + userInterim, false);
                 }
                 JSONObject transcript = content.optJSONObject(
                         "outputTranscription");
@@ -1976,14 +2286,58 @@ public final class GenAiVoiceWebSocket {
                                 Base64.DEFAULT));
                     }
                 }
+                if (content.optBoolean("generationComplete", false)) {
+                    generationCompletes++;
+                    logger.info("Realtime event: generationComplete");
+                }
                 if (content.optBoolean("turnComplete", false)) {
                     responses++;
+                    turnCompletes++;
+                    logger.info("Realtime event: turnComplete" + (lastTotalTokens >= 0
+                            ? " tokens(total=" + lastTotalTokens + ")" : ""));
+                    String said = userTranscript.toString() + userInterim;
+                    userTranscript.setLength(0);
+                    userInterim = "";
+                    userTurnOpen = false;
+                    if (!said.isEmpty()) finishInputTranscript(said);
                     sendJson(new JSONObject()
                             .put("type", "transcript_done")
                             .put("text", ""));
                     sendJson(new JSONObject()
                             .put("type", "state")
                             .put("state", "listening"));
+                }
+            }
+
+            /** Gemini usageMetadata: the newest totals, logged with the turn that used them. */
+            private void noteGeminiUsage(JSONObject usage) {
+                if (usage == null || !usage.has("totalTokenCount")) return;
+                lastTotalTokens = usage.optLong("totalTokenCount", lastTotalTokens);
+            }
+
+            /** Gemini voiceActivity: the provider's VAD start / end of the user's speech. */
+            private void noteVoiceActivity(JSONObject activity) throws Exception {
+                String type = activity == null ? "" : activity.optString("type", "");
+                if ("ACTIVITY_START".equals(type)) {
+                    noteUserSpeech();
+                    sendJson(new JSONObject().put("type", "user_speech_start"));
+                } else if ("ACTIVITY_END".equals(type)) {
+                    if (endOfSpeechAt == 0) endOfSpeechAt = System.currentTimeMillis();
+                    sendJson(new JSONObject().put("type", "user_speech_end"));
+                }
+            }
+
+            /** goAway: resume on a fresh socket when a handle exists (far-field), else end as before. */
+            private void onGoAway(JSONObject goAway) {
+                goAways++;
+                boolean resume = farField && live && resumeHandle != null && resumes < MAX_RESUMES;
+                logger.info("Realtime event: goAway timeLeft="
+                        + durationForLog(goAway == null ? null : goAway.opt("timeLeft"))
+                        + (resume ? " (resuming with the session handle)" : " (no resumable handle)"));
+                if (resume) {
+                    resumeRequested = true;
+                } else {
+                    providerFailed("Gemini Live requested a reconnect", "provider_closed");
                 }
             }
 

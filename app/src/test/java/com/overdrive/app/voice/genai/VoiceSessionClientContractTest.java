@@ -132,14 +132,15 @@ public class VoiceSessionClientContractTest {
     }
 
     @Test
-    public void retryingRearmsTheLiveTimerExactlyOnce() throws Exception {
+    public void retryingRearmsTheLiveTimerAtMostTwice() throws Exception {
         String src = readProjectFile(CLIENT);
         String onText = block(src, "    private void onText(String text) {");
         assertTrue(onText.contains("case \"retrying\":"));
         assertTrue(onText.contains("rearmLiveTimerLocked(m.optString(\"route\", \"\"));"));
         String rearm = block(src, "    private void rearmLiveTimerLocked(String route) {");
-        assertTrue(rearm.contains("if (live || liveTimerRearmed) return;"));
-        assertTrue(rearm.contains("liveTimerRearmed = true;"));
+        assertTrue(src.contains("MAX_LIVE_REARMS = 2;"));
+        assertTrue(rearm.contains("if (live || liveTimerRearms >= MAX_LIVE_REARMS) return;"));
+        assertTrue(rearm.contains("liveTimerRearms++;"));
         assertTrue(rearm.contains("t.cancel(false)"));
         assertTrue(rearm.contains("events.schedule(this::liveTimeout"));
         assertTrue(rearm.contains("RejectedExecutionException"));
