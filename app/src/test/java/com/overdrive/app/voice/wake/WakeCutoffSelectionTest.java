@@ -15,7 +15,7 @@ import org.junit.Test;
 /**
  * The one change to stage-1 behaviour: while media plays the voice engine sets a media cutoff
  * that can only lower the cutoff in force (never raise it, never below 0.20); without it the
- * model's own cutoff (0.45 in overdrive.json) and the sensitivity mapping are exactly as before.
+ * model's own cutoff (0.20 in overdrive.json, the retrained model) and the sensitivity mapping are as before.
  * The decider's recent-peak read is diagnostics only and survives the clear after a detection.
  */
 public class WakeCutoffSelectionTest {
@@ -36,7 +36,7 @@ public class WakeCutoffSelectionTest {
     @Test
     public void theNormalCutoffIsTheModelsOwnAndTheModelIsUntouched() throws Exception {
         JSONObject manifest = new JSONObject(read("src/main/assets/voice/wake/overdrive.json"));
-        assertEquals(0.45, manifest.getJSONObject("micro").getDouble("probability_cutoff"), 1e-9);
+        assertEquals(0.20, manifest.getJSONObject("micro").getDouble("probability_cutoff"), 1e-9);
         assertEquals(5, manifest.getJSONObject("micro").getInt("sliding_window_size"));
         String detector = read("src/main/java/com/overdrive/app/voice/wake/WakeWordDetector.java");
         assertTrue(detector.contains("return withMediaCutoff(normalCutoff(), mediaCutoff);"));
