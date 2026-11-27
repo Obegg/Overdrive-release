@@ -61,6 +61,14 @@ public final class VoiceSessionClient {
         /** Trip Briefing sessions only: the model called trip_briefing_answer ("yes" | "no", app or null). */
         default void onBriefingAnswer(String answer, String app) {
         }
+
+        /** The provider cut its reply for the user's speech (barge-in); playback is already flushed. */
+        default void onServerInterrupted() {
+        }
+
+        /** The provider's transcript of the user's turn so far; {@code done} once the turn is over. */
+        default void onInputTranscript(String partial, boolean done) {
+        }
     }
 
     private static final String TAG = "VoiceSession";
@@ -70,6 +78,10 @@ public final class VoiceSessionClient {
     private static final String KIND_UNKNOWN = "unknown";
     private static final String STOP_REASON = "Voice turn ended";
     private static final long LIVE_TIMEOUT_MS = 8_000;
+    // The daemon may re-dial the same route, then direct: each earns one more live window.
+    private static final int MAX_LIVE_REARMS = 2;
+    // After audioStreamEnd the mic stays closed until reply audio or the turn ends, at most this long.
+    static final long STREAM_END_HOLD_MS = 8_000;
     private static final long FAILED_CLOSE_GRACE_MS = 2_000;
     private static final long PREVIOUS_SOCKET_WAIT_MS = 2_500;
     private static final long PROMPT_HOLD_MS = 15_000;
@@ -105,6 +117,9 @@ public final class VoiceSessionClient {
     private volatile boolean live;
     private volatile ReplyPlayer player;
     private volatile HttpURLConnection inFlight;
+    private volatile boolean fullDuplex;
+    // elapsedRealtime until which mic audio is held after endOfUserSpeech; 0 = open.
+    private volatile long uplinkHeldUntil;
     private boolean endDelivered;
 
     // Guarded by stateLock.
@@ -117,8 +132,10 @@ public final class VoiceSessionClient {
     /** Daemon's failed{code}; lets a connect- or setup-phase failure surface as connect_failed / setup_failed. */
     private String failureCode = "";
     private ScheduledFuture<?> liveTimer;
-    /** The daemon's single direct-fallback retry earns exactly one extra live window. */
-    private boolean liveTimerRearmed;
+    /** Each daemon retry (same route, then direct) earns one extra live window, at most MAX_LIVE_REARMS. */
+    private int liveTimerRearms;
+    /** audio_stream_end already sent for this user turn. */
+    private boolean streamEndSent;
     private boolean sawStopped;
     private boolean pendingClear;
     private boolean providerBusy;
@@ -155,7 +172,7 @@ public final class VoiceSessionClient {
         this.pump = new UplinkPump(new PumpSink(), frameMs);
     }
 
-    /** {@code frameMs} sizes uplink frames per provider rate; 0 keeps the legacy 2048-sample frame. */
+    /** {@code frameMs} sizes uplink frames per provider rate; 0 uses UplinkPump.DEFAULT_FRAME_MS. */
     public static VoiceSessionClient open(Context ctx, String language, String audioChannel,
                                           int frameMs, Listener listener) {
         return open(ctx, language, audioChannel, frameMs, null, listener);
@@ -173,18 +190,56 @@ public final class VoiceSessionClient {
         return client;
     }
 
-    /** Thread-safe; buffered (10 s, oldest dropped) until live, dropped while a reply plays. */
+    /**
+     * Thread-safe; buffered (10 s, oldest dropped) until live. Half duplex (default) drops it while
+     * a reply plays; full duplex keeps it flowing for barge-in. Held after {@link #endOfUserSpeech}.
+     */
     public void sendPcm16k(short[] pcm, int offset, int length) {
         if (pcm == null || length <= 0 || offset < 0 || offset > pcm.length - length
                 || ended.get()) {
             return;
         }
+        if (uplinkHeld()) return;
         ReplyPlayer p = player;
-        if (p != null && p.isActive()) {
+        if (!fullDuplex && p != null && p.isActive()) {
             pump.markGap();
             return;
         }
         pump.write(pcm, offset, length);
+    }
+
+    /** True: mic audio keeps uplinking while the reply plays, and the provider's VAD can barge in. */
+    public void setFullDuplex(boolean enabled) {
+        fullDuplex = enabled;
+    }
+
+    /**
+     * The local endpointer heard the user finish. Gemini gets {@code audioStreamEnd} once per user
+     * turn, after every sample already written, and the mic is held until reply audio or turn end
+     * (more audio would reopen the stream). OpenAI: no-op, semantic_vad ends turns itself.
+     */
+    public void endOfUserSpeech() {
+        synchronized (stateLock) {
+            if (ended.get() || streamEndSent) return;
+            if (!provider.isEmpty() && !isGemini()) return;
+            streamEndSent = true;
+            uplinkHeldUntil = SystemClock.elapsedRealtime() + STREAM_END_HOLD_MS;
+        }
+        pump.markStreamEnd();
+    }
+
+    private boolean uplinkHeld() {
+        long until = uplinkHeldUntil;
+        if (until == 0) return false;
+        if (SystemClock.elapsedRealtime() < until) return true;
+        uplinkHeldUntil = 0;
+        return false;
+    }
+
+    /** A new user turn (provider VAD start, barge-in, or the model's turn ended). */
+    private void newUserTurnLocked() {
+        streamEndSent = false;
+        uplinkHeldUntil = 0;
     }
 
     public static String proposalKind(JSONObject proposal) {
@@ -300,10 +355,10 @@ public final class VoiceSessionClient {
      * same live window the first one had, but only once per session.
      */
     private void rearmLiveTimerLocked(String route) {
-        if (live || liveTimerRearmed) return;
+        if (live || liveTimerRearms >= MAX_LIVE_REARMS) return;
         ScheduledFuture<?> t = liveTimer;
         if (t == null || !t.cancel(false)) return;
-        liveTimerRearmed = true;
+        liveTimerRearms++;
         try {
             liveTimer = events.schedule(this::liveTimeout, LIVE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
             Log.i(TAG, "Voice bridge retrying via " + route + "; waiting another " + LIVE_TIMEOUT_MS + " ms");
@@ -472,6 +527,24 @@ public final class VoiceSessionClient {
                     onServerClearLocked();
                     pendingClear = true;
                     break;
+                case "interrupted":
+                    // The clear before it already flushed playback; flush again in case it was lost.
+                    flushPlaybackLocked(true);
+                    newUserTurnLocked();
+                    post(listener::onServerInterrupted);
+                    break;
+                case "user_speech_start":
+                    newUserTurnLocked();
+                    break;
+                case "user_speech_end":
+                    post(listener::onUserSpeechStopped);
+                    break;
+                case "input_transcript": {
+                    final String heard = m.optString("text", "");
+                    final boolean done = m.optBoolean("done", false);
+                    post(() -> listener.onInputTranscript(heard, done));
+                    break;
+                }
                 case "action_proposal":
                     onProposalLocked(m);
                     break;
@@ -528,7 +601,11 @@ public final class VoiceSessionClient {
         }
         if (!"listening".equals(state)) return;
         // OpenAI speech_started arrives as clear + listening; that is the user's turn, not ours.
-        if (afterClear && !isGemini()) return;
+        if (afterClear && !isGemini()) {
+            newUserTurnLocked();
+            return;
+        }
+        newUserTurnLocked();
         providerBusy = false;
         mutedTurn = false;
         turnCompleteOwed = true;
@@ -601,6 +678,8 @@ public final class VoiceSessionClient {
     private void onAudio(ByteString bytes) {
         synchronized (stateLock) {
             if (ended.get() || !live) return;
+            // Reply audio arriving at all reopens the mic, played or not.
+            uplinkHeldUntil = 0;
             if (mutedTurn || replySuppressedLocked()) return;
             if (!mutedItemId.isEmpty() && mutedItemId.equals(currentItemId)) return;
             ReplyPlayer p = player;
@@ -936,6 +1015,17 @@ public final class VoiceSessionClient {
         @Override
         public void onPrerollFlushed() {
             post(listener::onLive);
+        }
+
+        @Override
+        public void onStreamEnd() {
+            boolean gemini;
+            synchronized (stateLock) {
+                gemini = isGemini();
+            }
+            WebSocket s = socket;
+            // Same thread as the audio frames, so it lands after every sample written before it.
+            if (s != null && !ended.get() && gemini) s.send("{\"type\":\"audio_stream_end\"}");
         }
     }
 

@@ -71,7 +71,21 @@ public class GenAiVoiceWebSocketSetupTest {
             assertFalse(text.contains("proactiveAudio"));
             assertFalse(text.contains("thinking"));
             assertTrue(setup.has("outputAudioTranscription"));
-            assertFalse(setup.has("inputAudioTranscription"));
+            // Hands-free only: tuned automatic VAD, input transcription and goAway resumption.
+            assertEquals(farField, setup.has("inputAudioTranscription"));
+            assertEquals(farField, setup.has("sessionResumption"));
+            assertEquals(farField, setup.has("realtimeInputConfig"));
+            if (farField) {
+                JSONObject vad = setup.getJSONObject("realtimeInputConfig")
+                        .getJSONObject("automaticActivityDetection");
+                assertEquals(new HashSet<>(Arrays.asList("startOfSpeechSensitivity", "endOfSpeechSensitivity",
+                        "prefixPaddingMs", "silenceDurationMs")), new HashSet<>(keys(vad)));
+                assertEquals("START_SENSITIVITY_LOW", vad.getString("startOfSpeechSensitivity"));
+                assertEquals("END_SENSITIVITY_HIGH", vad.getString("endOfSpeechSensitivity"));
+                // The docs ask for an end-of-speech silence of at least 500 ms.
+                assertTrue(vad.getInt("silenceDurationMs") >= 500);
+                assertEquals(0, setup.getJSONObject("sessionResumption").length());
+            }
             assertEquals(1, setup.getJSONArray("tools").length());
         }
         // The resource prefix is not doubled.
@@ -198,7 +212,7 @@ public class GenAiVoiceWebSocketSetupTest {
     @Test
     public void payloadStaysSmallAndFreeOfTranscriptionWording() throws Exception {
         String text = GenAiVoiceWebSocket.geminiSetup("gemini-3.8-live", "grounded", true).toString();
-        assertFalse(text.contains("transcription\""));   // only outputAudioTranscription as a key
+        assertFalse(text.contains("transcription\""));   // only the *AudioTranscription keys
         assertTrue(text.length() < 16_000);
     }
 

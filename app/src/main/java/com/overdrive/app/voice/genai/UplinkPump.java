@@ -16,11 +16,15 @@ final class UplinkPump {
 
         /** Everything buffered before {@code live} has been handed to the socket. */
         void onPrerollFlushed();
+
+        /** Every sample written before {@link #markStreamEnd()} has been sent; called on the pump thread. */
+        default void onStreamEnd() {
+        }
     }
 
     static final int SOURCE_RATE = 16_000;
-    /** Frame size used when no duration is configured; what every provider has been fed so far. */
-    static final int LEGACY_FRAME_SAMPLES = 2048;
+    /** Frame duration when none is configured: Google's Live API asks for 20-40 ms chunks; 40 keeps packets few. */
+    static final int DEFAULT_FRAME_MS = 40;
     private static final String TAG = "VoiceUplink";
     private static final int CAPACITY = SOURCE_RATE * 10;
     private static final int SLAB = 4096;
@@ -35,6 +39,7 @@ final class UplinkPump {
     private int targetRate;
     private int epoch;
     private boolean gapMarked;
+    private boolean streamEndRequested;
     private boolean live;
     private boolean closed;
 
@@ -42,7 +47,7 @@ final class UplinkPump {
         this(sink, 0);
     }
 
-    /** {@code frameMs <= 0} keeps the legacy 2048-sample frame; otherwise frames last that long. */
+    /** {@code frameMs <= 0} uses {@link #DEFAULT_FRAME_MS}; otherwise frames last that long. */
     UplinkPump(Sink sink, int frameMs) {
         this.sink = sink;
         this.frameMs = frameMs;
@@ -50,7 +55,16 @@ final class UplinkPump {
 
     /** Samples per frame at {@code rate}; a duration resolves per provider rate (40 ms = 640 @16 k, 960 @24 k). */
     static int frameSamples(int rate, int frameMs) {
-        return frameMs <= 0 ? LEGACY_FRAME_SAMPLES : rate * frameMs / 1000;
+        return rate * (frameMs <= 0 ? DEFAULT_FRAME_MS : frameMs) / 1000;
+    }
+
+    /** After what is buffered now goes out (partial frame included), the sink hears onStreamEnd once. */
+    void markStreamEnd() {
+        synchronized (lock) {
+            if (closed) return;
+            streamEndRequested = true;
+            if (live) lock.notifyAll();
+        }
     }
 
     void write(short[] pcm, int offset, int length) {
@@ -142,8 +156,9 @@ final class UplinkPump {
             int n;
             int rate;
             boolean announceNow = false;
+            boolean endNow = false;
             synchronized (lock) {
-                while (!closed && size == 0 && announced) lock.wait();
+                while (!closed && size == 0 && announced && !streamEndRequested) lock.wait();
                 if (closed) return;
                 if (seenEpoch != epoch) {
                     seenEpoch = epoch;
@@ -163,6 +178,10 @@ final class UplinkPump {
                 if (!announced && prerollLeft == 0) {
                     announced = true;
                     announceNow = true;
+                }
+                if (streamEndRequested && size == 0 && announced) {
+                    streamEndRequested = false;
+                    endNow = true;
                 }
             }
             if (n > 0) {
@@ -196,6 +215,13 @@ final class UplinkPump {
                     fill = 0;
                 }
                 sink.onPrerollFlushed();
+            }
+            if (endNow) {
+                if (fill > 0) {
+                    if (!send(frame, fill, bytes)) return;
+                    fill = 0;
+                }
+                sink.onStreamEnd();
             }
         }
     }
