@@ -1242,6 +1242,12 @@ final class VoiceEngine implements PcmSink {
             liveDenoiseOff = true;
             return n == 0 ? 0 : copyThrough(pcm, off, n);
         }
+        if (m < 0) {
+            // -1 is the denoiser's failure return: bypass it rather than drop the audio.
+            Log.w(TAG, "Denoiser failed; bypassed");
+            liveDenoiseOff = true;
+            return n == 0 ? 0 : copyThrough(pcm, off, n);
+        }
         float msPerSecond = (System.nanoTime() - t0) / 1e6f * RATE / Math.max(1, n);
         liveDenoiseCost += (msPerSecond - liveDenoiseCost) * 0.05f;
         if (liveDenoiseCost > LIVE_DENOISE_BUDGET) {
@@ -1714,20 +1720,37 @@ final class VoiceEngine implements PcmSink {
         int state;
         if (h != null) {
             boolean fresh = now - h.atElapsedMs <= ECHO_STALE_MS;
-            state = fresh && h.healthy ? MediaTurnPolicy.ECHO_HEALTHY : MediaTurnPolicy.ECHO_UNHEALTHY;
+            // Media playing with idle references: the car plays audio the canceller never sees.
+            boolean blind = mediaActive && !h.refActive;
+            state = fresh && h.healthy && !blind ? MediaTurnPolicy.ECHO_HEALTHY : MediaTurnPolicy.ECHO_UNHEALTHY;
         } else {
             state = VoiceAssistantConfig.MIC_SOURCE_CAR_ARRAY.equals(AppAudioCaptureController.activeMicSource())
                     ? MediaTurnPolicy.ECHO_UNHEALTHY : MediaTurnPolicy.ECHO_NONE;
         }
         echoLast = h;
-        if (state == echoState) return;
-        echoState = state;
-        applyWakeCutoff();
-        // Barge-in only while the canceller removes our own reply from the mic.
-        if (state != MediaTurnPolicy.ECHO_HEALTHY && fullDuplexTurn) {
-            fullDuplexTurn = false;
-            if (session != null) session.setFullDuplex(false);
+        if (state != echoState) {
+            echoState = state;
+            applyWakeCutoff();
         }
+        updateFullDuplex();
+    }
+
+    /**
+     * Barge-in only while the canceller removes our own reply: healthy, and ERLE >= bargeInMinErleDb
+     * measured with the references playing. Idle references keep the current choice.
+     */
+    private void updateFullDuplex() {
+        if (phase != CLOUD || session == null || !sessionStreaming) return;
+        boolean on = fullDuplexTurn;
+        EchoHealth h = echoLast;
+        if (!config.fullDuplex || !echoHealthy() || h == null) {
+            on = false;
+        } else if (h.refActive) {
+            on = h.erleDb >= config.bargeInMinErleDb;
+        }
+        if (on == fullDuplexTurn) return;
+        fullDuplexTurn = on;
+        session.setFullDuplex(on);
     }
 
     /** How much of the last {@code samples} consumed the speaker references explain (0..1), NaN unknown. */
@@ -2299,6 +2322,7 @@ final class VoiceEngine implements PcmSink {
             for (int off = 0; off < pcm.length; off += 4096) {
                 int n = Math.min(4096, pcm.length - off);
                 int m = d.process(pcm, off, n, buf);
+                if (m < 0) return pcm;
                 int keep = Math.min(m, out.length - have);
                 System.arraycopy(buf, 0, out, have, keep);
                 have += keep;
@@ -2306,6 +2330,7 @@ final class VoiceEngine implements PcmSink {
             // Flush the model's lookahead with silence.
             short[] zeros = new short[latency + shift];
             int m = d.process(zeros, 0, zeros.length, buf);
+            if (m < 0) return pcm;
             int keep = Math.min(m, out.length - have);
             System.arraycopy(buf, 0, out, have, keep);
             have += keep;
@@ -2463,10 +2488,11 @@ final class VoiceEngine implements PcmSink {
             liveDenoiser.reset();
             liveDenoiseForWake = false;
         }
-        // Barge-in only while the car array's echo canceller is measured healthy (it removes our
-        // own reply from the mic); otherwise today's half duplex.
-        fullDuplexTurn = config.fullDuplex && echoHealthy();
-        session.setFullDuplex(fullDuplexTurn);
+        // Each turn starts half duplex; updateFullDuplex() opens barge-in once the canceller is
+        // measured removing the speakers well enough.
+        fullDuplexTurn = false;
+        session.setFullDuplex(false);
+        updateFullDuplex();
         if (replayUtterance) {
             speechStartAt = 0;
             lastSpeechAt = 0;
@@ -2568,6 +2594,8 @@ final class VoiceEngine implements PcmSink {
     private void reopenUplink() {
         uplinkGated = false;
         endpointSent = false;
+        // The client holds its uplink after audioStreamEnd; local speech releases it.
+        if (session != null) session.userSpeechResumed();
         smartTurnAskedFor = -1;
         segmentStartedAt = 0;
         deadline.userResumed();
@@ -4464,6 +4492,9 @@ final class VoiceEngine implements PcmSink {
         mediaSessionPlaying = state.playing;
         mediaStateAt = SystemClock.elapsedRealtime();
         mediaActive = MediaTurnPolicy.mediaPlaying(state.source, state.playing, musicActive);
+        // Media with idle references is unhealthy: re-judge the echo state now, not at the next poll.
+        echoPolledAt = 0;
+        pollEcho(mediaStateAt);
         applyWakeCutoff();
     }
 

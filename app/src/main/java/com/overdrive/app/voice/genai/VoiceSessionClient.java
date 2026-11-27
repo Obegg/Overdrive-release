@@ -228,6 +228,16 @@ public final class VoiceSessionClient {
         pump.markStreamEnd();
     }
 
+    /**
+     * The local endpointer heard the user speak again after {@link #endOfUserSpeech}: release the
+     * hold so the speech reaches the provider and the next end of speech is sent too.
+     */
+    public void userSpeechResumed() {
+        synchronized (stateLock) {
+            if (streamEndSent) newUserTurnLocked();
+        }
+    }
+
     private boolean uplinkHeld() {
         long until = uplinkHeldUntil;
         if (until == 0) return false;

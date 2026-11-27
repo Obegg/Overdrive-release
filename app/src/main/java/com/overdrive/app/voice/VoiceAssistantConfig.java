@@ -100,6 +100,8 @@ public final class VoiceAssistantConfig {
     public final double smartTurnThreshold;
     public final int endOfSpeechMaxMs;
     public final double echoRejectLikeness;
+    /** Measured ERLE (references playing) a turn needs before barge-in opens, so our reply can't interrupt itself. */
+    public final double bargeInMinErleDb;
     /**
      * Wake-word enrollment ({@code personalWake.voices}, written only by the daemon from the app's
      * result): one entry per trained person. The engine sees their union: every voice's keyword
@@ -141,6 +143,10 @@ public final class VoiceAssistantConfig {
     /** Echo-likeness of a trigger window (under media) at or above which it is rejected unchecked. */
     public static final double ECHO_REJECT_MIN = 0.50;
     public static final double ECHO_REJECT_MAX = 1.00;
+    /** Barge-in ERLE floor; the echo canceller's own healthy threshold is 10 dB. */
+    public static final double BARGE_IN_MIN_ERLE_DB_MIN = 10.0;
+    public static final double BARGE_IN_MIN_ERLE_DB_MAX = 40.0;
+    public static final double BARGE_IN_MIN_ERLE_DB_DEFAULT = 20.0;
 
     public static final double PERSONAL_WAKE_CUTOFF_MIN = 0.20;
     public static final double PERSONAL_WAKE_CUTOFF_MAX = 0.45;
@@ -158,7 +164,7 @@ public final class VoiceAssistantConfig {
                                  String enrollRequestName, double personalMediaCutoff,
                                  boolean wakeInputDenoised, boolean denoiseSpeech, boolean fullDuplex,
                                  double smartTurnThreshold, int endOfSpeechMaxMs,
-                                 double echoRejectLikeness) {
+                                 double echoRejectLikeness, double bargeInMinErleDb) {
         this.enabled = enabled;
         this.mode = mode;
         this.sensitivity = sensitivity;
@@ -189,6 +195,7 @@ public final class VoiceAssistantConfig {
         this.smartTurnThreshold = smartTurnThreshold;
         this.endOfSpeechMaxMs = endOfSpeechMaxMs;
         this.echoRejectLikeness = echoRejectLikeness;
+        this.bargeInMinErleDb = bargeInMinErleDb;
     }
 
     /** Cheapest possible enabled check for the poll tick: no allocation beyond the lookup. */
@@ -245,7 +252,9 @@ public final class VoiceAssistantConfig {
                 clamp(section.optInt("endOfSpeechMaxMs", END_OF_SPEECH_MAX_MS_DEFAULT),
                         END_OF_SPEECH_MAX_MS_MIN, END_OF_SPEECH_MAX_MS_MAX),
                 clampDouble(section.optDouble("echoRejectLikeness", MediaWakeGate.ECHO_REJECT_DEFAULT),
-                        ECHO_REJECT_MIN, ECHO_REJECT_MAX, MediaWakeGate.ECHO_REJECT_DEFAULT));
+                        ECHO_REJECT_MIN, ECHO_REJECT_MAX, MediaWakeGate.ECHO_REJECT_DEFAULT),
+                clampDouble(section.optDouble("bargeInMinErleDb", BARGE_IN_MIN_ERLE_DB_DEFAULT),
+                        BARGE_IN_MIN_ERLE_DB_MIN, BARGE_IN_MIN_ERLE_DB_MAX, BARGE_IN_MIN_ERLE_DB_DEFAULT));
     }
 
     /** One trained person: their lines, cutoffs and when they trained. */
@@ -443,6 +452,7 @@ public final class VoiceAssistantConfig {
             json.put("smartTurnThreshold", smartTurnThreshold);
             json.put("endOfSpeechMaxMs", endOfSpeechMaxMs);
             json.put("echoRejectLikeness", echoRejectLikeness);
+            json.put("bargeInMinErleDb", bargeInMinErleDb);
             JSONObject personal = new JSONObject()
                     .put("trained", !personalVoices.isEmpty())
                     .put("lines", personalWakeLines.size())
@@ -562,6 +572,10 @@ public final class VoiceAssistantConfig {
             if (patch.has("echoRejectLikeness")) {
                 out.put("echoRejectLikeness", requireRange(patch, "echoRejectLikeness",
                         ECHO_REJECT_MIN, ECHO_REJECT_MAX));
+            }
+            if (patch.has("bargeInMinErleDb")) {
+                out.put("bargeInMinErleDb", requireRange(patch, "bargeInMinErleDb",
+                        BARGE_IN_MIN_ERLE_DB_MIN, BARGE_IN_MIN_ERLE_DB_MAX));
             }
         } catch (IllegalArgumentException e) {
             throw e;

@@ -10,10 +10,11 @@ RATE = 16000
 WINDOW = 512
 
 
-def find_smart_turn():
-    """$SMART_TURN_ONNX, the MODELS worktree's asset, else the harness download."""
+def find_smart_turn(repo=None):
+    """$SMART_TURN_ONNX, the repo's shipped asset, else the harness download."""
     cands = [os.environ.get('SMART_TURN_ONNX', '')]
-    cands += glob.glob('/tmp/od-voice-models/app/src/main/assets/voice/turn/*.onnx')
+    if repo:
+        cands += sorted(glob.glob(os.path.join(repo, 'app/src/main/assets/voice/turn/*.onnx')))
     cands.append(os.path.expanduser(os.path.join(os.environ.get('VOICE_EVAL_DATA', '~/voice-eval-data'),
                                                  'models', 'smart-turn-v3.2-cpu.onnx')))
     for c in cands:

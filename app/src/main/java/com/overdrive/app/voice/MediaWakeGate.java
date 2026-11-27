@@ -12,8 +12,8 @@ final class MediaWakeGate {
 
     /** Silence after a rejected check while media is active; none without media, as before. */
     static final long REFRACTORY_AFTER_REJECT_MEDIA_MS = 2000;
-    /** Default echo-likeness of a trigger window at or above which it is rejected unchecked. */
-    static final double ECHO_REJECT_DEFAULT = 0.70;
+    /** Default echo-likeness at or above which a trigger is rejected unchecked (missed music measured 0.70-0.90). */
+    static final double ECHO_REJECT_DEFAULT = 0.60;
 
     private MediaWakeGate() {
     }

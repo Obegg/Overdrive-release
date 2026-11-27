@@ -319,7 +319,7 @@ def main():
     ap.add_argument('--out', default=os.path.expanduser('~/voice-eval-data/results/latest.json'))
     a = ap.parse_args()
     import endpoint
-    smart = None if a.no_smart_turn else endpoint.find_smart_turn()
+    smart = None if a.no_smart_turn else endpoint.find_smart_turn(a.repo)
     tasks = plan(a)
     # longest first so four workers finish together
     tasks.sort(key=lambda t: -(t.get('seconds') or 400))

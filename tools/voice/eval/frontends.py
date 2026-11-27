@@ -19,6 +19,11 @@ FILTER_SAMPLES, SUPPRESS_DB, HIGH_PASS_HZ = 2048, -25, 200
 def build_speex(repo, out_dir):
     lib = os.path.join(out_dir, f'libod_speex.{EXT}')
     src = os.path.join(repo, 'app/src/main/cpp/voice/voice_frontend.c')
+    if not os.path.exists(src):
+        # Trees after the new front-end no longer carry the SpeexDSP chain: reuse the baseline build.
+        if os.path.exists(lib):
+            return lib
+        raise FileNotFoundError(f'{src} is gone; build {lib} from an older tree (native/build_host.sh)')
     if not os.path.exists(lib) or os.path.getmtime(lib) < os.path.getmtime(src):
         subprocess.check_call([os.path.join(HERE, 'native', 'build_host.sh'), repo, out_dir],
                               stdout=subprocess.DEVNULL)
