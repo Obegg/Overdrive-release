@@ -434,7 +434,7 @@ final class VoiceEngine implements PcmSink {
     /** Provider the daemon named for the session ("gemini" | "openai"), "" until then. */
     private String sessionProvider = "";
 
-    // Hybrid end of speech (Gemini): endOfSpeechMaxMs of Silero silence (tools/voice/eval/sweep_endpoint.py).
+    // Hybrid end of speech (Gemini): the patience's Silero silence, longer after an unfinished transcript.
     /** A pause this long ends a speech segment for the continuous-speech ceiling. */
     private static final long SEGMENT_GAP_SAMPLES = 300L * RATE / 1000;
     /** Lead sent ahead of speech that resumes after an end of speech (the provider's prefix padding). */
@@ -498,6 +498,14 @@ final class VoiceEngine implements PcmSink {
     private long turnMaxLagSamples;
     private String eosBy;
     private int eosMs = -1;
+    /** Class of the transcript's ending at the end of speech (EndOfSpeechHint), never its text. */
+    private String eosCls;
+    /** The provider's latest transcript of the user's turn, its language, and the pause it was judged for. */
+    private String inputTranscript;
+    private int eosLang = EndOfSpeechHint.LANG_NONE;
+    private long hintForSample = -1;
+    private String hintTranscript;
+    private String hintCls;
     private int turnInterrupts;
     private int turnInputChars;
     private int turnToolCalls;
@@ -1923,6 +1931,11 @@ final class VoiceEngine implements PcmSink {
         turnMaxLagSamples = 0;
         eosBy = null;
         eosMs = -1;
+        eosCls = null;
+        inputTranscript = null;
+        hintForSample = -1;
+        hintTranscript = null;
+        hintCls = null;
         turnInterrupts = 0;
         turnInputChars = 0;
         turnToolCalls = 0;
@@ -2479,6 +2492,7 @@ final class VoiceEngine implements PcmSink {
         if (replayUtterance) deadline.awaitFrom(now);
         if (session == null) openSession();
         sessionStreaming = true;
+        eosLang = EndOfSpeechHint.languageFor(config.commandLanguage, locale());
         resetEndpoint();
         cloudPcmPos = 0;
         cloudPcmFull = false;
@@ -2517,8 +2531,9 @@ final class VoiceEngine implements PcmSink {
     }
 
     /**
-     * Hybrid end of speech: endOfSpeechMaxMs of Silero silence ends the turn (Gemini's own VAD may end
-     * it first); 8 s of speech with no pause (noise) ends it too.
+     * Hybrid end of speech: the patience's Silero silence ends the turn ("timer"); if the provider's
+     * transcript so far ends unfinished (EndOfSpeechHint) it waits up to the adaptive cap ("adaptive").
+     * Gemini's own VAD is the fallback ("server"); 8 s of speech with no pause (noise) ends it too.
      */
     private void checkEndOfSpeech(long now) {
         long silence = turnSamples - lastSpeechSample;
@@ -2531,7 +2546,22 @@ final class VoiceEngine implements PcmSink {
             return;
         }
         segmentStartedAt = 0;
-        if (silence >= (long) config.endOfSpeechMaxMs * RATE / 1000) endpoint(now, "silence", silence);
+        String patience = config.endOfSpeechPatience;
+        if (silence < (long) VoiceAssistantConfig.patienceMs(patience) * RATE / 1000) return;
+        // Judged once per pause, again only when a newer transcript arrives: no work on most ticks.
+        String text = inputTranscript;
+        if (hintForSample != lastSpeechSample || hintTranscript != text) {
+            hintForSample = lastSpeechSample;
+            hintTranscript = text;
+            hintCls = EndOfSpeechHint.classify(text, eosLang);
+        }
+        if (!EndOfSpeechHint.unfinished(hintCls)) {
+            eosCls = hintCls;
+            endpoint(now, "timer", silence);
+        } else if (silence >= (long) VoiceAssistantConfig.adaptiveCapMs(patience) * RATE / 1000) {
+            eosCls = hintCls;
+            endpoint(now, "adaptive", silence);
+        }
     }
 
     /**
@@ -4718,6 +4748,7 @@ final class VoiceEngine implements PcmSink {
             // Cloud end of speech: how, and after how much silence.
             if (eosBy != null) t.put("eosBy", eosBy);
             if (eosMs >= 0) t.put("eosMs", eosMs);
+            if (eosCls != null) t.put("eosCls", eosCls);
             if (fullDuplexTurn) t.put("duplex", true);
             if (turnInterrupts > 0) t.put("interrupts", turnInterrupts);
             if (turnInputChars > 0) t.put("inChars", turnInputChars);
@@ -4790,7 +4821,8 @@ final class VoiceEngine implements PcmSink {
                 lastCloudActivityAt = now;
                 // Gemini's own activity end came first: the engine's end of speech follows it.
                 if (phase == CLOUD && engineEndpoints() && !endpointSent && speechStartAt > 0) {
-                    endpoint(now, "provider", turnSamples - lastSpeechSample);
+                    eosCls = EndOfSpeechHint.classify(inputTranscript, eosLang);
+                    endpoint(now, "server", turnSamples - lastSpeechSample);
                 }
             });
         }
@@ -4831,6 +4863,8 @@ final class VoiceEngine implements PcmSink {
                 long now = SystemClock.elapsedRealtime();
                 turnComplete = true;
                 lastCloudActivityAt = now;
+                // The next user turn gets its own transcript.
+                inputTranscript = null;
                 // A turn answered by a tool call alone (no reply audio) is confirmed with the success
                 // cue and counts as answered, never as cloud_no_response.
                 if (phase == CLOUD && !turnReplyHeard && turnToolCalls > 0 && !turnAnswered) {
@@ -4868,6 +4902,7 @@ final class VoiceEngine implements PcmSink {
                 String text = partial.trim();
                 if (text.isEmpty()) return;
                 turnInputChars = Math.max(turnInputChars, text.length());
+                inputTranscript = text;
                 lastCloudActivityAt = SystemClock.elapsedRealtime();
                 if (!replySpeaking) {
                     overlay.show(thinkingShown ? VoiceOrbView.STATE_THINKING : VoiceOrbView.STATE_LISTENING,

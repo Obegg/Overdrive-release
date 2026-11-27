@@ -45,7 +45,8 @@ def hesitate(data, u, rng, out_dir):
     y = np.concatenate([x[:cut], np.zeros(gap), x[cut:]])
     path = os.path.join(out_dir, os.path.basename(u['path']).replace('.wav', f'_h{gap}.wav'))
     sf.write(path, y, RATE, subtype='PCM_16')
-    v = dict(u, path=path, samples=len(y), speech_end=u['speech_end'] + gap, pause_ms=gap * 1000 // RATE)
+    v = dict(u, path=path, samples=len(y), speech_end=u['speech_end'] + gap, pause_ms=gap * 1000 // RATE,
+             cut=cut, gap=gap)
     return v
 
 
@@ -57,7 +58,7 @@ def init(repo, data, smart):
     G['data'] = data
     G['fe'] = frontends.make(['speex'], repo, os.path.join(data, 'build'))[0]
     G['vad'] = endpoint.Silero(repo)
-    G['smart'] = endpoint.SmartTurn(smart)
+    G['smart'] = endpoint.SmartTurn(smart) if smart else None
     G['noise'] = cs.NoiseBank(data)
     G['music'] = cs.MusicBank(data)
 
@@ -82,7 +83,7 @@ def pauses(seg, flags, after):
             j += 1
         silence = (int(wend[j - 1]) if j >= n else int(wend[j]) - WINDOW) - last
         probs = {}
-        for off in OFFSETS_MS:
+        for off in (OFFSETS_MS if G['smart'] is not None else ()):
             at = last + off * RATE // 1000
             if off * RATE // 1000 > silence or at > len(seg):
                 break
@@ -105,7 +106,8 @@ def block(task):
         flags = G['vad'].flags(seg)
         after = u['speech_start'] + int(0.8 * RATE)
         out.append({'cond': task['cond'], 'set': task['set'], 'kind': u['kind'], 'end': u['speech_end'],
-                    'len': len(seg),
+                    'len': len(seg), 'text': u['text'], 'start': u['speech_start'],
+                    'cut': u.get('cut'), 'gap': u.get('gap', 0),
                     'pauses': pauses(seg, flags, after)})
     return out
 
@@ -133,6 +135,61 @@ def decide(utt, c, thr, max_ms, two, lat_ms, hang=None):
     return None
 
 
+# Port of voice/EndOfSpeechHint (English): the ending classes that extend the end of speech.
+EN_UNFINISHED = set('and or but so then to of for with at in from by the a an my your set turn change make put '
+                    'open close play call navigate is are can could would please um uh er'.split())
+# OD_EOS_DROP=word,...: measure the list without some words (on/like were dropped this way).
+EN_UNFINISHED -= set(filter(None, os.environ.get('OD_EOS_DROP', '').split(',')))
+
+
+def unfinished(transcript):
+    s = transcript.strip()
+    if not s:
+        return False
+    if s[-1] in ',，、':
+        return True
+    words = [w.strip('.,!?;:"').lower() for w in s.split()]
+    words = [w for w in words if w]
+    for i, w in enumerate(words):
+        if w == 'overdrive' or (w == 'drive' and i > 0 and words[i - 1] == 'over'):
+            if len(words) - i - 1 <= 1:
+                return True
+    return bool(words) and words[-1] in EN_UNFINISHED
+
+
+def transcript_at(utt, t):
+    """The known text cut where the audio at sample ``t`` is (words spread evenly over the speech)."""
+    toks = utt['text'].split()
+    start, end = utt['start'], utt['end'] - utt['gap']
+    if utt['cut'] is not None and t > utt['cut']:
+        t = max(utt['cut'], t - utt['gap'])
+    n = int(round(len(toks) * min(1.0, max(0.0, (t - start) / max(1, end - start)))))
+    return ' '.join(toks[:n])
+
+
+def decide_adaptive(utt, base_ms, cap_ms):
+    """Base silence; an unfinished transcript waits up to cap_ms unless speech resumes."""
+    base, cap = base_ms * RATE // 1000, cap_ms * RATE // 1000
+    for last, silence, _ in utt['pauses']:
+        if silence < base:
+            continue
+        if cap > base and unfinished(transcript_at(utt, last)):
+            if silence >= cap:
+                return (last + cap - utt['end']) * 1000 // RATE
+            continue
+        return (last + base - utt['end']) * 1000 // RATE
+    return None
+
+
+def score_fn(utts, fn):
+    lat = [fn(u) for u in utts]
+    done = np.array([v for v in lat if v is not None])
+    return {'n': len(utts), 'median': int(np.median(done)) if len(done) else None,
+            'p90': int(np.percentile(done, 90)) if len(done) else None,
+            'premature': float(np.mean(done < PREMATURE_MS)) if len(done) else 0.0,
+            'never': int(sum(v is None for v in lat))}
+
+
 def score(utts, **kw):
     lat = [decide(u, **kw) for u in utts]
     done = np.array([v for v in lat if v is not None])
@@ -151,10 +208,11 @@ def main():
     ap.add_argument('--jobs', type=int, default=4)
     ap.add_argument('--seed', type=int, default=7)
     ap.add_argument('--tmp', default='/tmp/od-voice-sweep')
+    ap.add_argument('--adaptive-only', action='store_true', help='no Smart Turn: plain vs transcript-adaptive silence')
     ap.add_argument('--out', default=os.path.expanduser('~/voice-eval-data/results/sweep_endpoint.json'))
     a = ap.parse_args()
     import endpoint
-    smart = endpoint.find_smart_turn()
+    smart = None if a.adaptive_only else endpoint.find_smart_turn()
     man = [json.loads(line) for line in open(os.path.join(a.data, 'tts', 'manifest.jsonl'))]
     cmds = [m for m in man if m['split'] == 'eval' and m['kind'] in ('wake_cmd_runon', 'wake_cmd_pause')]
     os.makedirs(a.tmp, exist_ok=True)
@@ -173,6 +231,16 @@ def main():
         for i, r in enumerate(pool.imap_unordered(block, tasks)):
             utts += r
             print(f'[{i + 1}/{len(tasks)}] {len(utts)} commands', flush=True)
+    adaptive = []
+    for name, base, cap in (('quick', 800, 2000), ('normal', 1000, 2500), ('relaxed', 2000, 3500)):
+        for mode, c in (('plain', base), ('adaptive', cap)):
+            adaptive.append({'patience': name, 'rule': mode, 'base_ms': base, 'cap_ms': c, **{
+                s: score_fn([u for u in utts if s == 'all' or u['set'] == s], lambda u: decide_adaptive(u, base, c))
+                for s in ('all', 'natural', 'hesitation')}})
+    if a.adaptive_only:
+        json.dump({'adaptive': adaptive, 'n': len(utts), 'conditions': conds}, open(a.out, 'w'))
+        print('wrote', a.out, f'{len(utts)} commands in {time.time() - t0:.0f}s')
+        return
     rows = []
     for lat in [int(v) for v in a.latency_ms.split(',')]:
         for c in (200, 300, 400):
@@ -187,7 +255,7 @@ def main():
     base = {f'silero_{h}': {s: score([u for u in utts if s == 'all' or u['set'] == s], c=0, thr=0, max_ms=0,
                                      two=False, lat_ms=0, hang=h) for s in ('all', 'natural', 'hesitation')}
             for h in (300, 500, 700, 1000)}
-    json.dump({'rows': rows, 'silero': base, 'n': len(utts), 'conditions': conds, 'wall_s': time.time() - t0,
+    json.dump({'rows': rows, 'adaptive': adaptive, 'silero': base, 'n': len(utts), 'conditions': conds, 'wall_s': time.time() - t0,
                'hesitations': len(hes)}, open(a.out, 'w'))
     print('wrote', a.out, f'{len(utts)} commands in {time.time() - t0:.0f}s')
 

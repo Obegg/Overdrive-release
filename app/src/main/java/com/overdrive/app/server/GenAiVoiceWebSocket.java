@@ -64,11 +64,11 @@ public final class GenAiVoiceWebSocket {
     // Far-field: one quick re-dial of the same route after such a timeout, before any direct fallback.
     static final long FAST_RETRY_CONNECT_TIMEOUT_MS = 3_000;
     // Far-field Gemini VAD (ai.google.dev live-api capabilities): music leaks into a cabin mic, so a
-    // start needs clear speech and the end comes readily; the client's audioStreamEnd ends it sooner.
+    // start needs clear speech; the end is the client's audioStreamEnd, the server's own end (slow,
+    // just past the engine's longest wait) only covers an end of speech that never arrives.
     static final String GEMINI_START_SENSITIVITY = "START_SENSITIVITY_LOW";
-    static final String GEMINI_END_SENSITIVITY = "END_SENSITIVITY_HIGH";
+    static final String GEMINI_END_SENSITIVITY = "END_SENSITIVITY_LOW";
     static final int GEMINI_PREFIX_PADDING_MS = 160;
-    static final int GEMINI_SILENCE_DURATION_MS = 600;
     // goAway reconnects per session; client audio held while resuming (ms of input).
     static final int MAX_RESUMES = 3;
     static final int RESUME_BACKLOG_MS = 3_000;
@@ -283,7 +283,18 @@ public final class GenAiVoiceWebSocket {
                 .put("startOfSpeechSensitivity", GEMINI_START_SENSITIVITY)
                 .put("endOfSpeechSensitivity", GEMINI_END_SENSITIVITY)
                 .put("prefixPaddingMs", GEMINI_PREFIX_PADDING_MS)
-                .put("silenceDurationMs", GEMINI_SILENCE_DURATION_MS));
+                .put("silenceDurationMs", geminiSilenceMs()));
+    }
+
+    /** The saved end-of-speech patience's server silence; the normal one if the config can't be read. */
+    static int geminiSilenceMs() {
+        String patience = com.overdrive.app.voice.VoiceAssistantConfig.PATIENCE_NORMAL;
+        try {
+            patience = com.overdrive.app.voice.VoiceAssistantConfig.fromRoot(
+                    com.overdrive.app.config.UnifiedConfigManager.loadConfig()).endOfSpeechPatience;
+        } catch (Throwable ignored) {
+        }
+        return com.overdrive.app.voice.VoiceAssistantConfig.serverSilenceMs(patience);
     }
 
     /** Client control {@code audio_stream_end} in Gemini's shape. */

@@ -15,6 +15,11 @@ public final class VoiceAssistantConfig {
     public static final String SENSITIVITY_NORMAL = "normal";
     public static final String SENSITIVITY_HIGH = "high";
 
+    /** How long a cloud turn waits in silence before the end of speech: 0.8 / 1 / 2 s. */
+    public static final String PATIENCE_QUICK = "quick";
+    public static final String PATIENCE_NORMAL = "normal";
+    public static final String PATIENCE_RELAXED = "relaxed";
+
     public static final int FOLLOW_UP_MIN_S = 0;
     public static final int FOLLOW_UP_MAX_S = 15;
     public static final int FOLLOW_UP_DEFAULT_S = 6;
@@ -98,7 +103,8 @@ public final class VoiceAssistantConfig {
     public final boolean denoiseSpeech;
     /** Barge-in (full duplex) while the car array's echo canceller is measurably healthy. */
     public final boolean fullDuplex;
-    public final int endOfSpeechMaxMs;
+    /** {@link #PATIENCE_QUICK}, {@code _NORMAL} or {@code _RELAXED} (Assistant settings page). */
+    public final String endOfSpeechPatience;
     public final double echoRejectLikeness;
     /** Measured ERLE (references playing) a turn needs before barge-in opens, so our reply can't interrupt itself. */
     public final double bargeInMinErleDb;
@@ -132,10 +138,6 @@ public final class VoiceAssistantConfig {
      * Hidden tuning knobs (POST /api/voice/config only, not in the UI); docs/VOICE_ASSISTANT.md.
      * Defaults are starting points for the EVAL harness and the car.
      */
-    /** Silero silence after which a cloud turn's end of speech is sent (in-car eval: 0.5 % early cuts at 1 s). */
-    public static final int END_OF_SPEECH_MAX_MS_MIN = 800;
-    public static final int END_OF_SPEECH_MAX_MS_MAX = 2500;
-    public static final int END_OF_SPEECH_MAX_MS_DEFAULT = 1000;
     /** Echo-likeness of a trigger window (under media) at or above which it is rejected unchecked. */
     public static final double ECHO_REJECT_MIN = 0.50;
     public static final double ECHO_REJECT_MAX = 1.00;
@@ -159,7 +161,7 @@ public final class VoiceAssistantConfig {
                                  java.util.List<PersonalVoice> personalVoices, String enrollRequestVoice,
                                  String enrollRequestName, double personalMediaCutoff,
                                  boolean wakeInputDenoised, boolean denoiseSpeech, boolean fullDuplex,
-                                 int endOfSpeechMaxMs,
+                                 String endOfSpeechPatience,
                                  double echoRejectLikeness, double bargeInMinErleDb) {
         this.enabled = enabled;
         this.mode = mode;
@@ -188,7 +190,7 @@ public final class VoiceAssistantConfig {
         this.wakeInputDenoised = wakeInputDenoised;
         this.denoiseSpeech = denoiseSpeech;
         this.fullDuplex = fullDuplex;
-        this.endOfSpeechMaxMs = endOfSpeechMaxMs;
+        this.endOfSpeechPatience = endOfSpeechPatience;
         this.echoRejectLikeness = echoRejectLikeness;
         this.bargeInMinErleDb = bargeInMinErleDb;
     }
@@ -242,8 +244,7 @@ public final class VoiceAssistantConfig {
                 section.optBoolean("wakeInputDenoised", false),
                 section.optBoolean("denoiseSpeech", true),
                 section.optBoolean("fullDuplex", true),
-                clamp(section.optInt("endOfSpeechMaxMs", END_OF_SPEECH_MAX_MS_DEFAULT),
-                        END_OF_SPEECH_MAX_MS_MIN, END_OF_SPEECH_MAX_MS_MAX),
+                normalizePatience(section.optString("endOfSpeechPatience", PATIENCE_NORMAL)),
                 clampDouble(section.optDouble("echoRejectLikeness", MediaWakeGate.ECHO_REJECT_DEFAULT),
                         ECHO_REJECT_MIN, ECHO_REJECT_MAX, MediaWakeGate.ECHO_REJECT_DEFAULT),
                 clampDouble(section.optDouble("bargeInMinErleDb", BARGE_IN_MIN_ERLE_DB_DEFAULT),
@@ -462,7 +463,7 @@ public final class VoiceAssistantConfig {
             json.put("wakeInputDenoised", wakeInputDenoised);
             json.put("denoiseSpeech", denoiseSpeech);
             json.put("fullDuplex", fullDuplex);
-            json.put("endOfSpeechMaxMs", endOfSpeechMaxMs);
+            json.put("endOfSpeechPatience", endOfSpeechPatience);
             json.put("echoRejectLikeness", echoRejectLikeness);
             json.put("bargeInMinErleDb", bargeInMinErleDb);
             JSONObject personal = new JSONObject()
@@ -573,9 +574,12 @@ public final class VoiceAssistantConfig {
             for (String key : new String[] {"wakeInputDenoised", "denoiseSpeech", "fullDuplex"}) {
                 if (patch.has(key)) out.put(key, requireBoolean(patch, key));
             }
-            if (patch.has("endOfSpeechMaxMs")) {
-                out.put("endOfSpeechMaxMs", (int) Math.round(requireRange(patch, "endOfSpeechMaxMs",
-                        END_OF_SPEECH_MAX_MS_MIN, END_OF_SPEECH_MAX_MS_MAX)));
+            if (patch.has("endOfSpeechPatience")) {
+                String p = patch.optString("endOfSpeechPatience", "");
+                if (!p.equals(normalizePatience(p))) {
+                    throw new IllegalArgumentException("Unknown endOfSpeechPatience: " + p);
+                }
+                out.put("endOfSpeechPatience", p);
             }
             if (patch.has("echoRejectLikeness")) {
                 out.put("echoRejectLikeness", requireRange(patch, "echoRejectLikeness",
@@ -681,6 +685,29 @@ public final class VoiceAssistantConfig {
 
     private static String normalizeMode(String mode) {
         return isMode(mode) ? mode : MODE_HYBRID;
+    }
+
+    /** Silence before the end of speech for a patience setting (in-car eval: 0.5 % early cuts at 1 s). */
+    public static int patienceMs(String patience) {
+        if (PATIENCE_QUICK.equals(patience)) return 800;
+        if (PATIENCE_RELAXED.equals(patience)) return 2000;
+        return 1000;
+    }
+
+    /** Longest silence when the transcript so far ends unfinished: base + min(1.5 x base, 1.5 s). */
+    public static int adaptiveCapMs(String patience) {
+        int base = patienceMs(patience);
+        return base + Math.min(base * 3 / 2, 1500);
+    }
+
+    /** Gemini's own VAD silence: just past the engine's longest wait, so it only covers a missing end. */
+    public static int serverSilenceMs(String patience) {
+        return adaptiveCapMs(patience) + 200;
+    }
+
+    private static String normalizePatience(String p) {
+        if (PATIENCE_QUICK.equals(p) || PATIENCE_RELAXED.equals(p)) return p;
+        return PATIENCE_NORMAL;
     }
 
     private static String normalizeSensitivity(String s) {

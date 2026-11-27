@@ -1132,6 +1132,17 @@
                                 </div>
                                 <div class="md-field">
                                     <div class="md-field-box">
+                                        <select class="md-input" id="voicePatience" disabled>
+                                            <option value="quick" data-i18n="voice_assistant.patience_quick">Quick</option>
+                                            <option value="normal" data-i18n="voice_assistant.patience_normal">Normal</option>
+                                            <option value="relaxed" data-i18n="voice_assistant.patience_relaxed">Relaxed</option>
+                                        </select>
+                                        <label class="md-label" for="voicePatience" data-i18n="voice_assistant.patience">Wait before answering</label>
+                                    </div>
+                                    <span class="md-supporting" data-i18n="voice_assistant.patience_hint">How long a pause ends your request. Choose Relaxed if OverDrive answers before you finish.</span>
+                                </div>
+                                <div class="md-field">
+                                    <div class="md-field-box">
                                         <select class="md-input" id="voiceCommandLanguage" disabled>
                                             <option value="" data-i18n="voice_assistant.command_language_auto">Automatic (follow the app language)</option>
                                             <option value="en" data-i18n="voice_assistant.command_language_en">English</option>

@@ -620,6 +620,7 @@ public final class VoiceAssistantApiHandler {
         copyToken(turn, t, "holdWhy", "[a-z_]{1,16}");
         copyToken(turn, t, "eosBy", "[a-z_]{1,16}");
         copyClamped(turn, t, "eosMs", 0, 60_000);
+        copyToken(turn, t, "eosCls", "[a-z]{1,12}");
         if (Boolean.TRUE.equals(turn.opt("duplex"))) t.put("duplex", true);
         copyClamped(turn, t, "interrupts", 0, 100);
         copyClamped(turn, t, "inChars", 0, 10_000);
@@ -684,7 +685,8 @@ public final class VoiceAssistantApiHandler {
         if (t.has("echo")) items.add("echo " + t.optString("echo")
                 + (t.has("erleDb") ? " " + t.optInt("erleDb") + " dB" : ""));
         if (t.has("eosBy")) items.add("end " + t.optString("eosBy")
-                + (t.has("eosMs") ? " after " + t.optInt("eosMs") + " ms" : ""));
+                + (t.has("eosMs") ? " after " + t.optInt("eosMs") + " ms" : "")
+                + (t.has("eosCls") ? " (" + t.optString("eosCls") + ")" : ""));
         if (t.has("duplex")) items.add("full duplex");
         if (t.has("interrupts")) items.add("barge-in " + t.optInt("interrupts"));
         if (t.has("inChars")) items.add("heard " + t.optInt("inChars") + " chars");

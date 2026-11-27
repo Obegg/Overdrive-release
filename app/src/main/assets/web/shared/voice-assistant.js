@@ -213,6 +213,9 @@
             this.bindSelect('voiceFollowUp', function (value) {
                 return { followUpSeconds: parseInt(value, 10) || 0 };
             });
+            this.bindSelect('voicePatience', function (value) {
+                return { endOfSpeechPatience: value };
+            });
             this.bindSelect('voiceAudioChannel', function (value) {
                 return { audioChannel: value };
             });
@@ -666,6 +669,7 @@
 
             this.setValue('voiceSensitivity', config ? config.sensitivity : 'normal', locked);
             this.setValue('voiceFollowUp', config ? String(config.followUpSeconds) : '6', locked);
+            this.setValue('voicePatience', config ? (config.endOfSpeechPatience || 'normal') : 'normal', locked);
             this.setValue('voiceAudioChannel', config ? config.audioChannel : 'media', locked);
             this.setValue('voiceCommandLanguage', config ? (config.commandLanguage || '') : '', locked);
             this.setValue('voiceMicSource', config ? (config.micSource || 'mic') : 'mic', locked);

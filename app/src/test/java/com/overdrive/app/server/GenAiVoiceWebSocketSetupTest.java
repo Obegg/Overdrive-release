@@ -81,9 +81,9 @@ public class GenAiVoiceWebSocketSetupTest {
                 assertEquals(new HashSet<>(Arrays.asList("startOfSpeechSensitivity", "endOfSpeechSensitivity",
                         "prefixPaddingMs", "silenceDurationMs")), new HashSet<>(keys(vad)));
                 assertEquals("START_SENSITIVITY_LOW", vad.getString("startOfSpeechSensitivity"));
-                assertEquals("END_SENSITIVITY_HIGH", vad.getString("endOfSpeechSensitivity"));
-                // The docs ask for an end-of-speech silence of at least 500 ms.
-                assertTrue(vad.getInt("silenceDurationMs") >= 500);
+                // The engine's audioStreamEnd decides; the server's slow end is only the fallback.
+                assertEquals("END_SENSITIVITY_LOW", vad.getString("endOfSpeechSensitivity"));
+                assertTrue(vad.getInt("silenceDurationMs") > 2500);
                 assertEquals(0, setup.getJSONObject("sessionResumption").length());
             }
             assertEquals(1, setup.getJSONArray("tools").length());
