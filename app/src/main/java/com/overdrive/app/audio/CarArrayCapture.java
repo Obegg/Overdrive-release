@@ -309,4 +309,13 @@ final class CarArrayCapture {
         frontend = null;
         if (f != null) f.close();
     }
+
+    // STUB(engine): compile-only FE contract methods; the FE branch replaces them.
+    static EchoHealth echoHealth() {
+        return null;
+    }
+
+    static float echoLikeness(long startSample, long endSample) {
+        return Float.NaN;
+    }
 }

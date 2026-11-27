@@ -1186,4 +1186,22 @@ public class AppAudioCaptureController {
             try { s.close(); } catch (Throwable ignored) {}
         }
     }
+
+    // STUB(engine): compile-only FE contract passthroughs; the FE branch replaces them.
+    /** Measured echo health of the car array, null unless the active source is car_array. */
+    public static EchoHealth echoHealth() {
+        CarArrayCapture array = arrayCapture;
+        return array != null && array.isRunning() ? CarArrayCapture.echoHealth() : null;
+    }
+
+    /** Passthrough of CarArrayCapture.echoLikeness (package-private class); NaN when unknown. */
+    public static float echoLikeness(long startSample, long endSample) {
+        CarArrayCapture array = arrayCapture;
+        return array != null && array.isRunning() ? CarArrayCapture.echoLikeness(startSample, endSample) : Float.NaN;
+    }
+
+    /** Total samples delivered to the wake sink since capture start (0 until the FE lands). */
+    public static long sampleClock() {
+        return 0L;
+    }
 }

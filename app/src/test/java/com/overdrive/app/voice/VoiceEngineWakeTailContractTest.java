@@ -35,15 +35,17 @@ public class VoiceEngineWakeTailContractTest {
 
     @Test
     public void wakeCheckSetsTheSkipAfterBeginTurnAndTheTailFlagOnlyForUntimedWakes() throws Exception {
-        String body = block(readProjectFile(ENGINE), "    private void checkWake() {");
+        String src = readProjectFile(ENGINE);
+        String body = block(src, "    private void onWakeVerdict(WakeCheck c) {");
         int begin = body.indexOf("beginTurn(false, gain);");
         int skip = body.indexOf("utteranceSkipSamples = end == LocalCommandSpotter.WAKE_END_UNKNOWN");
         assertTrue(begin >= 0);
         assertTrue(skip > begin);
         assertTrue(body.contains("wakeTailPossible = end == LocalCommandSpotter.WAKE_END_UNKNOWN;"));
         // The frozen structure of the check is untouched.
-        assertEquals(2, count(body, "englishSpeech()"));
-        assertFalse(body.contains("vad."));
+        String check = block(src, "    private void checkWake() {");
+        assertEquals(2, count(check, "englishSpeech()"));
+        assertFalse(check.contains("vad."));
     }
 
     @Test
@@ -56,7 +58,7 @@ public class VoiceEngineWakeTailContractTest {
         assertTrue(uOff >= 0);
         assertTrue(uOff < local);
         assertTrue(body.contains("System.arraycopy(pcm, uOff, utterance"));
-        assertTrue(body.contains("session.sendPcm16k(pcm, uOff, uLen)"));
+        assertTrue(body.contains("uplink(pcm, uOff, uLen)"));
         // The ~80 ms instant dispatch path keeps the original offsets.
         assertTrue(body.contains("spotter.process(pcm, off, n)"));
     }
@@ -64,7 +66,7 @@ public class VoiceEngineWakeTailContractTest {
     @Test
     public void transcriptGuardIsConsultedOnlyForWakeTurnsThatMayCarryATail() throws Exception {
         String src = readProjectFile(ENGINE);
-        assertTrue(block(src, "    private int understandLocally() {").contains("!turnManual && wakeTailPossible"));
+        assertTrue(block(src, "    private void requestTurnAsr(int purpose) {").contains("!turnManual && wakeTailPossible"));
         assertTrue(block(src, "    private void reArm(LocalCommandSpotter.Match wake) {")
                 .contains("wakeTailPossible = true;"));
     }

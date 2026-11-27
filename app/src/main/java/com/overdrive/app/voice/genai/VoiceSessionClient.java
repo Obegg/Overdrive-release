@@ -61,6 +61,13 @@ public final class VoiceSessionClient {
         /** Trip Briefing sessions only: the model called trip_briefing_answer ("yes" | "no", app or null). */
         default void onBriefingAnswer(String answer, String app) {
         }
+
+        // STUB(engine): CLOUD contract callbacks; the CLOUD branch replaces these.
+        default void onServerInterrupted() {
+        }
+
+        default void onInputTranscript(String partial, boolean done) {
+        }
     }
 
     private static final String TAG = "VoiceSession";
@@ -180,11 +187,23 @@ public final class VoiceSessionClient {
             return;
         }
         ReplyPlayer p = player;
-        if (p != null && p.isActive()) {
+        if (p != null && p.isActive() && !fullDuplex) {
             pump.markGap();
             return;
         }
         pump.write(pcm, offset, length);
+    }
+
+    // STUB(engine): CLOUD contract; the CLOUD branch replaces these two methods and the field.
+    private volatile boolean fullDuplex;
+
+    /** Gemini audioStreamEnd (hybrid end of speech); OpenAI no-op. Stub: nothing sent yet. */
+    public void endOfUserSpeech() {
+    }
+
+    /** True: mic audio keeps uplinking during reply playback (barge-in). Default false. */
+    public void setFullDuplex(boolean on) {
+        fullDuplex = on;
     }
 
     public static String proposalKind(JSONObject proposal) {

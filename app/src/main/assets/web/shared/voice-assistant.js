@@ -15,6 +15,10 @@
         state_push_to_talk: 'Push-to-talk only (wake model not installed)',
         state_unavailable: 'Unavailable',
         status_load_failed: 'Could not load the voice assistant status.',
+        engine_health_fmt: 'Lag {lag} ms · {drops} drops/min',
+        echo_healthy_fmt: 'Working ({erle} dB)',
+        echo_healthy: 'Working',
+        echo_unhealthy: 'Not converged (music is paused for commands)',
         installed: 'Installed',
         not_installed: 'Not installed',
         never: 'Never',
@@ -727,6 +731,25 @@
                 cloud: counters.cloudTurns || 0,
                 failures: counters.failures || 0
             }) : '—');
+
+            // Real-time audio consumer and the car array's measured echo canceller (when reported).
+            var engine = runtime.engine;
+            var engineItem = $('voiceEngineItem');
+            if (engineItem) engineItem.hidden = !engine;
+            if (engine) {
+                this.setText('voiceEngineHealth', t('engine_health_fmt', {
+                    lag: engine.maxLagMs != null ? engine.maxLagMs : (engine.lagMs || 0),
+                    drops: engine.dropsPerMin || 0
+                }));
+            }
+            var echo = runtime.echo;
+            var echoItem = $('voiceEchoItem');
+            if (echoItem) echoItem.hidden = !echo;
+            if (echo) {
+                this.setText('voiceEchoHealth', echo.state === 'healthy'
+                    ? (echo.erleDb != null ? t('echo_healthy_fmt', { erle: echo.erleDb }) : t('echo_healthy'))
+                    : t('echo_unhealthy'));
+            }
 
             var note = $('voiceRuntimeNote');
             if (note) {
