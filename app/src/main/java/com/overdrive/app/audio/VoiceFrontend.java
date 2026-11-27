@@ -3,16 +3,24 @@ package com.overdrive.app.audio;
 import android.util.Log;
 
 /**
- * JNI front-end (libvoice_frontend): WebRTC AEC3 cancels both speaker references from both car
- * microphones, a blind adaptive 2-mic beamformer steers to the talker (plain average when unsure),
- * then a 200 Hz high-pass and WebRTC noise suppression; one 10 ms frame at a time. Loaded only when
- * the car-microphone input is selected.
+ * JNI front-end (libvoice_frontend), one 10 ms frame at a time. Default (balanced): SpeexDSP's
+ * double-talk robust MDF echo canceller on the mic average, its references aligned by WebRTC AEC3's
+ * delay estimator (no fixed-tail limit on the echo delay), 200 Hz high-pass, Speex residual-echo and
+ * noise suppression; while the references are idle, a blind adaptive 2-mic beam instead. Other modes
+ * (AEC3 with its suppressor, AEC3 linear only) are for evaluation. Loaded only when the car-microphone
+ * input is selected.
  */
 final class VoiceFrontend implements AutoCloseable {
 
     private static final String TAG = "VoiceFrontend";
-    /** WebRTC noise suppression level: 0..3 = 6/12/18/21 dB. */
+    /** WebRTC noise suppression level for the AEC3 modes: 0..3 = 6/12/18/21 dB. */
     static final int NS_LEVEL = 1;
+    /** Echo modes (vfe.h): AEC3 + suppressor, aligned MDF (default), AEC3 linear, AEC3 linear + post-filter. */
+    static final int MODE_SUPPRESS_FULL = 0;
+    static final int MODE_SUPPRESS_BALANCED = 1;
+    static final int MODE_LINEAR_ONLY = 2;
+    static final int MODE_LINEAR_POSTFILTER = 3;
+    static final int DEFAULT_MODE = MODE_SUPPRESS_BALANCED;
     /** Per-frame diagnostics written by {@link #process(short[], short[], float[], short[])} (vfe.h). */
     static final int STATS = 16;
     static final int STAT_ECHO_SCORE = 0;
@@ -58,8 +66,12 @@ final class VoiceFrontend implements AutoCloseable {
 
     /** {@code mics} microphone channels followed by {@code refs} speaker-reference channels; null when it cannot start. */
     static VoiceFrontend create(int rate, int frame, int mics, int refs) {
+        return create(rate, frame, mics, refs, DEFAULT_MODE);
+    }
+
+    static VoiceFrontend create(int rate, int frame, int mics, int refs, int mode) {
         if (!isAvailable()) return null;
-        long h = nativeCreate(rate, frame, mics, refs, NS_LEVEL);
+        long h = nativeCreate(rate, frame, mics, refs, NS_LEVEL, mode);
         return h == 0 ? null : new VoiceFrontend(h, frame, mics + refs);
     }
 
@@ -82,7 +94,7 @@ final class VoiceFrontend implements AutoCloseable {
         if (h != 0) nativeDestroy(h);
     }
 
-    private static native long nativeCreate(int rate, int frame, int mics, int refs, int nsLevel);
+    private static native long nativeCreate(int rate, int frame, int mics, int refs, int nsLevel, int mode);
 
     private static native boolean nativeProcess(long handle, short[] in, int channels, int frame, short[] out,
                                                 float[] stats, short[] taps);

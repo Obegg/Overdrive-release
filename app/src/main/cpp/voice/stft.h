@@ -33,6 +33,8 @@ class Stft {
   Stft(int hop, int n, bool sqrt_hann);
   /** Pushes one hop and returns the spectrum of the last n samples. */
   void Push(const float *hop, std::complex<float> *out);
+  /** Pushes one hop without transforming. */
+  void Keep(const float *hop);
   /** Spectrum of an arbitrary n-sample block (window applied here). */
   void Block(const float *block, std::complex<float> *out);
   int bins() const { return n_ / 2 + 1; }

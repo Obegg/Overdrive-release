@@ -8,8 +8,8 @@ extern "C" {
 
 JNIEXPORT jlong JNICALL
 Java_com_overdrive_app_audio_VoiceFrontend_nativeCreate(JNIEnv *, jclass, jint rate, jint frame, jint mics,
-                                                        jint refs, jint nsLevel) {
-    return static_cast<jlong>(reinterpret_cast<intptr_t>(vfe_create(rate, frame, mics, refs, nsLevel)));
+                                                        jint refs, jint nsLevel, jint mode) {
+    return static_cast<jlong>(reinterpret_cast<intptr_t>(vfe_create_mode(rate, frame, mics, refs, nsLevel, mode)));
 }
 
 /** stats (VFE_STATS floats) and taps (frame * 3 shorts) may be null. */

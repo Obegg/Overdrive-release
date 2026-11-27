@@ -1,0 +1,5 @@
+SpeexDSP 1.2.1 (BSD-3-Clause, see COPYING), unmodified files from
+https://github.com/xiph/speexdsp/archive/refs/tags/SpeexDSP-1.2.1.tar.gz
+(sha256 d17ca363654556a4ff1d02cc13d9eb1fc5a8642c90b40bd54ce266c3807b91a7).
+Only the echo canceller and preprocessor sources are kept; speexdsp_config_types.h
+is the configure output for stdint platforms.

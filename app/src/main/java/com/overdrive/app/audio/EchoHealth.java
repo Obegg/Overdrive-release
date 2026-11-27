@@ -1,6 +1,11 @@
 package com.overdrive.app.audio;
 
-/** Snapshot of the car-microphone echo canceller's state (see {@link CarArrayCapture#echoHealth()}). */
+/**
+ * Snapshot of the car-microphone echo canceller's state (see {@link CarArrayCapture#echoHealth()}).
+ * {@link #healthy} only covers what the canceller can see: with the references idle it reports
+ * healthy (nothing to cancel). Consumers MUST treat (media playing && !refActive) as unhealthy:
+ * the car then plays audio the canceller has no reference for (fields saw refs at -90 dBFS with music on).
+ */
 public final class EchoHealth {
     /** ERLE at or above this, after convergence with the references playing, counts as healthy. */
     public static final float HEALTHY_ERLE_DB = 10f;
@@ -13,7 +18,10 @@ public final class EchoHealth {
     public final float residualEchoRatio;
     /** Reference-to-microphone alignment the canceller found, -1 when unknown. */
     public final int delayMs;
-    /** Converged with the references active and ERLE >= {@link #HEALTHY_ERLE_DB}, or nothing to cancel. */
+    /**
+     * Converged with the references active and ERLE >= {@link #HEALTHY_ERLE_DB}, or references idle.
+     * Not sufficient alone: see the class note on media playing with idle references.
+     */
     public final boolean healthy;
     public final long atElapsedMs;
 

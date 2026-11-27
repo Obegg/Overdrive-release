@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 namespace od {
 
@@ -19,14 +20,36 @@ constexpr float kMinCoherence = 0.5f;
 constexpr float kMaxWhiteGain = 2.0f;   // |w|^2; the plain average is 0.5
 constexpr float kMinSpeechMass = 8.f;
 constexpr float kHighPassHz = 200.f;
+#ifndef __ANDROID__
+float BenchKnob(const char *n, float d) { const char *e = std::getenv(n); return e ? std::atof(e) : d; }
+const float kMinGain = BenchKnob("VFE_PF_MIN_GAIN", 0.05f);
+const float kTailDecay = BenchKnob("VFE_PF_TAIL", 0.6f);
+const float kMinLeak = BenchKnob("VFE_PF_MIN_LEAK", 0.04f);
+const float kSpatial = BenchKnob("VFE_PF_SPATIAL", 0.f);
+const int kBeamMode = static_cast<int>(BenchKnob("VFE_BEAM", 0.f));
+const float kDd = BenchKnob("VFE_PF_DD", 0.9f);
+const int kSpread = static_cast<int>(BenchKnob("VFE_PF_SPREAD", 2.f));  // host A/B: 1 = average, 2 = mic 0
+#else
+constexpr float kMinGain = 0.05f;   // post-filter floor, -26 dB
+constexpr float kTailDecay = 0.6f;  // per 10 ms: echo tail beyond the linear filter
+constexpr float kSpatial = 0.f;     // blocking-output post-filter weight (off: see bench)
+constexpr float kDd = 0.9f;         // decision-directed smoothing of the a-priori ratio
+constexpr int kSpread = 2;          // echo-estimate smearing, bins either side
+constexpr float kMinLeak = 0.04f;   // the linear filter's residual is never assumed below -14 dB
+#endif
 }  // namespace
 
 Beamformer::Beamformer(int rate)
-    : stft0_(kHop, kFft, true), stft1_(kHop, kFft, true), istft_(kHop, kFft) {
+    : stft0_(kHop, kFft, true), stft1_(kHop, kFft, true), stfte0_(kHop, kFft, true), stfte1_(kHop, kFft, true),
+      istft_(kHop, kFft) {
   const int nb = kFft / 2 + 1;
   bins_.resize(nb);
   x0_.resize(nb);
   x1_.resize(nb);
+  e0_.resize(nb);
+  e1_.resize(nb);
+  eb_.assign(nb, 0.f);
+  bb_.assign(nb, 0.f);
   z_.resize(nb);
   shape_.resize(nb);
   const float hz = static_cast<float>(rate) / kFft;
@@ -37,6 +60,37 @@ Beamformer::Beamformer(int rate)
   }
   lo_bin_ = static_cast<int>(std::ceil(150.f / hz));
   hi_bin_ = std::min(nb - 1, static_cast<int>(7600.f / hz));
+}
+
+float Beamformer::PostGain(Bin &b, float pz, float pe, float pb, float strength) {
+  // Leakage = regression of output power on (frequency-smeared) echo-estimate power, which near-end
+  // speech is uncorrelated with, over ~2 s; residual echo = leakage x (estimate + decaying tail).
+  constexpr float a = 0.995f;
+  b.mz = a * b.mz + (1 - a) * pz;
+  b.me = a * b.me + (1 - a) * pe;
+  b.rze = a * b.rze + (1 - a) * pz * pe;
+  b.ree = a * b.ree + (1 - a) * pe * pe;
+  const float var = b.ree - b.me * b.me;
+  float leak = var > 1e-6f * b.ree ? (b.rze - b.mz * b.me) / var : 0.f;
+  leak = std::min(1.f, std::max(kMinLeak, leak));
+  b.tail = std::max(pe, kTailDecay * b.tail);
+  float residual = strength * leak * b.tail;
+  if (kSpatial > 0) {
+    // Blocking output: speech-free, carries residual echo and noise the beam let through.
+    b.mb = a * b.mb + (1 - a) * pb;
+    b.rzb = a * b.rzb + (1 - a) * pz * pb;
+    b.rbb = a * b.rbb + (1 - a) * pb * pb;
+    const float vb = b.rbb - b.mb * b.mb;
+    const float kb = vb > 1e-6f * b.rbb ? std::min(1.f, std::max(0.f, (b.rzb - b.mz * b.mb) / vb)) : 0.f;
+    residual = std::max(residual, kSpatial * kb * pb);
+  }
+  // Decision-directed Wiener gain on the speech-to-residual-echo ratio.
+  const float gamma = pz / (residual + 1e-6f);
+  const float xi = kDd * b.prev + (1 - kDd) * std::max(gamma - 1.f, 0.f);
+  const float g = std::max(kMinGain, xi / (1.f + xi));
+  b.prev = g * g * gamma;
+  b.gain = g;
+  return g;
 }
 
 void Beamformer::Weights(Bin &b, int ref) {
@@ -75,6 +129,7 @@ void Beamformer::Weights(Bin &b, int ref) {
       ok = q > 0 && sn > 1e-20f;
       if (ok) {
         const cf other = (ref == 0 ? p1 : p0) / s;
+        b.rtf = other;
         const float rel = std::norm(other);
         w0 = v0 * std::conj(s) / q;
         w1 = v1 * std::conj(s) / q;
@@ -96,9 +151,15 @@ void Beamformer::Weights(Bin &b, int ref) {
   }
 }
 
-void Beamformer::Process(const float *mic0, const float *mic1, float echo_gate, float *out) {
+void Beamformer::Process(const float *mic0, const float *mic1, const float *echo0, const float *echo1,
+                         float echo_gate, float strength, float *out) {
   stft0_.Push(mic0, x0_.data());
   stft1_.Push(mic1, x1_.data());
+  const bool post = echo0 && echo1 && strength > 0;
+  if (echo0 && echo1) {
+    stfte0_.Push(echo0, e0_.data());
+    stfte1_.Push(echo1, e1_.data());
+  }
   const int nb = static_cast<int>(bins_.size());
   const bool init = frames_ < 10;
   const float gate = std::min(1.f, std::max(0.f, 1.f - echo_gate));
@@ -138,10 +199,12 @@ void Beamformer::Process(const float *mic0, const float *mic1, float echo_gate, 
       b.speech_mass = 0.995f * b.speech_mass + ps;
     }
     cf z;
+    cf w0(0.5f, 0), w1(0.5f, 0);
     if (k >= lo_bin_ && k <= hi_bin_ && !init) {
       Weights(b, ref_);
       const float c = b.adapted ? b.conf : 0.f;
-      const cf w0 = c * b.w0 + (1.f - c) * cf(0.5f, 0), w1 = c * b.w1 + (1.f - c) * cf(0.5f, 0);
+      w0 = c * b.w0 + (1.f - c) * cf(0.5f, 0);
+      w1 = c * b.w1 + (1.f - c) * cf(0.5f, 0);
       z = std::conj(w0) * x0 + std::conj(w1) * x1;
       conf_sum += c;
       pw0 += std::max(0.f, b.py00 - b.pn00);
@@ -149,10 +212,25 @@ void Beamformer::Process(const float *mic0, const float *mic1, float echo_gate, 
     } else {
       z = 0.5f * (x0 + x1);
     }
-#ifdef VFE_BEAM_MODE
-    z = VFE_BEAM_MODE == 1 ? 0.5f * (x0 + x1) : x0;
+#ifndef __ANDROID__
+    if (kBeamMode == 1) z = 0.5f * (x0 + x1);
+    if (kBeamMode == 2) z = x0;
 #endif
+    if (post) {
+      eb_[k] = std::norm(std::conj(w0) * e0_[k] + std::conj(w1) * e1_[k]);
+      bb_[k] = std::norm(ref_ == 0 ? x1 - b.rtf * x0 : x0 - b.rtf * x1);
+    }
     z_[k] = z * shape_[k];
+  }
+  if (post) {
+    // Harmonics of a saturating speaker land beside the linear estimate: smear it over +-kSpread bins.
+    for (int k = 0; k < nb; k++) {
+      float acc = 0;
+      int lo = std::max(0, k - kSpread), hi = std::min(nb - 1, k + kSpread);
+      for (int j = lo; j <= hi; j++) acc += eb_[j];
+      const float pe = acc / (hi - lo + 1);
+      z_[k] *= PostGain(bins_[k], std::norm(z_[k]), pe, bb_[k], strength);
+    }
   }
   frames_++;
   confidence_ = static_cast<float>(conf_sum / (hi_bin_ - lo_bin_ + 1));

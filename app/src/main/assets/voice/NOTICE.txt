@@ -23,8 +23,11 @@ Wake word model voice/wake/ (when present)
 Speech-to-text model voice/asr/moonshine-tiny-en/ (sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27)
   Moonshine by Moonshine AI (formerly Useful Sensors). English models: MIT License.
   https://github.com/moonshine-ai/moonshine
-WebRTC audio processing (AEC3, noise suppression, high-pass) from webrtc-audio-processing 2.1
-(lib/arm64-v8a/libvoice_frontend.so)
+SpeexDSP 1.2.1 echo canceller and preprocessor (lib/arm64-v8a/libvoice_frontend.so)
+  Copyright Jean-Marc Valin, Xiph.Org Foundation and contributors. BSD-3-Clause.
+  https://github.com/xiph/speexdsp
+WebRTC audio processing (AEC3 incl. its delay estimator, noise suppression, high-pass) from
+webrtc-audio-processing 2.1 (lib/arm64-v8a/libvoice_frontend.so)
   Copyright The WebRTC project authors. BSD-3-Clause, with the WebRTC patent grant.
   https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing
   PFFFT: Copyright Julien Pommier, FFTPACK-derived BSD-style license.

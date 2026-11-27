@@ -1,4 +1,4 @@
-// Cabin voice front-end: WebRTC AEC3 (2 mics x 2 speaker refs), blind 2-mic beamformer, WebRTC NS.
+// Cabin voice front-end: echo cancelling (AEC3 or delay-aligned MDF), blind 2-mic beamformer, NS.
 // 16 kHz, 10 ms frames, mono out. Plain C API shared by the JNI binding and the offline bench.
 #ifndef OD_VOICE_VFE_H_
 #define OD_VOICE_VFE_H_
@@ -15,7 +15,7 @@ typedef struct Vfe Vfe;
 enum {
     VFE_ECHO_SCORE = 0,    // 0..1 share of this frame's output explained by the refs; NaN with refs idle
     VFE_OUT_ENERGY,        // mean square of this frame's output (weight for window averages)
-    VFE_ERLE_DB,           // mic vs AEC-output energy while the refs play: best 1 s block of the last 3
+    VFE_ERLE_DB,           // mic vs echo-cancelled (beam) energy while the refs play: best 1 s block of the last 3
     VFE_LINEAR_ERLE_DB,    // AEC3's own linear-filter ERLE
     VFE_DELAY_MS,          // AEC3 render alignment delay, -1 when unknown
     VFE_REF_ACTIVE,        // 1 while the references carry signal
@@ -27,7 +27,22 @@ enum {
     VFE_STATS = 16
 };
 
-/** NS level: 0..3 = 6/12/18/21 dB. Returns NULL when the configuration is unsupported. */
+/**
+ * Echo modes. FULL: AEC3 with its own suppressor. BALANCED (default): SpeexDSP MDF on references
+ * aligned by AEC3's delay estimator, Speex residual-echo/noise suppression; beam while refs are idle.
+ * LINEAR_ONLY: AEC3's linear filter. LINEAR_POSTFILTER: that plus the beam's residual-echo post-filter.
+ */
+enum {
+  VFE_SUPPRESS_FULL = 0,
+  VFE_SUPPRESS_BALANCED = 1,
+  VFE_LINEAR_ONLY = 2,
+  VFE_LINEAR_POSTFILTER = 3,
+  VFE_DEFAULT_MODE = VFE_SUPPRESS_BALANCED
+};
+
+/** NS level: 0..3 = 6/12/18/21 dB (AEC3 modes; balanced uses Speex's); mode: above. NULL when unsupported. */
+Vfe *vfe_create_mode(int rate, int frame, int mics, int refs, int ns_level, int mode);
+/** vfe_create_mode with VFE_DEFAULT_MODE; host (non-Android) builds take VFE_MODE / VFE_NS from the environment. */
 Vfe *vfe_create(int rate, int frame, int mics, int refs, int ns_level);
 /**
  * One interleaved frame (mics first, then refs) in, one mono frame out. stats (VFE_STATS) and

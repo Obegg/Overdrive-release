@@ -59,6 +59,11 @@ void Stft::Push(const float *hop, std::complex<float> *out) {
   Block(history_.data(), out);
 }
 
+void Stft::Keep(const float *hop) {
+  std::memmove(history_.data(), history_.data() + hop_, sizeof(float) * (n_ - hop_));
+  std::memcpy(history_.data() + n_ - hop_, hop, sizeof(float) * hop_);
+}
+
 void Stft::Block(const float *block, std::complex<float> *out) {
   for (int i = 0; i < n_; i++) scratch_[i] = block[i] * window_[i];
   fft_.Forward(scratch_.data(), out);

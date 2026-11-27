@@ -270,12 +270,21 @@ else()
 endif()
 
 # ==================== Voice front-end ====================
-# The voice assistant's car-microphone input: WebRTC AEC3 over the two cabin mics and both speaker
-# references, a blind 2-mic beamformer, then WebRTC noise suppression. Loaded only when selected.
+# The voice assistant's car-microphone input: echo cancelling over the two cabin mics and both speaker
+# references (SpeexDSP MDF aligned by WebRTC AEC3's delay estimator, or AEC3 itself), a blind 2-mic
+# beamformer, noise suppression. Loaded only when selected.
 set(WAP_DIR ${CMAKE_SOURCE_DIR}/third_party/webrtc-audio-processing)
+set(SPEEXDSP_DIR ${CMAKE_SOURCE_DIR}/third_party/speexdsp)
 set(VOICE_FE_SOURCES
     voice/voice_frontend_jni.cc
     voice/vfe.cc
+    voice/aligned_mdf.cc
+    ${SPEEXDSP_DIR}/libspeexdsp/mdf.c
+    ${SPEEXDSP_DIR}/libspeexdsp/preprocess.c
+    ${SPEEXDSP_DIR}/libspeexdsp/filterbank.c
+    ${SPEEXDSP_DIR}/libspeexdsp/fftwrap.c
+    ${SPEEXDSP_DIR}/libspeexdsp/kiss_fft.c
+    ${SPEEXDSP_DIR}/libspeexdsp/kiss_fftr.c
     voice/beamformer.cc
     voice/stft.cc
     ${WAP_DIR}/webrtc/api/audio/echo_canceller3_config.cc
@@ -384,6 +393,8 @@ target_include_directories(voice_frontend PRIVATE
     ${CMAKE_SOURCE_DIR}/voice
     ${WAP_DIR}
     ${WAP_DIR}/webrtc
+    ${SPEEXDSP_DIR}/include
+    ${SPEEXDSP_DIR}/libspeexdsp
 )
 # webrtc-audio-processing's meson switches for Android, without logging, metrics or debug dumps.
 target_compile_definitions(voice_frontend PRIVATE
@@ -397,6 +408,10 @@ target_compile_definitions(voice_frontend PRIVATE
     RTC_DISABLE_CHECK_MSG
     NDEBUG
     _GNU_SOURCE
+    # SpeexDSP's configure switches: floating point, bundled KISS FFT.
+    FLOATING_POINT
+    USE_KISS_FFT
+    EXPORT=
 )
 if(ANDROID_ABI STREQUAL "arm64-v8a")
     target_compile_definitions(voice_frontend PRIVATE WEBRTC_ARCH_ARM64 WEBRTC_HAS_NEON)
