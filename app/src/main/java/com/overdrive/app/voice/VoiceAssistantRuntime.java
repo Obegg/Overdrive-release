@@ -347,6 +347,17 @@ public final class VoiceAssistantRuntime {
                 if (aecOn != null) body.put("aecEnabled", aecOn);
                 int[] channels = AppAudioCaptureController.carArrayChannelsDb();
                 if (channels != null) body.put("arrayChannelsDb", new org.json.JSONArray(channels));
+                com.overdrive.app.audio.EchoHealth echo = AppAudioCaptureController.echoHealth();
+                if (echo != null) {
+                    JSONObject e = new JSONObject();
+                    e.put("ref", echo.refActive);
+                    e.put("erleDb", Math.round(echo.erleDb));
+                    e.put("delayMs", echo.delayMs);
+                    e.put("residualPct", Math.round(echo.residualEchoRatio * 100));
+                    e.put("healthy", echo.healthy);
+                    e.put("overruns", AppAudioCaptureController.carArrayOverruns());
+                    body.put("arrayEcho", e);
+                }
                 if (source != null) {
                     JSONObject snap = source.snapshot();
                     body.put("counters", snap.optJSONObject("counters"));

@@ -270,38 +270,150 @@ else()
 endif()
 
 # ==================== Voice front-end ====================
-# The voice assistant's car-microphone input: SpeexDSP echo cancelling and noise suppression over
-# the two cabin mics and the speaker reference. Loaded only when that input is selected.
-set(SPEEXDSP_DIR ${CMAKE_SOURCE_DIR}/third_party/speexdsp)
-add_library(voice_frontend SHARED
-    voice/voice_frontend.c
-    ${SPEEXDSP_DIR}/libspeexdsp/mdf.c
-    ${SPEEXDSP_DIR}/libspeexdsp/preprocess.c
-    ${SPEEXDSP_DIR}/libspeexdsp/filterbank.c
-    ${SPEEXDSP_DIR}/libspeexdsp/fftwrap.c
-    ${SPEEXDSP_DIR}/libspeexdsp/kiss_fft.c
-    ${SPEEXDSP_DIR}/libspeexdsp/kiss_fftr.c
+# The voice assistant's car-microphone input: WebRTC AEC3 over the two cabin mics and both speaker
+# references, a blind 2-mic beamformer, then WebRTC noise suppression. Loaded only when selected.
+set(WAP_DIR ${CMAKE_SOURCE_DIR}/third_party/webrtc-audio-processing)
+set(VOICE_FE_SOURCES
+    voice/voice_frontend_jni.cc
+    voice/vfe.cc
+    voice/beamformer.cc
+    voice/stft.cc
+    ${WAP_DIR}/webrtc/api/audio/echo_canceller3_config.cc
+    ${WAP_DIR}/webrtc/common_audio/audio_util.cc
+    ${WAP_DIR}/webrtc/common_audio/channel_buffer.cc
+    ${WAP_DIR}/webrtc/common_audio/resampler/push_sinc_resampler.cc
+    ${WAP_DIR}/webrtc/common_audio/resampler/sinc_resampler.cc
+    ${WAP_DIR}/webrtc/common_audio/signal_processing/splitting_filter.c
+    ${WAP_DIR}/webrtc/common_audio/third_party/ooura/fft_size_128/ooura_fft.cc
+    ${WAP_DIR}/webrtc/common_audio/third_party/ooura/fft_size_256/fft4g.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/adaptive_fir_filter.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/adaptive_fir_filter_erl.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/aec3_common.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/aec3_fft.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/aec_state.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/alignment_mixer.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/api_call_jitter_metrics.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/block_buffer.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/block_delay_buffer.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/block_framer.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/block_processor.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/block_processor_metrics.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/clockdrift_detector.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/coarse_filter_update_gain.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/comfort_noise_generator.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/config_selector.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/decimator.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/dominant_nearend_detector.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/downsampled_render_buffer.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/echo_audibility.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/echo_canceller3.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/echo_path_delay_estimator.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/echo_path_variability.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/echo_remover.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/echo_remover_metrics.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/erl_estimator.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/erle_estimator.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/fft_buffer.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/filter_analyzer.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/frame_blocker.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/fullband_erle_estimator.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/matched_filter.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/matched_filter_lag_aggregator.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/moving_average.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/multi_channel_content_detector.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/refined_filter_update_gain.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/render_buffer.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/render_delay_buffer.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/render_delay_controller.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/render_delay_controller_metrics.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/render_signal_analyzer.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/residual_echo_estimator.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/reverb_decay_estimator.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/reverb_frequency_response.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/reverb_model.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/reverb_model_estimator.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/signal_dependent_erle_estimator.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/spectrum_buffer.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/stationarity_estimator.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/subband_erle_estimator.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/subband_nearend_detector.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/subtractor.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/subtractor_output.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/subtractor_output_analyzer.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/suppression_filter.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/suppression_gain.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/aec3/transparent_mode.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/audio_buffer.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/high_pass_filter.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/logging/apm_data_dumper.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/ns/fast_math.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/ns/histograms.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/ns/noise_estimator.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/ns/noise_suppressor.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/ns/ns_fft.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/ns/prior_signal_model.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/ns/prior_signal_model_estimator.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/ns/quantile_noise_estimator.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/ns/signal_model.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/ns/signal_model_estimator.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/ns/speech_probability_estimator.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/ns/suppression_params.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/ns/wiener_filter.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/splitting_filter.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/three_band_filter_bank.cc
+    ${WAP_DIR}/webrtc/modules/audio_processing/utility/cascaded_biquad_filter.cc
+    ${WAP_DIR}/webrtc/rtc_base/checks.cc
+    ${WAP_DIR}/webrtc/rtc_base/experiments/field_trial_parser.cc
+    ${WAP_DIR}/webrtc/rtc_base/memory/aligned_malloc.cc
+    ${WAP_DIR}/webrtc/rtc_base/platform_thread_types.cc
+    ${WAP_DIR}/webrtc/rtc_base/race_checker.cc
+    ${WAP_DIR}/webrtc/rtc_base/string_encode.cc
+    ${WAP_DIR}/webrtc/system_wrappers/source/cpu_features.cc
+    ${WAP_DIR}/webrtc/system_wrappers/source/field_trial.cc
+    ${WAP_DIR}/webrtc/system_wrappers/source/metrics.cc
+    ${WAP_DIR}/webrtc/third_party/pffft/src/pffft.c
 )
+if(ANDROID_ABI STREQUAL "arm64-v8a")
+    list(APPEND VOICE_FE_SOURCES
+        ${WAP_DIR}/webrtc/common_audio/resampler/sinc_resampler_neon.cc
+        ${WAP_DIR}/webrtc/common_audio/third_party/ooura/fft_size_128/ooura_fft_neon.cc
+    )
+endif()
+add_library(voice_frontend SHARED ${VOICE_FE_SOURCES})
 target_include_directories(voice_frontend PRIVATE
     ${CMAKE_SOURCE_DIR}/voice
-    ${SPEEXDSP_DIR}/include
-    ${SPEEXDSP_DIR}/libspeexdsp
+    ${WAP_DIR}
+    ${WAP_DIR}/webrtc
 )
-# SpeexDSP's configure switches, given here instead of a config.h: floating point, bundled KISS FFT.
+# webrtc-audio-processing's meson switches for Android, without logging, metrics or debug dumps.
 target_compile_definitions(voice_frontend PRIVATE
-    FLOATING_POINT
-    USE_KISS_FFT
-    EXPORT=
-    $<$<CONFIG:Release>:NDEBUG>
-    $<$<CONFIG:RelWithDebInfo>:NDEBUG>
+    WEBRTC_POSIX
+    WEBRTC_LINUX
+    WEBRTC_ANDROID
+    WEBRTC_LIBRARY_IMPL
+    WEBRTC_APM_DEBUG_DUMP=0
+    RTC_DISABLE_LOGGING
+    RTC_DISABLE_METRICS
+    RTC_DISABLE_CHECK_MSG
+    NDEBUG
+    _GNU_SOURCE
 )
+if(ANDROID_ABI STREQUAL "arm64-v8a")
+    target_compile_definitions(voice_frontend PRIVATE WEBRTC_ARCH_ARM64 WEBRTC_HAS_NEON)
+else()
+    target_compile_definitions(voice_frontend PRIVATE PFFFT_SIMD_DISABLE)
+endif()
 target_compile_options(voice_frontend PRIVATE
     -fvisibility=hidden
+    -fvisibility-inlines-hidden
     -ffunction-sections
     -fdata-sections
+    -fno-exceptions
+    -fno-rtti
     -O2
+    -w
 )
-target_link_libraries(voice_frontend m)
+target_link_libraries(voice_frontend m log)
 set_target_properties(voice_frontend PROPERTIES
-    LINK_FLAGS "-Wl,--gc-sections,--strip-all,--exclude-libs,ALL"
+    LINK_FLAGS "-Wl,--gc-sections,--strip-all,--exclude-libs,ALL,--icf=all"
 )

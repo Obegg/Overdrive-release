@@ -1,0 +1,35 @@
+package com.overdrive.app.audio;
+
+/** Snapshot of the car-microphone echo canceller's state (see {@link CarArrayCapture#echoHealth()}). */
+public final class EchoHealth {
+    /** ERLE at or above this, after convergence with the references playing, counts as healthy. */
+    public static final float HEALTHY_ERLE_DB = 10f;
+
+    /** The speaker references carry signal (above about -70 dBFS within the last 0.5 s). */
+    public final boolean refActive;
+    /** Microphone vs canceller-output energy while the references play (best 1 s of the last 3). */
+    public final float erleDb;
+    /** Share of the last second's output explained by the references, 0..1 (0 with references idle). */
+    public final float residualEchoRatio;
+    /** Reference-to-microphone alignment the canceller found, -1 when unknown. */
+    public final int delayMs;
+    /** Converged with the references active and ERLE >= {@link #HEALTHY_ERLE_DB}, or nothing to cancel. */
+    public final boolean healthy;
+    public final long atElapsedMs;
+
+    public EchoHealth(boolean refActive, float erleDb, float residualEchoRatio, int delayMs, boolean converged,
+                      long atElapsedMs) {
+        this.refActive = refActive;
+        this.erleDb = erleDb;
+        this.residualEchoRatio = residualEchoRatio;
+        this.delayMs = delayMs;
+        this.healthy = !refActive || (converged && erleDb >= HEALTHY_ERLE_DB);
+        this.atElapsedMs = atElapsedMs;
+    }
+
+    @Override
+    public String toString() {
+        return "EchoHealth{ref=" + refActive + ", erle=" + Math.round(erleDb) + "dB, residual="
+                + Math.round(residualEchoRatio * 100) + "%, delay=" + delayMs + "ms, healthy=" + healthy + '}';
+    }
+}
