@@ -227,6 +227,8 @@ struct Vfe {
   int mode = VFE_SUPPRESS_BALANCED;
   bool ns_off = false;  // host A/B only (ns_level < 0)
   bool idle_beam = false;
+  int idle_suppress = 1;  // refs idle: 0 none, 1 Speex, 2 WebRTC NS
+  int16_t spare16[kFrame];
   float strength = 0;
   std::unique_ptr<webrtc::EchoCanceller3> aec;  // not in balanced mode
   std::unique_ptr<webrtc::AudioBuffer> render, capture, mono, linear;
@@ -275,6 +277,7 @@ extern "C" Vfe *vfe_create_mode(int rate, int frame, int mics, int refs, int ns_
   // Beam instead of the mic average while the refs are idle: no wake-recall gain on the eval
   // harness (quiet 90.9 vs 91.2 %, road0 64.1 vs 65.6 %), so off by default.
   v->idle_beam = Knob("VFE_IDLE_BEAM", 0) > 0.5f;
+  v->idle_suppress = static_cast<int>(Knob("VFE_IDLE_SUPPRESS", 1));
   v->strength = mode == VFE_LINEAR_POSTFILTER ? Knob("VFE_PF_STRENGTH", kPostStrength) : 0.f;
   if (mode == VFE_SUPPRESS_BALANCED) {
     v->mdf = std::make_unique<od::AlignedMdf>(kRate, kFrame, static_cast<int>(Knob("VFE_MDF_TAIL", kMdfTail)));
@@ -305,7 +308,7 @@ extern "C" Vfe *vfe_create_mode(int rate, int frame, int mics, int refs, int ns_
   v->mono = std::make_unique<webrtc::AudioBuffer>(kRate, 1, kRate, 1, kRate, 1);
   v->hpf = std::make_unique<webrtc::HighPassFilter>(kRate, kChannels);
 #if !defined(__ANDROID__) || defined(VFE_ALL_MODES)
-  if (!v->mdf) {
+  if (!v->mdf || v->idle_suppress == 2) {
     webrtc::NsConfig ns;
     ns.target_level = static_cast<webrtc::NsConfig::SuppressionLevel>(std::min(3, std::max(0, ns_level)));
     v->ns = std::make_unique<webrtc::NoiseSuppressor>(ns, kRate, 1);
@@ -409,8 +412,24 @@ double ProcessBalanced(Vfe *v, const int16_t *in, bool ref_active, float *const 
   if (v->beam_mix > 0.999f) v->beam_mix = 1.f;
   if (v->beam_mix < 0.001f) v->beam_mix = 0.f;
   if (!need_beam) std::copy(line, line + kFrame, v->beam_out);
-  if (!v->ns_off) speex_preprocess_run(v->pre_state, v->final16);
-  for (int i = 0; i < kFrame; i++) v->out_f[i] = v->final16[i];
+  // Host A/B only: bypassing Speex's suppression with idle refs lost road recall on the harness
+  // (road0 65.6 -> 59.7 %, road5 83.8 -> 79.4 %), so Speex stays on (idle_suppress = 1).
+  const bool idle = !ref_active && v->ref_idle >= kPathIdleFrames;
+  if (idle && v->idle_suppress != 1) {
+    std::copy(v->final16, v->final16 + kFrame, v->spare16);
+    if (!v->ns_off) speex_preprocess_run(v->pre_state, v->spare16);
+    float *m = v->mono->channels()[0];
+    for (int i = 0; i < kFrame; i++) m[i] = v->final16[i];
+    if (v->idle_suppress == 2 && v->ns) {
+      v->mono->set_num_channels(1);
+      v->ns->Analyze(*v->mono);
+      v->ns->Process(v->mono.get());
+    }
+    std::copy(m, m + kFrame, v->out_f);
+  } else {
+    if (!v->ns_off) speex_preprocess_run(v->pre_state, v->final16);
+    for (int i = 0; i < kFrame; i++) v->out_f[i] = v->final16[i];
+  }
   if (v->frames % 10 == 0) {
     const int d = ref_active ? v->mdf->delay_ms() : -1;
     if (d >= 0 && v->delay_ms >= 0 && std::abs(d - v->delay_ms) > 8) {
