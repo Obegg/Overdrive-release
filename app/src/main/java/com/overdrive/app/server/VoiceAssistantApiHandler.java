@@ -495,9 +495,33 @@ public final class VoiceAssistantApiHandler {
                         .put("ms", clamp(c.optInt("ms"), 0, 60_000))
                         .putOpt("text", plainText(c.optString("text", "")))
                         .putOpt("media", mediaFlag(c))
-                        .putOpt("p", unitProbability(c)));
+                        .putOpt("p", unitProbability(c))
+                        .putOpt("echo", probability(c, "echo")));
+                copyClamped(c, out.getJSONObject(out.length() - 1), "qMs", 0, 60_000);
             }
             if (out.length() > 0) clean.put("checks", out);
+        }
+        // Real-time consumer health (ring lag, drops) and worker load, for /api/voice/status.
+        JSONObject engine = input.optJSONObject("engine");
+        if (engine != null && engine.opt("lagMs") instanceof Number) {
+            JSONObject e = new JSONObject();
+            copyClamped(engine, e, "lagMs", 0, 600_000);
+            copyClamped(engine, e, "maxLagMs", 0, 600_000);
+            copyClamped(engine, e, "dropsPerMin", 0, 100_000);
+            copyClamped(engine, e, "droppedMsPerMin", 0, 60_000);
+            copyClamped(engine, e, "workerPct", 0, 100);
+            copyClamped(engine, e, "workerQueueMs", 0, 600_000);
+            copyClamped(engine, e, "workerDropped", 0, 100_000);
+            clean.put("engine", e);
+        }
+        // The car array's measured echo-canceller health.
+        JSONObject echo = input.optJSONObject("echo");
+        if (echo != null && echo.optString("state", "").matches("[a-z]{1,10}")) {
+            JSONObject e = new JSONObject().put("state", echo.optString("state"));
+            copyClamped(echo, e, "erleDb", -30, 90);
+            copyClamped(echo, e, "delayMs", 0, 2000);
+            if (echo.opt("refActive") instanceof Boolean) e.put("refActive", echo.optBoolean("refActive"));
+            clean.put("echo", e);
         }
         int dropped = clamp(input.optInt("checksDropped"), 0, 10_000);
         if (dropped > 0) clean.put("checksDropped", dropped);
@@ -585,7 +609,27 @@ public final class VoiceAssistantApiHandler {
             t.put("mediaPkg", mediaPkg);
         }
         copyClamped(turn, t, "pauseMs", -1, 60_000);
+        // Echo health at turn start, the media decision's reason, cloud end of speech, worker waits.
+        copyToken(turn, t, "echo", "[a-z]{1,10}");
+        copyClamped(turn, t, "erleDb", -30, 90);
+        copyToken(turn, t, "holdWhy", "[a-z_]{1,16}");
+        copyToken(turn, t, "eosBy", "[a-z_]{1,16}");
+        copyClamped(turn, t, "eosMs", 0, 60_000);
+        t.putOpt("stp", probability(turn, "stp"));
+        if (Boolean.TRUE.equals(turn.opt("duplex"))) t.put("duplex", true);
+        copyClamped(turn, t, "interrupts", 0, 100);
+        copyClamped(turn, t, "inChars", 0, 10_000);
+        copyClamped(turn, t, "tools", 0, 100);
+        copyClamped(turn, t, "vqMs", 0, 60_000);
+        copyClamped(turn, t, "asrQMs", 0, 60_000);
+        copyClamped(turn, t, "lagMs", 0, 600_000);
         return t;
+    }
+
+    private static void copyToken(JSONObject from, JSONObject to, String key, String pattern)
+            throws JSONException {
+        Object v = from.opt(key);
+        if (v instanceof String && ((String) v).matches(pattern)) to.put(key, v);
     }
 
     /** Stage-1 probabilities are 0..1, kept with two decimals; anything else is dropped. */
@@ -632,6 +676,19 @@ public final class VoiceAssistantApiHandler {
         } else if (t.has("pauseMs") && t.optInt("pauseMs") < 0) {
             items.add("media pause unconfirmed");
         }
+        if (t.has("holdWhy")) items.add("hold " + t.optString("holdWhy"));
+        if (t.has("echo")) items.add("echo " + t.optString("echo")
+                + (t.has("erleDb") ? " " + t.optInt("erleDb") + " dB" : ""));
+        if (t.has("eosBy")) items.add("end " + t.optString("eosBy")
+                + (t.has("eosMs") ? " after " + t.optInt("eosMs") + " ms" : ""));
+        if (t.has("stp")) items.add(String.format(java.util.Locale.US, "smart turn %.2f", t.optDouble("stp")));
+        if (t.has("duplex")) items.add("full duplex");
+        if (t.has("interrupts")) items.add("barge-in " + t.optInt("interrupts"));
+        if (t.has("inChars")) items.add("heard " + t.optInt("inChars") + " chars");
+        if (t.has("tools")) items.add("tools " + t.optInt("tools"));
+        if (t.has("vqMs")) items.add("verify queued " + t.optInt("vqMs") + " ms");
+        if (t.has("asrQMs")) items.add("stt queued " + t.optInt("asrQMs") + " ms");
+        if (t.optInt("lagMs") > 0) items.add("lag " + t.optInt("lagMs") + " ms");
         return items.isEmpty() ? "" : " [" + String.join(", ", items) + "]";
     }
 
@@ -698,6 +755,8 @@ public final class VoiceAssistantApiHandler {
                         .append(" dB ").append(v.optInt("ms")).append(" ms");
                 if (v.has("media")) line.append(" media");
                 if (v.has("p")) line.append(String.format(java.util.Locale.US, " p=%.2f", v.optDouble("p")));
+                if (v.has("echo")) line.append(String.format(java.util.Locale.US, " echo=%.2f", v.optDouble("echo")));
+                if (v.has("qMs")) line.append(" queued ").append(v.optInt("qMs")).append(" ms");
                 if (v.has("text")) line.append(" heard \"").append(v.optString("text")).append('"');
             }
             if (clean.has("checksDropped")) {
@@ -748,6 +807,18 @@ public final class VoiceAssistantApiHandler {
                     line.append("idle");
                 }
                 line.append(" ovr ").append(echo.optInt("overruns"));
+            }
+            JSONObject engine = clean.optJSONObject("engine");
+            if (engine != null) {
+                line.append(" | engine lag ").append(engine.optInt("lagMs")).append(" ms (max ")
+                        .append(engine.optInt("maxLagMs")).append("), drops ")
+                        .append(engine.optInt("dropsPerMin")).append("/min, worker ")
+                        .append(engine.optInt("workerPct")).append('%');
+            }
+            JSONObject gate = clean.optJSONObject("echo");
+            if (gate != null) {
+                line.append(" | echo gate ").append(gate.optString("state"));
+                if (gate.has("erleDb")) line.append(' ').append(gate.optInt("erleDb")).append(" dB");
             }
         }
         return line.toString();

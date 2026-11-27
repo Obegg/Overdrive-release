@@ -89,6 +89,17 @@ public final class VoiceAssistantConfig {
     public final boolean shareLocationWithAi;
     /** Stage-1 wake cutoff while media plays, {@code WAKE_CUTOFF_UNDER_MEDIA_MIN..MAX}. */
     public final double wakeCutoffUnderMedia;
+    /** The lowest Train-with-music cutoff of any voice, NaN for none (kept even when echo is healthy). */
+    public final double personalMediaCutoff;
+    /** Stage 1 hears GTCRN-denoised audio (default off until the EVAL numbers say it helps). */
+    public final boolean wakeInputDenoised;
+    /** GTCRN-denoised audio for the cloud uplink and speech-to-text when the model is present. */
+    public final boolean denoiseSpeech;
+    /** Barge-in (full duplex) while the car array's echo canceller is measurably healthy. */
+    public final boolean fullDuplex;
+    public final double smartTurnThreshold;
+    public final int endOfSpeechMaxMs;
+    public final double echoRejectLikeness;
     /**
      * Wake-word enrollment ({@code personalWake.voices}, written only by the daemon from the app's
      * result): one entry per trained person. The engine sees their union: every voice's keyword
@@ -115,6 +126,22 @@ public final class VoiceAssistantConfig {
     /** Per voice. */
     public static final int PERSONAL_WAKE_MAX_LINES = 6;
     public static final int PERSONAL_WAKE_MAX_LINE_CHARS = 160;
+    /*
+     * Hidden tuning knobs (POST /api/voice/config only, not in the UI); docs/VOICE_ASSISTANT.md.
+     * Defaults are starting points for the EVAL harness and the car.
+     */
+    /** Smart Turn end-of-turn probability that ends a cloud turn at a candidate silence. */
+    public static final double SMART_TURN_THRESHOLD_MIN = 0.30;
+    public static final double SMART_TURN_THRESHOLD_MAX = 0.90;
+    public static final double SMART_TURN_THRESHOLD_DEFAULT = 0.50;
+    /** Silence after which a cloud turn's end of speech is sent whatever Smart Turn said. */
+    public static final int END_OF_SPEECH_MAX_MS_MIN = 800;
+    public static final int END_OF_SPEECH_MAX_MS_MAX = 2500;
+    public static final int END_OF_SPEECH_MAX_MS_DEFAULT = 1300;
+    /** Echo-likeness of a trigger window (under media) at or above which it is rejected unchecked. */
+    public static final double ECHO_REJECT_MIN = 0.50;
+    public static final double ECHO_REJECT_MAX = 1.00;
+
     public static final double PERSONAL_WAKE_CUTOFF_MIN = 0.20;
     public static final double PERSONAL_WAKE_CUTOFF_MAX = 0.45;
 
@@ -128,7 +155,10 @@ public final class VoiceAssistantConfig {
                                  long personalWakeTrainedAt, String enrollRequestId,
                                  long enrollRequestedAt, boolean enrollRequestMusic,
                                  java.util.List<PersonalVoice> personalVoices, String enrollRequestVoice,
-                                 String enrollRequestName) {
+                                 String enrollRequestName, double personalMediaCutoff,
+                                 boolean wakeInputDenoised, boolean denoiseSpeech, boolean fullDuplex,
+                                 double smartTurnThreshold, int endOfSpeechMaxMs,
+                                 double echoRejectLikeness) {
         this.enabled = enabled;
         this.mode = mode;
         this.sensitivity = sensitivity;
@@ -152,6 +182,13 @@ public final class VoiceAssistantConfig {
         this.personalVoices = personalVoices;
         this.enrollRequestVoice = enrollRequestVoice;
         this.enrollRequestName = enrollRequestName;
+        this.personalMediaCutoff = personalMediaCutoff;
+        this.wakeInputDenoised = wakeInputDenoised;
+        this.denoiseSpeech = denoiseSpeech;
+        this.fullDuplex = fullDuplex;
+        this.smartTurnThreshold = smartTurnThreshold;
+        this.endOfSpeechMaxMs = endOfSpeechMaxMs;
+        this.echoRejectLikeness = echoRejectLikeness;
     }
 
     /** Cheapest possible enabled check for the poll tick: no allocation beyond the lookup. */
@@ -198,7 +235,17 @@ public final class VoiceAssistantConfig {
                 voices,
                 request != null && isVoiceId(request.optString("voice", ""))
                         ? request.optString("voice", "") : MAIN_VOICE,
-                request == null ? "" : voiceName(request.optString("name", "")));
+                request == null ? "" : voiceName(request.optString("name", "")),
+                mediaCutoff,
+                section.optBoolean("wakeInputDenoised", false),
+                section.optBoolean("denoiseSpeech", true),
+                section.optBoolean("fullDuplex", true),
+                clampDouble(section.optDouble("smartTurnThreshold", SMART_TURN_THRESHOLD_DEFAULT),
+                        SMART_TURN_THRESHOLD_MIN, SMART_TURN_THRESHOLD_MAX, SMART_TURN_THRESHOLD_DEFAULT),
+                clamp(section.optInt("endOfSpeechMaxMs", END_OF_SPEECH_MAX_MS_DEFAULT),
+                        END_OF_SPEECH_MAX_MS_MIN, END_OF_SPEECH_MAX_MS_MAX),
+                clampDouble(section.optDouble("echoRejectLikeness", MediaWakeGate.ECHO_REJECT_DEFAULT),
+                        ECHO_REJECT_MIN, ECHO_REJECT_MAX, MediaWakeGate.ECHO_REJECT_DEFAULT));
     }
 
     /** One trained person: their lines, cutoffs and when they trained. */
@@ -390,6 +437,12 @@ public final class VoiceAssistantConfig {
             json.put("resumeMediaAfterListening", resumeMediaAfterListening);
             json.put("shareLocationWithAi", shareLocationWithAi);
             json.put("wakeCutoffUnderMedia", wakeCutoffUnderMedia);
+            json.put("wakeInputDenoised", wakeInputDenoised);
+            json.put("denoiseSpeech", denoiseSpeech);
+            json.put("fullDuplex", fullDuplex);
+            json.put("smartTurnThreshold", smartTurnThreshold);
+            json.put("endOfSpeechMaxMs", endOfSpeechMaxMs);
+            json.put("echoRejectLikeness", echoRejectLikeness);
             JSONObject personal = new JSONObject()
                     .put("trained", !personalVoices.isEmpty())
                     .put("lines", personalWakeLines.size())
@@ -495,6 +548,21 @@ public final class VoiceAssistantConfig {
                 }
                 out.put("wakeCutoffUnderMedia", normalizeWakeCutoffUnderMedia(cutoff));
             }
+            for (String key : new String[] {"wakeInputDenoised", "denoiseSpeech", "fullDuplex"}) {
+                if (patch.has(key)) out.put(key, requireBoolean(patch, key));
+            }
+            if (patch.has("smartTurnThreshold")) {
+                out.put("smartTurnThreshold", requireRange(patch, "smartTurnThreshold",
+                        SMART_TURN_THRESHOLD_MIN, SMART_TURN_THRESHOLD_MAX));
+            }
+            if (patch.has("endOfSpeechMaxMs")) {
+                out.put("endOfSpeechMaxMs", (int) Math.round(requireRange(patch, "endOfSpeechMaxMs",
+                        END_OF_SPEECH_MAX_MS_MIN, END_OF_SPEECH_MAX_MS_MAX)));
+            }
+            if (patch.has("echoRejectLikeness")) {
+                out.put("echoRejectLikeness", requireRange(patch, "echoRejectLikeness",
+                        ECHO_REJECT_MIN, ECHO_REJECT_MAX));
+            }
         } catch (IllegalArgumentException e) {
             throw e;
         } catch (Exception e) {
@@ -565,6 +633,20 @@ public final class VoiceAssistantConfig {
         Object v = patch.get(key);
         if (!(v instanceof Boolean)) throw new IllegalArgumentException(key + " must be true or false");
         return (Boolean) v;
+    }
+
+    private static double requireRange(JSONObject patch, String key, double min, double max) throws Exception {
+        Object v = patch.get(key);
+        double d = v instanceof Number ? ((Number) v).doubleValue() : Double.NaN;
+        if (!(d >= min - 1e-9 && d <= max + 1e-9)) {
+            throw new IllegalArgumentException(key + " must be a number from " + min + " to " + max);
+        }
+        return Math.round(d * 100.0) / 100.0;
+    }
+
+    private static double clampDouble(double v, double min, double max, double fallback) {
+        if (Double.isNaN(v) || Double.isInfinite(v)) return fallback;
+        return Math.max(min, Math.min(max, v));
     }
 
     private static boolean isMode(String mode) {

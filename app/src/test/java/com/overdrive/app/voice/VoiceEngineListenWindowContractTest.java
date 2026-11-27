@@ -80,7 +80,8 @@ public class VoiceEngineListenWindowContractTest {
         assertTrue(cue > fallback);
         // Only the WAKE cue moves; success/failure cues keep the configured channel.
         assertEquals(1, count(src, "cueFallback != null ? cueFallback : channel()"));
-        assertEquals(2, count(src, "earcons.play(Earcons.SUCCESS, channel())")
+        // (the third SUCCESS cue confirms a cloud turn answered by a tool call alone)
+        assertEquals(3, count(src, "earcons.play(Earcons.SUCCESS, channel())")
                 + count(src, "earcons.play(cue, channel())"));
         String note = block(src, "    private void noteTurn(String outcome) {");
         assertTrue(note.contains("if (cueFallback != null) t.put(\"cueFallback\", cueFallback);"));
@@ -99,13 +100,18 @@ public class VoiceEngineListenWindowContractTest {
     @Test
     public void wakeCheckAnchorsTheListenWindowAfterTheReplayWithoutTouchingTheFrozenParts()
             throws Exception {
-        String body = block(readProjectFile(ENGINE), "    private void checkWake() {");
+        String src = readProjectFile(ENGINE);
+        String body = block(src, "    private void onWakeVerdict(WakeCheck c) {");
         assertTrue(body.contains("cueStartSample = turnSamples + cueBacklogSamples;"));
         assertTrue(body.contains("listenFromSample = cueStartSample +"));
-        int replay = body.indexOf("onTurnAudio(verifyBuf, off, len, now, off >= speechFrom);");
+        int replay = body.indexOf("replayHistory(base + start, base + speechFrom, gain);");
         int anchor = body.indexOf("cueStartSample = turnSamples + cueBacklogSamples;");
         assertTrue(replay >= 0 && replay < anchor);
-        assertEquals(2, count(body, "englishSpeech()"));
+        assertTrue(block(src, "    private void replayHistory(long from, long speechFromPos, float gain) {")
+                .contains("onTurnAudio(chunk, 0, len, now, pos >= speechFromPos);"));
+        String check = block(src, "    private void checkWake() {");
+        assertEquals(2, count(check, "englishSpeech()"));
+        assertFalse(check.contains("vad."));
         assertFalse(body.contains("vad."));
     }
 

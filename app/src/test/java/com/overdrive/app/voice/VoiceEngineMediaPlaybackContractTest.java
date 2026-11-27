@@ -102,8 +102,8 @@ public class VoiceEngineMediaPlaybackContractTest {
         String onAudio = block(src, "    private void onAudio(short[] chunk, int n, long now) {");
         assertTrue(onAudio.contains("boolean mediaHold = turnSamples < mediaHoldUntilSample;"));
         assertTrue(onAudio.contains("onTurnAudio(gained, 0, n, now, !mediaHold);"));
-        assertTrue(block(src, "    private void checkWake() {")
-                .contains("onTurnAudio(verifyBuf, off, len, now, off >= speechFrom);"));
+        assertTrue(block(src, "    private void replayHistory(long from, long speechFromPos, float gain) {")
+                .contains("onTurnAudio(chunk, 0, len, now, pos >= speechFromPos);"));
         assertTrue(src.contains("tickMediaHold(now);"));
     }
 
@@ -156,17 +156,31 @@ public class VoiceEngineMediaPlaybackContractTest {
 
     @Test
     public void wakeCheckGatesTheSttFallbackOnMediaWithoutTouchingTheFrozenParts() throws Exception {
-        String body = block(readProjectFile(ENGINE), "    private void checkWake() {");
+        String src = readProjectFile(ENGINE);
+        String body = block(src, "    private void checkWake() {");
         assertTrue(body.contains("boolean media = mediaActive;"));
+        // Echo health is measured, never assumed from the mic source.
+        assertTrue(body.contains("boolean healthy = echoHealthy();"));
+        assertFalse(src.contains("echoFree()"));
         assertTrue(body.contains("boolean weak = triggerPeak < wake.modelCutoff();"));
-        assertTrue(body.contains("boolean guarded = (media && !echoFree) || weak;"));
-        assertTrue(body.contains("boolean sttOnly = MediaWakeGate.sttOnly(guarded, verifyMsUsed > VERIFY_BUDGET_MS)"));
-        assertTrue(body.contains("if (!heard && n > 0 && MediaWakeGate.sttFallbackAllowed(guarded)) {"));
-        int reject = body.indexOf("rejectedWakes.incrementAndGet();");
-        int hold = body.indexOf("long hold = MediaWakeGate.refractoryAfterRejectMs(guarded);");
-        int apply = body.indexOf("if (hold > 0) refractoryUntil = SystemClock.elapsedRealtime() + hold;");
+        assertTrue(body.contains("boolean guarded = (media && !healthy) || weak;"));
+        // Under media speech-to-text never runs on a trigger, whatever the echo canceller does.
+        assertTrue(body.contains("boolean noStt = media || weak;"));
+        assertTrue(body.contains("c.sttOnly = MediaWakeGate.sttOnly(noStt, verifyMsUsed > VERIFY_BUDGET_MS)"));
+        assertTrue(body.contains("c.sttAllowed = MediaWakeGate.sttFallbackAllowed(noStt) && englishSpeech();"));
+        // A trigger the speaker references explain is rejected before any verifier runs.
+        int echo = body.indexOf("MediaWakeGate.rejectAsEcho(media, c.echo, config.echoRejectLikeness)");
+        int submit = body.indexOf("worker.submit(StageWorker.KIND_WAKE");
+        assertTrue(echo >= 0 && submit > echo);
+        assertTrue(block(src, "    private static void verifyOnWorker(WakeCheck c) {")
+                .contains("if (!heard && n > 0 && c.sttAllowed && c.stt != null) {"));
+        String verdict = block(src, "    private void onWakeVerdict(WakeCheck c) {");
+        int reject = verdict.indexOf("rejectedWakes.incrementAndGet();");
+        int hold = verdict.indexOf("long hold = MediaWakeGate.refractoryAfterRejectMs(c.guarded, c.healthy);");
+        int apply = verdict.indexOf("if (hold > 0) refractoryUntil = SystemClock.elapsedRealtime() + hold;");
         assertTrue(reject >= 0 && hold > reject && apply > hold);
-        assertTrue(body.contains("CommandTranscriber.logSafe(text, 40), media);"));
+        assertTrue(verdict.contains("if (!running || c.turnAt != turn || phase != ARMED || wake == null) return;"));
+        assertTrue(verdict.contains("CommandTranscriber.logSafe(c.text, 40), c.media,"));
         assertEquals(2, count(body, "englishSpeech()"));
         assertFalse(body.contains("vad."));
         assertFalse(body.contains("isMusicActive()"));

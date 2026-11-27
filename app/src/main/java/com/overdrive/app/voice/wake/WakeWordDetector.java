@@ -17,8 +17,7 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 
 /**
- * Streaming microWakeWord detector: {@link MicroFrontend} features feed the wake model and, when
- * {@code vad.tflite} + {@code vad.json} sit next to it, a VAD model that must agree. Feed 16 kHz
+ * Streaming microWakeWord detector: {@link MicroFrontend} features feed the wake model. Feed 16 kHz
  * mono PCM from one thread; the setters and getters may be called from any thread.
  */
 public final class WakeWordDetector implements AutoCloseable {
@@ -26,7 +25,6 @@ public final class WakeWordDetector implements AutoCloseable {
     public static final String DEFAULT_ASSET_BASE = "voice/wake/overdrive";
 
     private static final String TAG = "VoiceWake";
-    private static final String VAD_NAME = "vad";
     private static final int REFRACTORY_MS = 1500;
     private static final int SECOND_CHANCE_MS = 3000;
     private static final float LOW_DELTA = 0.02f;
@@ -44,9 +42,6 @@ public final class WakeWordDetector implements AutoCloseable {
     private final float manifestCutoff;
     private final MicroFrontend frontend;
     private final Feed wake;
-    private final Feed vad;
-    private final WakeDecider.Window vadWindow;
-    private final int vadCutoffU8;
     private final WakeDecider decider;
     private final Object cutoffLock = new Object();
 
@@ -62,15 +57,11 @@ public final class WakeWordDetector implements AutoCloseable {
     private boolean closed;
 
     WakeWordDetector(String wakeWord, float manifestCutoff, int windowSize, int stepMs,
-                     StreamingModel wakeModel, StreamingModel vadModel, float vadCutoff,
-                     int vadWindowSize) {
+                     StreamingModel wakeModel) {
         this.wakeWord = wakeWord;
         this.manifestCutoff = manifestCutoff;
         frontend = new MicroFrontend(stepMs);
         wake = new Feed(wakeModel);
-        vad = vadModel == null ? null : new Feed(vadModel);
-        vadWindow = vadModel == null ? null : new WakeDecider.Window(vadWindowSize);
-        vadCutoffU8 = (int) (vadCutoff * 255.0);
         cutoff = manifestCutoff;
         decider = new WakeDecider(windowSize, Math.round(REFRACTORY_MS / (float) stepMs),
                 Math.round(SECOND_CHANCE_MS / (float) stepMs), manifestCutoff);
@@ -97,39 +88,24 @@ public final class WakeWordDetector implements AutoCloseable {
         }
     }
 
-    /** Loads {@code <base>.tflite} + {@code <base>.json}, plus the sibling VAD pair when present. */
+    /** Loads {@code <base>.tflite} + {@code <base>.json}. */
     public static WakeWordDetector load(Context ctx, String assetBase) throws IOException {
         AssetManager assets = ctx.getAssets();
         Manifest wakeManifest = Manifest.read(assets, assetBase);
-        String vadBase = assetBase.substring(0, assetBase.lastIndexOf('/') + 1) + VAD_NAME;
-        Manifest vadManifest = !vadBase.equals(assetBase) && isModelPresent(ctx, vadBase)
-                ? Manifest.read(assets, vadBase) : null;
-        if (vadManifest != null && vadManifest.stepMs != wakeManifest.stepMs) {
-            throw new IOException("VAD feature step " + vadManifest.stepMs + " ms differs from "
-                    + wakeManifest.stepMs + " ms");
-        }
         try {
             System.loadLibrary("tensorflowlite_jni");
         } catch (Throwable ignored) {
         }
         StreamingModel wakeModel = null;
-        StreamingModel vadModel = null;
         try {
             wakeModel = TfliteStreamingModel.open(readModel(assets, assetBase + ".tflite"));
-            if (vadManifest != null) {
-                vadModel = TfliteStreamingModel.open(readModel(assets, vadBase + ".tflite"));
-            }
             WakeWordDetector detector = new WakeWordDetector(wakeManifest.wakeWord,
-                    wakeManifest.cutoff, wakeManifest.windowSize, wakeManifest.stepMs, wakeModel,
-                    vadModel, vadManifest == null ? 0f : vadManifest.cutoff,
-                    vadManifest == null ? 1 : vadManifest.windowSize);
+                    wakeManifest.cutoff, wakeManifest.windowSize, wakeManifest.stepMs, wakeModel);
             Log.i(TAG, "Wake model '" + wakeManifest.wakeWord + "' stride " + wakeModel.stride()
-                    + " cutoff " + wakeManifest.cutoff + " window " + wakeManifest.windowSize
-                    + (vadModel != null ? " with VAD gate" : ""));
+                    + " cutoff " + wakeManifest.cutoff + " window " + wakeManifest.windowSize);
             return detector;
         } catch (Throwable t) {
             if (wakeModel != null) wakeModel.close();
-            if (vadModel != null) vadModel.close();
             throw t;
         }
     }
@@ -273,10 +249,6 @@ public final class WakeWordDetector implements AutoCloseable {
             try {
                 frontend.reset();
                 wake.reset();
-                if (vad != null) {
-                    vad.reset();
-                    vadWindow.clear();
-                }
                 decider.reset();
             } catch (RuntimeException e) {
                 release();
@@ -296,9 +268,7 @@ public final class WakeWordDetector implements AutoCloseable {
 
     private boolean onSlice(int[] features) {
         boolean fresh = wake.push(features);
-        if (vad != null && vad.push(features)) vadWindow.add(vad.last);
-        boolean vadOpen = vad == null || vadWindow.above(vadCutoffU8);
-        if (!decider.onSlice(fresh, wake.last, vadOpen)) return false;
+        if (!decider.onSlice(fresh, wake.last, true)) return false;
         if (!decider.candidateMode()) wake.reset();
         return true;
     }
@@ -328,7 +298,6 @@ public final class WakeWordDetector implements AutoCloseable {
     private void release() {
         closed = true;
         wake.model.close();
-        if (vad != null) vad.model.close();
     }
 
     private static ByteBuffer readModel(AssetManager assets, String path) throws IOException {

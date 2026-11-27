@@ -363,7 +363,7 @@ public final class VoiceAssistantRuntime {
                     body.put("counters", snap.optJSONObject("counters"));
                     if (snap.has("lastWakeAt")) body.put("lastWakeAt", snap.optLong("lastWakeAt"));
                     for (String key : new String[] {"lastVerify", "lastTurn", "mic", "checks", "turns",
-                            "checksDropped", "nearMisses", "stage1", "enroll"}) {
+                            "checksDropped", "nearMisses", "stage1", "enroll", "engine", "echo"}) {
                         Object value = snap.opt(key);
                         if (value != null) body.put(key, value);
                     }
