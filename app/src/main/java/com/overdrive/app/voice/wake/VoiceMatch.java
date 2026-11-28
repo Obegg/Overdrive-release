@@ -21,6 +21,8 @@ public final class VoiceMatch {
     public static final int DECIMATE = 2;
     /** Frame distance: cosine (spectral shape; Euclidean lost half the recall at the same false wakes). */
     public static final boolean COSINE = true;
+    /** Each matching frame's mean over the 40 channels removed first (fewer negatives near a voice's takes). */
+    public static final boolean FRAME_MEAN = true;
     /** DTW step: a template frame moves 0, 1 .. MAX_STEP test frames (never two 0s in a row). */
     public static final int MAX_STEP = 2;
     /** Gate: the trigger's stage-1 peak in reference units (0.45 = the model's cutoff) and the speech level. */
@@ -28,8 +30,8 @@ public final class VoiceMatch {
     public static final float MIN_LEVEL_DBFS = -55f;
     /** Threshold: the worst leave-one-out take x (1 + MARGIN), in [FLOOR, CAP], under AMBIENT x the cabin's best. */
     public static final float MARGIN = 0.25f;
-    public static final float FLOOR = 0.16f;
-    public static final float CAP = 0.19f;
+    public static final float FLOOR = 0.35f;
+    public static final float CAP = 0.45f;
     public static final float AMBIENT = 0.80f;
     /** Template: frames above the take's floor + TRIM_REL x its range, padded by TRIM_PAD. */
     public static final float TRIM_REL = 0.20f;
@@ -160,9 +162,15 @@ public final class VoiceMatch {
                 int src = (from + f * DECIMATE + k) * CHANNELS;
                 for (int c = 0; c < CHANNELS; c++) out[f * CHANNELS + c] += (frames[src + c] & 0xFFFF);
             }
+            float mean = 0f;
+            for (int c = 0; c < CHANNELS; c++) {
+                out[f * CHANNELS + c] /= 256f * DECIMATE;
+                mean += out[f * CHANNELS + c];
+            }
+            mean = FRAME_MEAN ? mean / CHANNELS : 0f;
             float norm = 0f;
             for (int c = 0; c < CHANNELS; c++) {
-                float x = out[f * CHANNELS + c] / (256f * DECIMATE);
+                float x = out[f * CHANNELS + c] - mean;
                 out[f * CHANNELS + c] = x;
                 norm += x * x;
             }
