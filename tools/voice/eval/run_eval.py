@@ -52,7 +52,7 @@ def voice_key(m):
 
 def enroll_task(task):
     """One voice's enrollment (gen_enroll.py takes) in a quiet parked car, through every front-end: the takes'
-    stage-1 frames as the engine keeps them (lead, word, 0.3 s tail; onset = where speech began)."""
+    stage-1 frames as the engine keeps them (lead, word, 0.3 s tail)."""
     import zlib
     import microfrontend as mf
     import voicematch as vm
@@ -76,7 +76,7 @@ def enroll_task(task):
     for fe in G['fes']:
         f = mf.MicroFrontend().process(fe.run(x4)[0])
         fr = lambda s: max(0, (s - 480) // 160)  # noqa: E731
-        tk = [vm.Take(P, f[fr(a - lead):fr(b + int(0.3 * RATE)) + 1], lead // 160) for a, b, lead in layout]
+        tk = [vm.Take(P, f[fr(a - lead):fr(b + int(0.3 * RATE)) + 1]) for a, b, lead in layout]
         out[fe.name] = vm.enrolled(P, key, tk)
     return key, out
 
@@ -468,7 +468,7 @@ def main():
             print(f'[{i + 1}/{len(tasks)}] {r["scene"]} {r.get("cond", "")} #{r["block"]} '
                   f'{r["seconds"]:.0f}s audio in {r["wall_s"]:.0f}s', flush=True)
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
-    vm_meta = {fe: {k: [round(v.threshold, 4), round(v.loo, 4), round(v.ambient, 4)] if v else None
+    vm_meta = {fe: {k: [round(v.threshold, 4), round(v.loo, 4)] if v else None
                     for k, v in sorted(d.items())} for fe, d in (voices or {}).items()}
     order = {fe: [k for k, v in d.items() if v] for fe, d in (voices or {}).items()}  # trigger_tma's columns
     meta = {'args': vars(a), 'smart_turn': smart, 'wall_s': time.time() - t0, 'voices': vm_meta, 'voice_order': order,

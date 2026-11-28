@@ -1,5 +1,5 @@
 """Voice-match threshold policies replayed over a run_eval --voice-match result: each voice's threshold is re-derived
-from its recorded leave-one-out and cabin distances; a positive also counts as woken when the run without voice
+from its recorded worst leave-one-out distance; a positive also counts as woken when the run without voice
 match woke it (--before, same seeds). Distances above 2x a voice's run threshold were not measured. False wakes:
 with every voice loaded, then each voice enrolled alone (mean and worst over voices).
 python3 -I sweep_voicematch.py run.json --before final_after.json [--fe speex] [--margins 0.25,0.5] [--floors ..] [--caps ..]
@@ -16,11 +16,8 @@ from run_eval import voice_key  # noqa: E402
 GROUPS = ('accented', 'say', 'en_IN')
 
 
-def threshold(loo, amb, margin, floor, cap, ambient):
-    t = max(floor, min(cap, loo * (1 + margin)))
-    if amb == amb and amb < 1e8:
-        t = min(t, ambient * amb)
-    return t if t >= floor - 1e-6 else None
+def threshold(loo, margin, floor, cap):
+    return max(floor, min(cap, loo * (1 + margin)))
 
 
 def main():
@@ -31,7 +28,6 @@ def main():
     ap.add_argument('--margins', default='0.25,0.5,0.75')
     ap.add_argument('--floors', default='0.25,0.3,0.35')
     ap.add_argument('--caps', default='0.35,0.42,0.5')
-    ap.add_argument('--ambient', type=float, default=0.8)
     a = ap.parse_args()
     R = json.load(open(a.run))
     B = json.load(open(a.before))
@@ -59,7 +55,7 @@ def main():
             for cap in map(float, a.caps.split(',')):
                 if cap < fl:
                     continue
-                thr = {k: (threshold(v[1], v[2], m, fl, cap, a.ambient) if v else None) for k, v in voices.items()}
+                thr = {k: (threshold(v[1], m, fl, cap) if v else None) for k, v in voices.items()}
                 rec = collections.defaultdict(lambda: [0, 0])
                 for b in R['blocks']:
                     if b['scene'] != 'positives':
