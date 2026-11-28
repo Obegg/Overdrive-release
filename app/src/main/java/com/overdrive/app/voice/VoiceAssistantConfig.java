@@ -134,7 +134,7 @@ public final class VoiceAssistantConfig {
     /** Per voice. */
     public static final int PERSONAL_WAKE_MAX_LINES = 6;
     /** Voice-match templates kept per voice: a normal and a with-music training of 4 takes each. */
-    public static final int VOICE_MATCH_MAX_TAKES = 8;
+    public static final int VOICE_MATCH_MAX_TAKES = com.overdrive.app.voice.wake.VoiceMatch.MAX_TAKES;
     public static final int PERSONAL_WAKE_MAX_LINE_CHARS = 160;
     /*
      * Hidden tuning knobs (POST /api/voice/config only, not in the UI); docs/VOICE_ASSISTANT.md.
