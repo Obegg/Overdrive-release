@@ -283,9 +283,13 @@ const NetworkPage = {
     },
 
     saveLimit() {
-        const raw = ((document.getElementById('hsCap') || {}).value || '').trim();
-        const mb = raw === '' ? 0 : parseInt(raw, 10);
-        if (isNaN(mb) || mb < 0) {
+        const input = document.getElementById('hsCap');
+        if (!input) return;
+        const raw = input.value.trim();
+        const mb = raw === '' ? 0 : Number(raw);
+        if ((input.validity && input.validity.badInput)
+                || (raw !== '' && !/^[0-9]+$/.test(raw))
+                || !Number.isSafeInteger(mb) || mb < 0) {
             BYD.core.toast(this.t('network.limit_invalid', 'Enter a whole number of megabytes.'), 'error');
             return;
         }

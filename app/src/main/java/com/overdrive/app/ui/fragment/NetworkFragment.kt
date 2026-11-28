@@ -235,8 +235,8 @@ class NetworkFragment : Fragment() {
 
     private fun saveLimit(root: View) {
         val raw = root.findViewById<TextInputEditText>(R.id.etDataCap)?.text?.toString()?.trim() ?: ""
-        val mb = raw.toLongOrNull() ?: 0L
-        if (mb < 0L) {
+        val mb = parseHotspotDataLimit(raw)
+        if (mb == null) {
             toast(getString(R.string.network_limit_invalid))
             return
         }
