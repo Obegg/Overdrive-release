@@ -88,17 +88,10 @@ public class TariffProfileTest {
     }
 
     @Test
-    public void usageCountAdvancesWithoutMovingLastUsedBackwards() {
+    public void newProfileStartsWithNoUsage() {
         TariffProfile profile = new TariffProfile("Office", 47, 8, 50, 0.25, 0, "CHF");
         assertEquals(0, profile.getUseCount());
         assertEquals(0L, profile.getLastUsedAt());
-        profile.markUsed(2000L);
-        profile.markUsed(1000L);
-        assertEquals(2, profile.getUseCount());
-        assertEquals(2000L, profile.getLastUsedAt());
-        profile.markUsed(3000L);
-        assertEquals(3, profile.getUseCount());
-        assertEquals(3000L, profile.getLastUsedAt());
     }
 
     @Test
@@ -106,8 +99,9 @@ public class TariffProfileTest {
         TariffProfile original = new TariffProfile("Office", 47.25, -8.5, 125,
                 0.25, 0.60, "CHF ");
         original.setEnabled(false);
-        original.markUsed(1000L);
-        original.markUsed(2000L);
+        original = new TariffProfile(original.toJson()
+                .put("lastUsedAt", 2000L)
+                .put("useCount", 2));
         TariffProfile restored = new TariffProfile(new JSONObject(original.toJson().toString()));
         assertEquals(original.getId(), restored.getId());
         assertEquals(original.getLabel(), restored.getLabel());

@@ -57,9 +57,9 @@ public class TariffProfile {
     private boolean enabled;
     private long createdAt;
     /** Last time this profile priced a session — drives the "recently used" ordering. */
-    private long lastUsedAt;
+    private final long lastUsedAt;
     /** How many sessions this profile has priced. Shown as provenance in the UI. */
-    private int useCount;
+    private final int useCount;
 
     public TariffProfile(String label, double lat, double lng, int radiusMeters,
                          double acRate, double dcRate, String currency) {
@@ -130,12 +130,6 @@ public class TariffProfile {
     /** True when this profile can price at least one kind of session. */
     public boolean hasAnyRate() {
         return acRate > 0 || dcRate > 0;
-    }
-
-    /** Record that this profile priced a session (drives ordering + provenance). */
-    public void markUsed(long whenMs) {
-        if (whenMs > this.lastUsedAt) this.lastUsedAt = whenMs;
-        this.useCount++;
     }
 
     // ==================== CLAMPS ====================

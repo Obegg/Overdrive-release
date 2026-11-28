@@ -278,10 +278,6 @@ public class TariffManager {
      * Apply one operation-specific tariff patch to a fresh durable root while holding the same
      * cross-process lock for read, mutation and save. The process-local list is never a write base.
      */
-    private synchronized MutationCommit commitMutation(LockedTariffMutation mutation) {
-        return commitMutation(null, mutation);
-    }
-
     private synchronized MutationCommit commitMutation(
             String repriceKey,
             LockedTariffMutation mutation) {
@@ -299,9 +295,7 @@ public class TariffManager {
 
                     document.section.put(KEY_TARIFFS, document.tariffs);
                     normalizeDefaultId(document);
-                    if (repriceKey != null) {
-                        queuePendingReprice(document.section, repriceKey);
-                    }
+                    queuePendingReprice(document.section, repriceKey);
                     document.root.put(SECTION, document.section);
                     if (!UnifiedConfigManager.saveConfig(document.root)) {
                         return MutationCommit.rejected(
@@ -774,11 +768,6 @@ public class TariffManager {
                 ? null : new RepriceIntent(key, token);
     }
 
-    public synchronized boolean completePendingReprice(String tariffId) {
-        RepriceIntent intent = pendingRepriceIntent(tariffId);
-        return intent == null || completePendingReprice(intent);
-    }
-
     synchronized boolean completePendingReprice(RepriceIntent intent) {
         if (intent == null) return false;
         try {
@@ -932,11 +921,11 @@ public class TariffManager {
                     // A historical row may reference a profile the user later deleted.
                     // The fresh durable snapshot is already the committed result.
                     if (target == null) {
-                        return usageSnapshot(section, false);
+                        return usageSnapshot(section);
                     }
                     if (target.optInt("useCount", 0) == normalizedCount
                             && target.optLong("lastUsedAt", 0L) == normalizedLastUsed) {
-                        return usageSnapshot(section, false);
+                        return usageSnapshot(section);
                     }
 
                     // Patch the profile and publish a canonical tariffs array. Legacy
@@ -949,7 +938,7 @@ public class TariffManager {
                         return UsageReconcileResult.failure(
                                 "config persistence rejected usage replay");
                     }
-                    return usageSnapshot(section, true);
+                    return usageSnapshot(section);
                 } catch (Exception e) {
                     return UsageReconcileResult.failure(
                             e.getMessage() != null
@@ -980,98 +969,42 @@ public class TariffManager {
 
     /** Build an immutable manager image detached from the root passed to saveConfig(). */
     private static UsageReconcileResult usageSnapshot(
-            JSONObject section, boolean persisted) {
+            JSONObject section) {
         String requestedDefault = section != null ? section.optString(KEY_DEFAULT_ID, "") : "";
         List<TariffProfile> parsed = parseProfiles(section);
         String publishedDefault = resolvePublishedDefault(parsed, requestedDefault);
         return UsageReconcileResult.success(
-                Collections.unmodifiableList(parsed), publishedDefault, persisted);
+                Collections.unmodifiableList(parsed), publishedDefault);
     }
 
     private static final class UsageReconcileResult {
         final boolean success;
         final List<TariffProfile> profiles;
         final String defaultTariffId;
-        final boolean persisted;
         final String failure;
 
         private UsageReconcileResult(
                 boolean success,
                 List<TariffProfile> profiles,
                 String defaultTariffId,
-                boolean persisted,
                 String failure) {
             this.success = success;
             this.profiles = profiles;
             this.defaultTariffId = defaultTariffId;
-            this.persisted = persisted;
             this.failure = failure;
         }
 
         static UsageReconcileResult success(
                 List<TariffProfile> profiles,
-                String defaultTariffId,
-                boolean persisted) {
+                String defaultTariffId) {
             return new UsageReconcileResult(
-                    true, profiles, defaultTariffId, persisted, "");
+                    true, profiles, defaultTariffId, "");
         }
 
         static UsageReconcileResult failure(String failure) {
             return new UsageReconcileResult(
-                    false, Collections.emptyList(), "", false, failure);
+                    false, Collections.emptyList(), "", failure);
         }
-    }
-
-    /**
-     * Note that a tariff priced a session.
-     *
-     * <p>Current close paths replay authoritative aggregate counts through
-     * {@link #reconcileUsage}. This compatibility entry point still performs an
-     * increment, but patches only the current durable profile under the config
-     * lock; it never serializes the process-local tariff array.
-     */
-    public synchronized void markUsed(String id, long whenMs) {
-        if (id == null || id.isEmpty()) return;
-        commitMutation(document -> {
-            int idx = findProfileIndex(document.tariffs, id);
-            if (idx < 0) return StagedMutation.rejected("tariff not found");
-            JSONObject durable = document.tariffs.getJSONObject(idx);
-            TariffProfile profile = new TariffProfile(durable);
-            profile.markUsed(whenMs);
-            document.tariffs.put(
-                    idx, mergeCanonicalProfile(durable, profile));
-            return StagedMutation.accepted(profile);
-        });
-    }
-
-    /**
-     * Compatibility no-op. Usage metadata is now persisted either immediately by
-     * {@link #markUsed} or idempotently from database aggregates by
-     * {@link #reconcileUsage}; there is no process-local full-array buffer to flush.
-     */
-    public synchronized void flushPendingUsage() {
-        // Intentionally empty.
-    }
-
-    /**
-     * Profiles ordered for display: most-recently-used first, then most-used,
-     * then newest. Keeps the tariff the driver actually uses at the top of the
-     * list instead of whatever order they happened to create things in.
-     */
-    public List<TariffProfile> getProfilesForDisplay() {
-        List<TariffProfile> list = getProfiles();
-        Collections.sort(list, DISPLAY_ORDER);
-        return list;
-    }
-
-    /**
-     * API payload: the ordered profile list plus the default id and, when a
-     * location is known, which profile currently matches — that's what lets the
-     * UI show "auto-applies here" against the live position.
-     */
-    public synchronized JSONObject toStatusJson(double lat, double lng)
-            throws Exception {
-        return toStatusJson(loadVerifiedConfig(), lat, lng);
     }
 
     /**
