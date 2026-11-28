@@ -36,8 +36,6 @@ public final class Mp4Index {
     final Mp4Track audio;
     /** Video sample index of each GOP's sync sample; gopFirst[gopCount] = video sample count. */
     final int[] gopFirst;
-    /** GOP presentation start in microseconds; gopUs[gopCount] = video end. */
-    final long[] gopUs;
     /** Audio samples muxed with GOP n are [audioFirst[n], audioFirst[n + 1]). Null without audio. */
     final int[] audioFirst;
     final GopTable gops;
@@ -51,7 +49,6 @@ public final class Mp4Index {
         this.video = video;
         this.audio = audio;
         this.gopFirst = gopFirst;
-        this.gopUs = gopUs;
         this.audioFirst = audioFirst;
         long[] ticks = new long[gopFirst.length];
         for (int g = 0; g < ticks.length; g++) ticks[g] = video.time[gopFirst[g]];
@@ -87,32 +84,12 @@ public final class Mp4Index {
         return lastModified;
     }
 
-    public boolean hasVideo() {
-        return video != null;
-    }
-
     public boolean hasAudio() {
         return audio != null;
     }
 
     public int gopCount() {
         return gopFirst.length - 1;
-    }
-
-    public double gopDurationSec(int n) {
-        checkGop(n);
-        return (gopUs[n + 1] - gopUs[n]) / 1e6;
-    }
-
-    /** Presentation time of GOP n's keyframe, microseconds from media time 0. */
-    public long gopStartUs(int n) {
-        checkGop(n);
-        return gopUs[n];
-    }
-
-    /** Presentation end of the video track in microseconds. */
-    public long durationUs() {
-        return gopUs[gopUs.length - 1];
     }
 
     /** RFC 6381 codecs: video, then audio when present (e.g. "avc1.42C01F,mp4a.40.2"). */
@@ -126,10 +103,6 @@ public final class Mp4Index {
 
     public int height() {
         return video.height;
-    }
-
-    public byte[] videoStsd() {
-        return video.stsd.clone();
     }
 
     void checkGop(int n) {
@@ -699,9 +672,8 @@ public final class Mp4Index {
     /** Walks ES_Descriptor -> DecoderConfigDescriptor -> AudioSpecificConfig; null when unreadable. */
     private static String aacCodec(byte[] m, int p, int end) {
         try {
-            int[] len = new int[1];
             if (p >= end || m[p] != 0x03) return null;
-            p = descriptorBody(m, p + 1, end, len);
+            p = descriptorBody(m, p + 1, end);
             need(p, 3, end, "esds");
             int flags = u8(m, p + 2);
             p += 3;
@@ -712,13 +684,13 @@ public final class Mp4Index {
             }
             if ((flags & 0x20) != 0) p += 2;
             if (p >= end || m[p] != 0x04) return null;
-            p = descriptorBody(m, p + 1, end, len);
+            p = descriptorBody(m, p + 1, end);
             need(p, 13, end, "esds");
             int oti = u8(m, p);
             p += 13;
             if (oti != 0x40) return "mp4a." + hex2((byte) oti);
             if (p >= end || m[p] != 0x05) return "mp4a.40.2";
-            p = descriptorBody(m, p + 1, end, len);
+            p = descriptorBody(m, p + 1, end);
             need(p, 2, end, "esds");
             int aot = u8(m, p) >> 3;
             if (aot == 31) aot = 32 + (((u8(m, p) & 7) << 3) | (u8(m, p + 1) >> 5));
@@ -728,15 +700,12 @@ public final class Mp4Index {
         }
     }
 
-    private static int descriptorBody(byte[] m, int p, int end, int[] len) throws Mp4Exception {
-        int v = 0;
+    private static int descriptorBody(byte[] m, int p, int end) throws Mp4Exception {
         for (int i = 0; i < 4; i++) {
             need(p, 1, end, "esds");
             int b = u8(m, p++);
-            v = (v << 7) | (b & 0x7f);
             if ((b & 0x80) == 0) break;
         }
-        len[0] = v;
         return p;
     }
 
