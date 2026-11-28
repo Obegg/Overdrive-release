@@ -32,6 +32,8 @@ public final class CarArrayCapture {
     static final int MICS = 2;
     static final int REFS = 2;
     static final int FRAME = RATE / 100;
+    /** 10 ms frames per read and per sink delivery: 30 ms keeps the wake sink within 40 ms of the input. */
+    static final int BLOCK_FRAMES = 3;
     /**
      * Both microphones at exact digital zero this long means the car muted the input (with BYD's
      * assistant switched off its DSP gates the mics, 2026-10-14): fall back instead of hearing nothing.
@@ -46,7 +48,7 @@ public final class CarArrayCapture {
     private static volatile CarArrayCapture current;
 
     private final PcmSink sink;
-    private final float[] stats = new float[VoiceFrontend.STATS];
+    private final float[] stats = new float[VoiceFrontend.STATS * BLOCK_FRAMES];
     private final float[] ringScore = new float[RING];
     private final float[] ringWeight = new float[RING];
     /** Frames handed to the sink; frame i covers sink samples [i * FRAME, (i + 1) * FRAME). */
@@ -80,6 +82,8 @@ public final class CarArrayCapture {
     private short[] taps;
     private volatile int captureLeft;
     private byte[] rawBytes;
+    private byte[] cleanBytes;
+    private byte[] tapBytes;
 
     CarArrayCapture(PcmSink sink) {
         this.sink = sink;
@@ -234,9 +238,8 @@ public final class CarArrayCapture {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
         } catch (Throwable ignored) {
         }
-        short[] in = new short[FRAME * CHANNELS];
-        short[] mono = new short[FRAME];
-        byte[] out = new byte[FRAME * 2];
+        short[] in = new short[FRAME * CHANNELS * BLOCK_FRAMES];
+        short[] mono = new short[FRAME * BLOCK_FRAMES];
         try {
             while (running) {
                 int filled = 0;
@@ -252,38 +255,38 @@ public final class CarArrayCapture {
                     if (n < in.length - filled) shortReads++;
                     filled += n;
                 }
-                framesRead += FRAME;
+                framesRead += FRAME * BLOCK_FRAMES;
                 if (!running) return;
-                if (micsSilent(in)) {
-                    if (++silentFrames >= SILENT_FRAMES_MAX) {
-                        Log.w(TAG, "Car microphones went digitally silent; falling back");
-                        failed = true;
-                        running = false;
-                        return;
-                    }
-                } else {
-                    silentFrames = 0;
-                }
-                noteLevels(in);
-                if (!frontend.process(in, mono, stats, captureLeft > 0 ? taps : null)) {
+                short[] taps = captureLeft > 0 ? this.taps : null;
+                if (!frontend.process(in, BLOCK_FRAMES, mono, stats, taps)) {
                     failed = true;
                     running = false;
                     return;
                 }
-                noteEcho();
-                if (levelFrames == 0) {
-                    checkOverrun();
-                    maybeStartCapture();
+                for (int f = 0; f < BLOCK_FRAMES; f++) {
+                    int base = f * VoiceFrontend.STATS;
+                    // Exact digital zero on both mics (mean square 0).
+                    if (stats[base + VoiceFrontend.STAT_CH_POWER] == 0f
+                            && stats[base + VoiceFrontend.STAT_CH_POWER + 1] == 0f) {
+                        if (++silentFrames >= SILENT_FRAMES_MAX) {
+                            Log.w(TAG, "Car microphones went digitally silent; falling back");
+                            failed = true;
+                            running = false;
+                            return;
+                        }
+                    } else {
+                        silentFrames = 0;
+                    }
+                    noteLevels(base);
+                    noteEcho(framesDelivered + f, base);
+                    if (levelFrames == 0) checkOverrun();
                 }
-                if (captureLeft > 0) writeCapture(in, mono);
-                for (int i = 0; i < FRAME; i++) {
-                    out[2 * i] = (byte) mono[i];
-                    out[2 * i + 1] = (byte) (mono[i] >> 8);
-                }
+                if (taps != null) writeCapture(in, mono, taps);
+                else if (levelFrames < BLOCK_FRAMES) maybeStartCapture();
                 delivered = true;
-                framesDelivered++;
+                framesDelivered += BLOCK_FRAMES;
                 try {
-                    sink.onPcm(out, out.length, RATE);
+                    sink.onPcm16(mono, mono.length, RATE);
                 } catch (Throwable t) {
                     Log.w(TAG, "Wake sink failed: " + t.getMessage());
                 }
@@ -297,17 +300,19 @@ public final class CarArrayCapture {
         }
     }
 
-    private void noteEcho() {
-        long f = framesDelivered;
+    private void noteEcho(long f, int base) {
         int i = (int) (f % RING);
-        ringScore[i] = stats[VoiceFrontend.STAT_ECHO_SCORE];
-        ringWeight[i] = stats[VoiceFrontend.STAT_OUT_ENERGY];
+        ringScore[i] = stats[base + VoiceFrontend.STAT_ECHO_SCORE];
+        ringWeight[i] = stats[base + VoiceFrontend.STAT_OUT_ENERGY];
         if (f % 10 == 0) {
-            health = new EchoHealth(stats[VoiceFrontend.STAT_REF_ACTIVE] > 0.5f, stats[VoiceFrontend.STAT_ERLE_DB],
-                    stats[VoiceFrontend.STAT_RESIDUAL_ECHO], Math.round(stats[VoiceFrontend.STAT_DELAY_MS]),
-                    stats[VoiceFrontend.STAT_CONVERGED] > 0.5f, SystemClock.elapsedRealtime());
-            beamConfidence = stats[VoiceFrontend.STAT_BEAM_CONFIDENCE];
-            linearErleDb = stats[VoiceFrontend.STAT_LINEAR_ERLE_DB];
+            health = new EchoHealth(stats[base + VoiceFrontend.STAT_REF_ACTIVE] > 0.5f,
+                    stats[base + VoiceFrontend.STAT_ERLE_DB], stats[base + VoiceFrontend.STAT_RESIDUAL_ECHO],
+                    Math.round(stats[base + VoiceFrontend.STAT_LAST_DELAY_MS]),
+                    Math.round(stats[base + VoiceFrontend.STAT_DELAY_AGE_MS]),
+                    stats[base + VoiceFrontend.STAT_ENR_DB], stats[base + VoiceFrontend.STAT_BELOW_NOISE] > 0.5f,
+                    stats[base + VoiceFrontend.STAT_CONVERGED] > 0.5f, SystemClock.elapsedRealtime());
+            beamConfidence = stats[base + VoiceFrontend.STAT_BEAM_CONFIDENCE];
+            linearErleDb = stats[base + VoiceFrontend.STAT_LINEAR_ERLE_DB];
         }
     }
 
@@ -349,8 +354,10 @@ public final class CarArrayCapture {
             cleanOut = new FileOutputStream(new File(dir, "voice_capture.clean"));
             aecOut = new FileOutputStream(new File(dir, "voice_capture.aec2"));
             beamOut = new FileOutputStream(new File(dir, "voice_capture.beam"));
-            rawBytes = new byte[FRAME * CHANNELS * 2];
-            taps = new short[FRAME * 3];
+            rawBytes = new byte[FRAME * CHANNELS * 2 * BLOCK_FRAMES];
+            cleanBytes = new byte[FRAME * 2 * BLOCK_FRAMES];
+            tapBytes = new byte[FRAME * 2 * 2 * BLOCK_FRAMES];
+            taps = new short[FRAME * 3 * BLOCK_FRAMES];
             captureLeft = CAPTURE_FRAMES;
             Log.i(TAG, "Field capture started (45 s)");
         } catch (IOException e) {
@@ -358,31 +365,33 @@ public final class CarArrayCapture {
         }
     }
 
-    private void writeCapture(short[] in, short[] mono) {
+    private void writeCapture(short[] in, short[] mono, short[] taps) {
         try {
-            for (int i = 0; i < in.length; i++) {
-                rawBytes[2 * i] = (byte) in[i];
-                rawBytes[2 * i + 1] = (byte) (in[i] >> 8);
-            }
+            toBytes(in, 0, in.length, rawBytes, 0);
             rawOut.write(rawBytes);
-            byte[] clean = new byte[FRAME * 2];
-            for (int i = 0; i < FRAME; i++) {
-                clean[2 * i] = (byte) mono[i];
-                clean[2 * i + 1] = (byte) (mono[i] >> 8);
+            toBytes(mono, 0, mono.length, cleanBytes, 0);
+            cleanOut.write(cleanBytes);
+            // Per frame: the canceller's two outputs (interleaved), then the beam before noise suppression.
+            for (int f = 0; f < BLOCK_FRAMES; f++) {
+                toBytes(taps, f * FRAME * 3, FRAME * 2, tapBytes, f * FRAME * 4);
             }
-            cleanOut.write(clean);
-            // The canceller's two outputs (interleaved) and the beam before noise suppression.
-            byte[] tap = new byte[FRAME * 3 * 2];
-            for (int i = 0; i < FRAME * 3; i++) {
-                tap[2 * i] = (byte) taps[i];
-                tap[2 * i + 1] = (byte) (taps[i] >> 8);
+            aecOut.write(tapBytes, 0, FRAME * 4 * BLOCK_FRAMES);
+            for (int f = 0; f < BLOCK_FRAMES; f++) {
+                toBytes(taps, f * FRAME * 3 + FRAME * 2, FRAME, tapBytes, f * FRAME * 2);
             }
-            aecOut.write(tap, 0, FRAME * 2 * 2);
-            beamOut.write(tap, FRAME * 2 * 2, FRAME * 2);
+            beamOut.write(tapBytes, 0, FRAME * 2 * BLOCK_FRAMES);
         } catch (IOException e) {
             captureLeft = 0;
         }
-        if (--captureLeft <= 0) closeCapture();
+        captureLeft -= BLOCK_FRAMES;
+        if (captureLeft <= 0) closeCapture();
+    }
+
+    private static void toBytes(short[] src, int off, int n, byte[] dst, int at) {
+        for (int i = 0; i < n; i++) {
+            dst[at + 2 * i] = (byte) src[off + i];
+            dst[at + 2 * i + 1] = (byte) (src[off + i] >> 8);
+        }
     }
 
     private void closeCapture() {
@@ -400,24 +409,9 @@ public final class CarArrayCapture {
         beamOut = null;
     }
 
-    private static boolean micsSilent(short[] in) {
-        for (int i = 0; i < FRAME; i++) {
-            for (int c = 0; c < MICS; c++) {
-                if (in[i * CHANNELS + c] != 0) return false;
-            }
-        }
-        return true;
-    }
-
-    private void noteLevels(short[] in) {
-        for (int c = 0; c < CHANNELS; c++) {
-            double sum = 0;
-            for (int i = 0; i < FRAME; i++) {
-                double v = in[i * CHANNELS + c];
-                sum += v * v;
-            }
-            levelSum[c] += sum / FRAME;
-        }
+    /** Level per raw channel from the front-end's per-frame mean squares; published once a second. */
+    private void noteLevels(int base) {
+        for (int c = 0; c < CHANNELS; c++) levelSum[c] += stats[base + VoiceFrontend.STAT_CH_POWER + c];
         if (++levelFrames == LEVEL_FRAMES) {
             int[] db = new int[CHANNELS];
             for (int c = 0; c < CHANNELS; c++) {

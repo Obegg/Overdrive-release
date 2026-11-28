@@ -825,11 +825,7 @@ final class VoiceEngine implements PcmSink {
         if (capShorts.length < n) capShorts = new short[n];
         Resampler.bytesToShorts(pcm, length, capShorts);
         if (sampleRate == RATE) {
-            ring.write(capShorts, 0, n);
-            // The car array delivers 16 kHz: ring positions map to its sample clock (echo likeness).
-            long clock = AppAudioCaptureController.sampleClock();
-            clockValid = clock > 0;
-            if (clock > 0) clockOffset = clock - ring.writtenSamples();
+            write16k(capShorts, n);
             return;
         }
         clockValid = false;
@@ -883,6 +879,25 @@ final class VoiceEngine implements PcmSink {
             short[] chunk = new short[1024];
             while (running) {
                 Runnable r;
+    /** The car array's samples, without the byte round trip. */
+    @Override
+    public void onPcm16(short[] pcm, int samples, int sampleRate) {
+        if (!running) return;
+        if (sampleRate == RATE) {
+            write16k(pcm, samples);
+            return;
+        }
+        PcmSink.super.onPcm16(pcm, samples, sampleRate);
+    }
+
+    private void write16k(short[] pcm, int n) {
+        ring.write(pcm, 0, n);
+        // The car array delivers 16 kHz: ring positions map to its sample clock (echo likeness).
+        long clock = AppAudioCaptureController.sampleClock();
+        clockValid = clock > 0;
+        if (clock > 0) clockOffset = clock - ring.writtenSamples();
+    }
+
                 while (running && (r = events.poll()) != null) r.run();
                 if (!running) break;
                 int n = ring.read(chunk, 0, chunk.length);

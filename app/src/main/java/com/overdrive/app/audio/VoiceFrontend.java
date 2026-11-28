@@ -21,8 +21,8 @@ final class VoiceFrontend implements AutoCloseable {
     static final int MODE_LINEAR_ONLY = 2;
     static final int MODE_LINEAR_POSTFILTER = 3;
     static final int DEFAULT_MODE = MODE_SUPPRESS_BALANCED;
-    /** Per-frame diagnostics written by {@link #process(short[], short[], float[], short[])} (vfe.h). */
-    static final int STATS = 16;
+    /** Per-frame diagnostics written by {@link #process} (vfe.h). */
+    static final int STATS = 24;
     static final int STAT_ECHO_SCORE = 0;
     static final int STAT_OUT_ENERGY = 1;
     static final int STAT_ERLE_DB = 2;
@@ -32,6 +32,15 @@ final class VoiceFrontend implements AutoCloseable {
     static final int STAT_CONVERGED = 6;
     static final int STAT_RESIDUAL_ECHO = 7;
     static final int STAT_BEAM_CONFIDENCE = 8;
+    static final int STAT_ENR_DB = 13;
+    static final int STAT_BELOW_NOISE = 14;
+    static final int STAT_LAST_DELAY_MS = 15;
+    static final int STAT_DELAY_AGE_MS = 16;
+    /** Four values: mean square of each raw channel (mics, then references). */
+    static final int STAT_CH_POWER = 17;
+    static final int STAT_ECHO_BYPASS = 21;
+    /** Frames one {@link #process} call may carry. */
+    static final int MAX_FRAMES = 4;
 
     private static volatile Boolean loaded;
 
@@ -75,16 +84,17 @@ final class VoiceFrontend implements AutoCloseable {
         return h == 0 ? null : new VoiceFrontend(h, frame, mics + refs);
     }
 
-    /** One interleaved frame ({@code frame * channels} samples) in, {@code frame} mono samples out. */
-    boolean process(short[] interleaved, short[] mono) {
-        return process(interleaved, mono, null, null);
-    }
-
-    /** As above; {@code stats} ({@link #STATS}) and {@code taps} (AEC output by mic, then the beam: frame*3) may be null. */
-    boolean process(short[] interleaved, short[] mono, float[] stats, short[] taps) {
+    /**
+     * {@code frames} (1..{@link #MAX_FRAMES}) interleaved frames in, as many mono frames out; per frame
+     * {@code stats} gets {@link #STATS} values and {@code taps} (may be null) frame*3 samples: AEC output
+     * by mic, then the beam.
+     */
+    boolean process(short[] interleaved, int frames, short[] mono, float[] stats, short[] taps) {
         long h = handle;
-        return h != 0 && interleaved.length >= frame * channels && mono.length >= frame
-                && nativeProcess(h, interleaved, channels, frame, mono, stats, taps);
+        return h != 0 && frames >= 1 && frames <= MAX_FRAMES && interleaved.length >= frames * frame * channels
+                && mono.length >= frames * frame && stats != null && stats.length >= frames * STATS
+                && (taps == null || taps.length >= frames * frame * 3)
+                && nativeProcess(h, interleaved, channels, frame, frames, mono, stats, taps);
     }
 
     @Override
@@ -96,8 +106,8 @@ final class VoiceFrontend implements AutoCloseable {
 
     private static native long nativeCreate(int rate, int frame, int mics, int refs, int nsLevel, int mode);
 
-    private static native boolean nativeProcess(long handle, short[] in, int channels, int frame, short[] out,
-                                                float[] stats, short[] taps);
+    private static native boolean nativeProcess(long handle, short[] in, int channels, int frame, int frames,
+                                                short[] out, float[] stats, short[] taps);
 
     private static native void nativeDestroy(long handle);
 }

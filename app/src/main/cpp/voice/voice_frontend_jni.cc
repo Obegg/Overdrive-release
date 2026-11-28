@@ -4,6 +4,11 @@
 
 #include "vfe.h"
 
+namespace {
+constexpr int kFrame = 160;
+constexpr int kMaxFrames = 4;
+}  // namespace
+
 extern "C" {
 
 JNIEXPORT jlong JNICALL
@@ -12,27 +17,32 @@ Java_com_overdrive_app_audio_VoiceFrontend_nativeCreate(JNIEnv *, jclass, jint r
     return static_cast<jlong>(reinterpret_cast<intptr_t>(vfe_create_mode(rate, frame, mics, refs, nsLevel, mode)));
 }
 
-/** stats (VFE_STATS floats) and taps (frame * 3 shorts) may be null. */
+/** frames (1..4) frames per call; stats gets VFE_STATS floats per frame; taps (frame * 3 per frame) may be null. */
 JNIEXPORT jboolean JNICALL
 Java_com_overdrive_app_audio_VoiceFrontend_nativeProcess(JNIEnv *env, jclass, jlong handle, jshortArray in,
-                                                         jint channels, jint frame, jshortArray out,
+                                                         jint channels, jint frame, jint frames, jshortArray out,
                                                          jfloatArray stats, jshortArray taps) {
     Vfe *v = reinterpret_cast<Vfe *>(static_cast<intptr_t>(handle));
-    if (!v || channels != 4 || env->GetArrayLength(in) < frame * channels || env->GetArrayLength(out) < frame
-            || (stats && env->GetArrayLength(stats) < VFE_STATS) || (taps && env->GetArrayLength(taps) < frame * 3)) {
+    if (!v || channels != 4 || frame != kFrame || frames < 1 || frames > kMaxFrames || !stats
+            || env->GetArrayLength(in) < frames * frame * channels || env->GetArrayLength(out) < frames * frame
+            || env->GetArrayLength(stats) < frames * VFE_STATS
+            || (taps && env->GetArrayLength(taps) < frames * frame * 3)) {
         return JNI_FALSE;
     }
-    // The front-end runs ~0.1-1 ms, so plain copies keep the GC unblocked.
-    jshort src[160 * 4], dst[160], tap[160 * 3];
-    jfloat st[VFE_STATS];
-    if (frame != 160) return JNI_FALSE;
-    env->GetShortArrayRegion(in, 0, frame * channels, src);
-    int ok = vfe_process(v, reinterpret_cast<const int16_t *>(src), reinterpret_cast<int16_t *>(dst),
-                         stats ? st : nullptr, taps ? reinterpret_cast<int16_t *>(tap) : nullptr);
-    if (!ok) return JNI_FALSE;
-    env->SetShortArrayRegion(out, 0, frame, dst);
-    if (stats) env->SetFloatArrayRegion(stats, 0, VFE_STATS, st);
-    if (taps) env->SetShortArrayRegion(taps, 0, frame * 3, tap);
+    // One copy in and out per call (a few KB); the front-end runs ~0.1-1 ms, so the GC stays unblocked.
+    jshort src[kMaxFrames * kFrame * 4], dst[kMaxFrames * kFrame], tap[kMaxFrames * kFrame * 3];
+    jfloat st[kMaxFrames * VFE_STATS];
+    env->GetShortArrayRegion(in, 0, frames * frame * channels, src);
+    for (int f = 0; f < frames; f++) {
+        if (!vfe_process(v, reinterpret_cast<const int16_t *>(src + f * frame * channels),
+                         reinterpret_cast<int16_t *>(dst + f * frame), st + f * VFE_STATS,
+                         taps ? reinterpret_cast<int16_t *>(tap + f * frame * 3) : nullptr)) {
+            return JNI_FALSE;
+        }
+    }
+    env->SetShortArrayRegion(out, 0, frames * frame, dst);
+    env->SetFloatArrayRegion(stats, 0, frames * VFE_STATS, st);
+    if (taps) env->SetShortArrayRegion(taps, 0, frames * frame * 3, tap);
     return JNI_TRUE;
 }
 
