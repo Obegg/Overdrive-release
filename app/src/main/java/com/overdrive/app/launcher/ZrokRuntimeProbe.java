@@ -29,6 +29,7 @@ public final class ZrokRuntimeProbe {
     private static final int PROXY_PORT = 8119;
     private static final int PORT_TIMEOUT_MS = 500;
     private static final int HTTP_TIMEOUT_MS = 5_000;
+    private static final int MAX_COMMAND_OUTPUT_BYTES = 65_536;
     private static final Pattern VERSION = Pattern.compile("(?i)(?:^|[^0-9])v?(\\d+)\\.(\\d+)\\.(\\d+)");
     private static final Pattern SHARE_URL =
             Pattern.compile("https://([a-z0-9-]+)\\.share\\.zrok\\.io", Pattern.CASE_INSENSITIVE);
@@ -408,30 +409,51 @@ public final class ZrokRuntimeProbe {
             // zrok keeps its environment under $HOME/.zrok: the scratch root.
             builder.environment().put("HOME", com.overdrive.app.util.ScratchRoot.dir());
             com.overdrive.app.util.ScratchRoot.applyEnv(builder);
-            Process process = builder.start();
-            ByteArrayOutputStream output = new ByteArrayOutputStream();
-            Thread reader = new Thread(() -> copyOutput(process.getInputStream(), output), "zrok-version-reader");
-            reader.setDaemon(true);
-            reader.start();
-            if (!process.waitFor(5, TimeUnit.SECONDS)) {
-                process.destroyForcibly();
-                process.waitFor(1, TimeUnit.SECONDS);
-            }
-            reader.join(1_000L);
-            return reader.isAlive() ? "" : output.toString("UTF-8");
+            return readCommandResult(builder.start(), 5_000L);
         } catch (Exception ignored) {
             return "";
         }
     }
 
-    private static void copyOutput(InputStream input, ByteArrayOutputStream output) {
+    // Capability checks must not trust partial output from a failed command.
+    static String readCommandResult(Process process, long timeoutMs) {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        boolean[] complete = {false};
+        try {
+            process.getOutputStream().close();
+            Thread reader = new Thread(() -> complete[0] = copyOutput(process.getInputStream(), output),
+                    "zrok-version-reader");
+            reader.setDaemon(true);
+            reader.start();
+            if (!process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) return "";
+            if (process.exitValue() != 0) return "";
+            reader.join(1_000L);
+            return !reader.isAlive() && complete[0]
+                    ? new String(output.toByteArray(), StandardCharsets.UTF_8) : "";
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "";
+        } catch (Exception ignored) {
+            return "";
+        } finally {
+            if (process.isAlive()) process.destroyForcibly();
+        }
+    }
+
+    private static boolean copyOutput(InputStream input, ByteArrayOutputStream output) {
         byte[] buffer = new byte[1_024];
+        boolean truncated = false;
         try (InputStream stream = input) {
             int read;
-            while (output.size() < 65_536 && (read = stream.read(buffer)) != -1) {
-                output.write(buffer, 0, Math.min(read, 65_536 - output.size()));
+            while ((read = stream.read(buffer)) != -1) {
+                int kept = Math.min(read, MAX_COMMAND_OUTPUT_BYTES - output.size());
+                output.write(buffer, 0, kept);
+                truncated |= kept < read;
             }
-        } catch (Exception ignored) {}
+            return !truncated;
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     private static void appendLog(File file, String message) {
