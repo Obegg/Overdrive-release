@@ -28,6 +28,8 @@ public class StorageManagerPerSavePermissionTest {
                 .contains("makeFilesReadable("));
         assertFalse(methodBody(source, "public void onTripFileSaved")
                 .contains("makeFilesReadable("));
+        assertFalse(methodBody(source, "private void queuePostSaveCleanup")
+                .contains("makeFilesReadable("));
     }
 
     @Test

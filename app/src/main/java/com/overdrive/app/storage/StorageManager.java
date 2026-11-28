@@ -25,6 +25,8 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 
 /**
  * StorageManager - SOTA Storage Management for Overdrive
@@ -831,7 +833,6 @@ public class StorageManager {
 
     private static final String DEFERRED_RECORDINGS = "recordings";
     private static final String DEFERRED_SURVEILLANCE = "surveillance";
-    private static final String DEFERRED_PROXIMITY = "proximity";
     private static final String DEFERRED_TRIPS = "trips";
 
     // Per-category cleanup locks. The previous design used a single shared
@@ -11863,209 +11864,73 @@ public class StorageManager {
     
     // ==================== Event-Driven Cleanup (SOTA) ====================
     
-    /**
-     * Called after a recording file is saved/closed.
-     * Triggers async cleanup to ensure we stay within limits.
-     * Also sets file permissions so UI app can read it.
-     * 
-     * This is the SOTA approach - cleanup after each file save rather than
-     * only at recording start, preventing storage overflow during long sessions.
-     * 
-     * IMPORTANT: Runs async to avoid blocking the video encoding thread.
-     */
+    /** Schedule cleanup after a recording file is closed. */
     public void onRecordingFileSaved() {
-        markStorageDirtyForPool("recordings");  // idle gate: a new clip can put the pool over cap
-        // Fix directory permissions in case they were reset
+        markStorageDirtyForPool("recordings");
         fixDirectoryPermissions(recordingsDir);
-
-        // FIX: Removed broadcastRecentFiles() — specific file already broadcast by onFileSaved()
-
-        // Gate destructive cleanup on encoder write state. If a recording is
-        // mid-flight, deferring this delete burst is what keeps the SD card
-        // available for the encoder's disk writer. The deferred queue is
-        // drained the next time we observe encoder=idle, so nothing is lost.
-        if (isEncoderWriting()) {
-            deferredCleanupDirs.add(DEFERRED_RECORDINGS);
-            logDebug("Recording file saved during active write — deferring cleanup");
-            return;
-        }
-
-        asyncCleanupExecutor.execute(() -> {
-            synchronized (recordingsCleanupLock) {
-                try {
-                    // Scoped to the active volume so a fallback to internal triggers
-                    // (and bounds) on internal's pool + effective limit, not the
-                    // combined cross-volume pool vs the raw external limit.
-                    long currentSize = scopedSizeForCategory("recordings");
-                    long limitBytes = scopedLimitBytesForCategory("recordings");
-
-                    if (currentSize > limitBytes) {
-                        logInfo("Recording file saved - triggering cleanup (current=" +
-                            formatSize(currentSize) + ", limit=" + formatSize(limitBytes) + ")");
-                        // Call ensureSpace directly: we already hold
-                        // recordingsCleanupLock and already gated on
-                        // isEncoderWriting at the top. Going through
-                        // ensureRecordingsSpace would just re-take the
-                        // (reentrant) lock and re-check the encoder gate.
-                        ensureSpace("recordings", getReapableDirs("recordings"), recordingsDir,
-                            namePrefixForCategory("recordings"),
-                            limitBytes, 0);
-                    } else {
-                        logDebug("Recording file saved - within limits (" +
-                            formatSize(currentSize) + "/" + formatSize(limitBytes) + ")");
-                    }
-                } catch (Exception e) {
-                    logWarn("Async recording cleanup error: " + e.getMessage());
-                }
-            }
-        });
+        queuePostSaveCleanup("Recording", DEFERRED_RECORDINGS, recordingsCleanupLock,
+            () -> recordingsDir);
     }
-    
-    /**
-     * Called after a surveillance event file is saved/closed.
-     * Triggers async cleanup to ensure we stay within limits.
-     * Also sets file permissions so UI app can read it.
-     * 
-     * IMPORTANT: Runs async to avoid blocking the video encoding thread.
-     */
+
+    /** Schedule cleanup after a surveillance event file is closed. */
     public void onSurveillanceFileSaved() {
-        markStorageDirtyForPool("surveillance");  // idle gate: a new clip can put the pool over cap
-        // Fix directory permissions in case they were reset
+        markStorageDirtyForPool("surveillance");
         fixDirectoryPermissions(surveillanceDir);
-
-        // FIX: Removed broadcastRecentFiles() call that re-scanned ALL files modified
-        // in the last 60 seconds. This caused duplicate MediaScanner broadcasts —
-        // if two events saved 20 seconds apart, the second save re-broadcast the first.
-        // Over days of parking, this list grows to hundreds of files, causing massive
-        // CPU spikes on every new event. The specific file is already broadcast by
-        // onFileSaved() → broadcastFile(file) before this method is called.
-
-        // Defer destructive cleanup if encoder is mid-write. See onRecordingFileSaved
-        // for rationale — SD card I/O contention against the encoder's disk writer
-        // is what produces the freeze+skip artifact in the recorded MP4.
-        if (isEncoderWriting()) {
-            deferredCleanupDirs.add(DEFERRED_SURVEILLANCE);
-            logDebug("Surveillance file saved during active write — deferring cleanup");
-            return;
-        }
-
-        asyncCleanupExecutor.execute(() -> {
-            synchronized (surveillanceCleanupLock) {
-                try {
-                    long currentSize = scopedSizeForCategory("surveillance");
-                    long limitBytes = scopedLimitBytesForCategory("surveillance");
-
-                    if (currentSize > limitBytes) {
-                        logInfo("Surveillance file saved - triggering cleanup (current=" +
-                            formatSize(currentSize) + ", limit=" + formatSize(limitBytes) + ")");
-                        ensureSpace("surveillance", getReapableDirs("surveillance"), surveillanceDir,
-                            namePrefixForCategory("surveillance"),
-                            limitBytes, 0);
-                    } else {
-                        logDebug("Surveillance file saved - within limits (" +
-                            formatSize(currentSize) + "/" + formatSize(limitBytes) + ")");
-                    }
-                } catch (Exception e) {
-                    logWarn("Async surveillance cleanup error: " + e.getMessage());
-                }
-            }
-        });
+        queuePostSaveCleanup("Surveillance", DEFERRED_SURVEILLANCE, surveillanceCleanupLock,
+            () -> surveillanceDir);
     }
-    
-    /**
-     * Called after a proximity event file is saved/closed.
-     * Triggers async cleanup to ensure we stay within limits.
-     * Also sets file permissions so UI app can read it.
-     * 
-     * IMPORTANT: Runs async to avoid blocking the video encoding thread.
-     */
+
+    /** Schedule cleanup of the shared recordings pool after a proximity event. */
     public void onProximityFileSaved() {
-        markStorageDirtyForPool("proximity");  // idle gate: a new clip can put the pool over cap
-        // Fix directory permissions in case they were reset
+        markStorageDirtyForPool("proximity");
         fixDirectoryPermissions(proximityDir);
-
-        // FIX: Removed broadcastRecentFiles() — specific file already broadcast by onFileSaved()
-
-        if (isEncoderWriting()) {
-            // Queue the RECORDINGS key: proximity's bytes are in that pool, and both
-            // keys' drains now reap it — enqueuing DEFERRED_PROXIMITY as well would
-            // just run the same pass twice.
-            deferredCleanupDirs.add(DEFERRED_RECORDINGS);
-            logDebug("Proximity file saved during active write — deferring cleanup");
-            return;
-        }
-
-        asyncCleanupExecutor.execute(() -> {
-            // Measure and reap the SHARED recordings pool. Comparing the proximity
-            // dirs alone against the recordings cap can essentially never fire, which
-            // would make post-save proximity cleanup dead code.
-            synchronized (recordingsCleanupLock) {
-                try {
-                    long currentSize = scopedSizeForCategory("recordings");
-                    long limitBytes = scopedLimitBytesForCategory("recordings");
-
-                    if (currentSize > limitBytes) {
-                        logInfo("Proximity file saved - triggering cleanup (current=" +
-                            formatSize(currentSize) + ", limit=" + formatSize(limitBytes) + ")");
-                        ensureSpace("recordings", getReapableDirs("recordings"), recordingsDir,
-                            namePrefixForCategory("recordings"),
-                            limitBytes, 0);
-                    } else {
-                        logDebug("Proximity file saved - within limits (" +
-                            formatSize(currentSize) + "/" + formatSize(limitBytes) + ")");
-                    }
-                } catch (Exception e) {
-                    logWarn("Async proximity cleanup error: " + e.getMessage());
-                }
-            }
-        });
+        queuePostSaveCleanup("Proximity", DEFERRED_RECORDINGS, recordingsCleanupLock,
+            () -> recordingsDir);
     }
-    
-    /**
-     * Called after a trip telemetry file is saved/closed.
-     * Triggers async cleanup to ensure we stay within limits.
-     * Also sets file permissions so UI app can read it.
-     * 
-     * IMPORTANT: Runs async to avoid blocking the telemetry recording thread.
-     */
+
+    /** Schedule cleanup after a trip telemetry file is closed. */
     public void onTripFileSaved() {
-        markStorageDirtyForPool("trips");  // idle gate: a new trip file can put the pool over cap
-        // Fix directory permissions in case they were reset
+        markStorageDirtyForPool("trips");
         fixDirectoryPermissions(tripsDir);
+        queuePostSaveCleanup("Trip", DEFERRED_TRIPS, tripsCleanupLock,
+            () -> tripsDir);
+    }
 
+    /** Defer destructive cleanup during encoder writes; otherwise run it off the save thread. */
+    private void queuePostSaveCleanup(String eventName, String category, Object cleanupLock,
+                                      Supplier<File> activeDir) {
+        // onFileSaved already handles the individual file's permissions and media broadcast.
         if (isEncoderWriting()) {
-            deferredCleanupDirs.add(DEFERRED_TRIPS);
-            logDebug("Trip file saved during active write — deferring cleanup");
+            deferredCleanupDirs.add(category);
+            logDebug(eventName + " file saved during active write — deferring cleanup");
             return;
         }
 
         asyncCleanupExecutor.execute(() -> {
-            synchronized (tripsCleanupLock) {
+            synchronized (cleanupLock) {
                 try {
-                    // Scoped (parity with the other onXxxFileSaved handlers) so a
-                    // trips fallback to internal triggers on internal's pool + cap.
-                    // scopedSizeForCategory("trips") still uses the DB-cached size in
-                    // normal mode (no FUSE walk).
-                    long currentSize = scopedSizeForCategory("trips");
-                    long limitBytes = scopedLimitBytesForCategory("trips");
-
+                    // Measure the active volume and its effective cap, including internal fallback.
+                    long currentSize = scopedSizeForCategory(category);
+                    long limitBytes = scopedLimitBytesForCategory(category);
                     if (currentSize > limitBytes) {
-                        logInfo("Trip file saved - triggering cleanup (current=" +
+                        logInfo(eventName + " file saved - triggering cleanup (current=" +
                             formatSize(currentSize) + ", limit=" + formatSize(limitBytes) + ")");
-                        ensureSpace("trips", getReapableDirs("trips"), tripsDir,
-                            namePrefixForCategory("trips"),
-                            tripsLimitMb * 1024 * 1024, 0);
+                        // Preserve the trips path's raw cap; other save paths use the scoped cap.
+                        // Read the live directory under the lock, not when the save was queued.
+                        ensureSpace(category, getReapableDirs(category), activeDir.get(),
+                            namePrefixForCategory(category),
+                            DEFERRED_TRIPS.equals(category) ? tripsLimitMb * 1024 * 1024 : limitBytes, 0);
                     } else {
-                        logDebug("Trip file saved - within limits (" +
+                        logDebug(eventName + " file saved - within limits (" +
                             formatSize(currentSize) + "/" + formatSize(limitBytes) + ")");
                     }
                 } catch (Exception e) {
-                    logWarn("Async trips cleanup error: " + e.getMessage());
+                    logWarn("Async cleanup after " + eventName + " save: " + e.getMessage());
                 }
             }
         });
     }
-    
+
     /**
      * Fix directory permissions so UI app can read files.
      * Note: chmod doesn't work on Android FUSE filesystem, but we keep Java API calls.
@@ -12587,87 +12452,38 @@ public class StorageManager {
         logInfo("Started periodic storage cleanup (interval=" + CLEANUP_INTERVAL_SECONDS + "s)");
     }
     
-    /**
-     * Drain any cleanup that was deferred because the encoder was mid-write.
-     * Called from the periodic tick AND from each onXxxFileSaved path, so a
-     * deferred backlog never sits indefinitely. Safe to call when the queue
-     * is empty (early-exits on empty set).
-     */
+    /** Drain deferred cleanup on an encoder-idle periodic tick. */
     private void drainDeferredCleanupIfDue() {
         if (deferredCleanupDirs.isEmpty()) return;
-        if (isEncoderWriting()) return;  // still busy, try later
-        // Snapshot+clear so a concurrent add (e.g. a periodic tick that fires
-        // while we're draining) doesn't lose the new mark.
-        java.util.Set<String> toRun = new java.util.HashSet<>(deferredCleanupDirs);
+        if (isEncoderWriting()) return;
+        // Snapshot the pending categories before draining them.
+        Set<String> toRun = new HashSet<>(deferredCleanupDirs);
         deferredCleanupDirs.removeAll(toRun);
         logInfo("Draining deferred cleanup: " + toRun);
 
-        // Per-dir try/catch: a failure on one dir must NOT cause the others
-        // to be re-marked. The previous catch-all re-added the entire toRun
-        // snapshot on any exception, including dirs that had already been
-        // cleaned successfully — wasting the next tick on idempotent re-runs
-        // (audit P1).
-        // Same direct-ensureSpace pattern as onXxxFileSaved: we already
-        // hold the per-category lock and already gated on isEncoderWriting
-        // at the top. Going through ensureXxxSpace would re-take the
-        // (reentrant) lock and re-check the encoder gate.
-        if (toRun.contains(DEFERRED_RECORDINGS)) {
-            try {
-                synchronized (recordingsCleanupLock) {
-                    // Scoped to the active volume (internal during a fallback) so the
-                    // drain actually fires when internal is over its effective cap.
-                    if (scopedSizeForCategory("recordings") > scopedLimitBytesForCategory("recordings")) {
-                        ensureSpace("recordings", getReapableDirs("recordings"), recordingsDir,
-                            namePrefixForCategory("recordings"), recordingsLimitMb * 1024 * 1024, 0);
-                    }
+        drainDeferredCategory(toRun, DEFERRED_RECORDINGS, recordingsCleanupLock,
+            () -> recordingsDir, () -> recordingsLimitMb * 1024 * 1024);
+        drainDeferredCategory(toRun, DEFERRED_SURVEILLANCE, surveillanceCleanupLock,
+            () -> surveillanceDir, () -> surveillanceLimitMb * 1024 * 1024);
+        drainDeferredCategory(toRun, DEFERRED_TRIPS, tripsCleanupLock,
+            () -> tripsDir, () -> tripsLimitMb * 1024 * 1024);
+    }
+
+    private void drainDeferredCategory(Set<String> toRun, String category, Object cleanupLock,
+                                       Supplier<File> activeDir, LongSupplier rawLimitBytes) {
+        if (!toRun.contains(category)) return;
+        try {
+            synchronized (cleanupLock) {
+                if (scopedSizeForCategory(category) > scopedLimitBytesForCategory(category)) {
+                    // Already gated on encoder state; use the raw cap for ensureSpace to scope.
+                    ensureSpace(category, getReapableDirs(category), activeDir.get(),
+                        namePrefixForCategory(category), rawLimitBytes.getAsLong(), 0);
                 }
-            } catch (Exception e) {
-                logWarn("Deferred recordings cleanup error: " + e.getMessage());
-                deferredCleanupDirs.add(DEFERRED_RECORDINGS);
             }
-        }
-        if (toRun.contains(DEFERRED_SURVEILLANCE)) {
-            try {
-                synchronized (surveillanceCleanupLock) {
-                    if (scopedSizeForCategory("surveillance") > scopedLimitBytesForCategory("surveillance")) {
-                        ensureSpace("surveillance", getReapableDirs("surveillance"), surveillanceDir,
-                            namePrefixForCategory("surveillance"), surveillanceLimitMb * 1024 * 1024, 0);
-                    }
-                }
-            } catch (Exception e) {
-                logWarn("Deferred surveillance cleanup error: " + e.getMessage());
-                deferredCleanupDirs.add(DEFERRED_SURVEILLANCE);
-            }
-        }
-        // Legacy key: nothing enqueues DEFERRED_PROXIMITY any more (onProximityFileSaved
-        // queues DEFERRED_RECORDINGS, whose drain reaps the shared pool). Kept only to
-        // drain a key left in the set by a build that predates the merge.
-        if (toRun.contains(DEFERRED_PROXIMITY)) {
-            try {
-                synchronized (recordingsCleanupLock) {
-                    if (scopedSizeForCategory("recordings") > scopedLimitBytesForCategory("recordings")) {
-                        ensureSpace("recordings", getReapableDirs("recordings"), recordingsDir,
-                            namePrefixForCategory("recordings"),
-                            rawLimitBytesForCategory("recordings"), 0);
-                    }
-                }
-            } catch (Exception e) {
-                logWarn("Deferred proximity cleanup error: " + e.getMessage());
-                deferredCleanupDirs.add(DEFERRED_PROXIMITY);
-            }
-        }
-        if (toRun.contains(DEFERRED_TRIPS)) {
-            try {
-                synchronized (tripsCleanupLock) {
-                    if (scopedSizeForCategory("trips") > scopedLimitBytesForCategory("trips")) {
-                        ensureSpace("trips", getReapableDirs("trips"), tripsDir,
-                            namePrefixForCategory("trips"), tripsLimitMb * 1024 * 1024, 0);
-                    }
-                }
-            } catch (Exception e) {
-                logWarn("Deferred trips cleanup error: " + e.getMessage());
-                deferredCleanupDirs.add(DEFERRED_TRIPS);
-            }
+        } catch (Exception e) {
+            // A failure must only requeue this category, not completed work in other pools.
+            logWarn("Deferred " + category + " cleanup error: " + e.getMessage());
+            deferredCleanupDirs.add(category);
         }
     }
 
