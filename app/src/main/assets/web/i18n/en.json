@@ -5759,6 +5759,13 @@
     "toast_deleted": "WireGuard config deleted",
     "confirm_delete": "Delete the WireGuard config? The private key is removed and the tunnel stops.",
     "network_error": "Network error: {message}",
+    "expose_label": "Dashboard reachable over WireGuard",
+    "expose_warning": "Every peer that can reach the car's tunnel address can open the login page. Restrict access on the WireGuard server.",
+    "expose_apply": "This is the saved setting, not live reachability. It applies the next time the tunnel starts. If it is running, restart WireGuard from the car's Daemons screen.",
+    "expose_on": "Saved setting: on",
+    "expose_off": "Saved setting: off",
+    "expose_saved": "Dashboard setting saved",
+    "expose_failed": "Could not change the dashboard setting",
     "detail_proxy_off": "App traffic is not routed through the tunnel (proxy flag off)"
   },
   "safekeep": {

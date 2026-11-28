@@ -8,6 +8,9 @@ var WG = {
     MAX_BYTES: 16 * 1024,
     refreshInterval: null,
     saving: false,
+    refreshing: null,
+    exposureSaving: false,
+    exposureValue: null,
 
     init: function () {
         var self = this;
@@ -33,15 +36,27 @@ var WG = {
 
     // ==================== STATUS ====================
 
-    refresh: function () {
+    refresh: function (force) {
         var self = this;
-        fetch('/api/wireguard')
-            .then(function (resp) { return resp.json(); })
-            .then(function (data) { self.render(data); })
-            .catch(function () { self.render(null); });
+        if (this.exposureSaving || (this.refreshing && !force)) return;
+        var request = {};
+        this.refreshing = request;
+        function finish(data) {
+            if (self.refreshing !== request) return;
+            self.refreshing = null;
+            self.render(data);
+        }
+        fetch('/api/wireguard', { cache: 'no-store' })
+            .then(function (resp) {
+                if (!resp.ok || resp.headers.get('X-OverDrive-Offline') !== null) return null;
+                return resp.json();
+            })
+            .then(finish)
+            .catch(function () { finish(null); });
     },
 
     render: function (data) {
+        this.renderExposure(data);
         var dot = document.getElementById('wgDot');
         var state = document.getElementById('wgState');
         var detail = document.getElementById('wgDetail');
@@ -128,6 +143,59 @@ var WG = {
         return this.T('wireguard.handshake_hours', 'Last handshake {n}h ago', { n: Math.floor(ago / 3600) });
     },
 
+    // ==================== DASHBOARD OPT-IN ====================
+
+    renderExposure: function (data) {
+        var input = document.getElementById('wgExpose');
+        var state = document.getElementById('wgExposeState');
+        if (!input || !state) return;
+        var known = data && typeof data.expose_dashboard === 'boolean';
+        this.exposureValue = known ? data.expose_dashboard : null;
+        input.checked = this.exposureValue === true;
+        input.indeterminate = !known;
+        input.disabled = !known || this.exposureSaving;
+        state.textContent = !known
+            ? this.T('wireguard.status_unavailable', 'Status unavailable')
+            : this.exposureValue
+                ? this.T('wireguard.expose_on', 'Saved setting: on')
+                : this.T('wireguard.expose_off', 'Saved setting: off');
+    },
+
+    changeExposure: function () {
+        var self = this;
+        var input = document.getElementById('wgExpose');
+        if (this.exposureSaving || this.exposureValue === null) return;
+        var enabled = input.checked;
+        if (enabled === this.exposureValue) return;
+        this.exposureSaving = true;
+        input.disabled = true;
+        // A poll started before this write must not overwrite its result.
+        this.refreshing = null;
+        document.getElementById('wgExposeState').textContent =
+            this.T('wireguard.status_loading', 'Checking status...');
+
+        function finish(error) {
+            self.exposureSaving = false;
+            // Read back the saved flag, even after a failed or cancelled request.
+            self.renderExposure(null);
+            if (error) self.toast(error, 'error');
+            else self.toast(self.T('wireguard.expose_saved', 'Dashboard setting saved'), 'success');
+            self.refresh();
+        }
+        var failed = this.T('wireguard.expose_failed', 'Could not change the dashboard setting');
+        fetch('/api/wireguard/expose', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: enabled })
+        })
+            .then(function (resp) {
+                return resp.json().then(function (result) {
+                    finish(resp.ok && result && result.success === true ? null : (result && result.error) || failed);
+                });
+            })
+            .catch(function () { finish(failed); });
+    },
+
     // ==================== INPUT ====================
 
     onFile: function (input) {
@@ -186,7 +254,7 @@ var WG = {
                 if (result && result.success) {
                     document.getElementById('wgConfig').value = '';
                     self.toast(self.T('wireguard.toast_saved', 'WireGuard config saved'), 'success');
-                    self.refresh();
+                    self.refresh(true);
                 } else {
                     self.showError((result && result.error) || self.T('errors.save_failed', 'Save failed'));
                 }
@@ -206,7 +274,7 @@ var WG = {
             .then(function (result) {
                 if (result && result.success) {
                     self.toast(self.T('wireguard.toast_deleted', 'WireGuard config deleted'), 'success');
-                    self.refresh();
+                    self.refresh(true);
                 } else {
                     self.toast((result && result.error) || self.T('errors.delete_failed', 'Delete failed'), 'error');
                 }

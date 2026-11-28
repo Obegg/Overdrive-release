@@ -33,6 +33,7 @@
         .form-group textarea::placeholder { color: var(--text-muted); }
         .wg-error { display: none; margin-top: 8px; padding: 10px 12px; border-radius: 8px; font-size: 13px;
             color: var(--danger); background: rgba(239,68,68,0.08); border: 1px solid var(--danger); word-break: break-word; }
+        #wgExpose:disabled + .toggle-slider { opacity: 0.5; cursor: not-allowed; }
         .form-actions { display: flex; gap: 8px; margin-top: 16px; justify-content: flex-end; flex-wrap: wrap; }
         .file-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
         .file-row input[type=file] { font-size: 13px; color: var(--text-secondary); max-width: 100%; }
@@ -70,6 +71,26 @@
                                 <div id="wgDetail" class="wg-detail"></div>
                             </div>
                         </div>
+                    </div>
+                </div>
+
+                <!-- Dashboard opt-in (saved for the next tunnel start) -->
+                <div class="card" style="margin-bottom:12px;">
+                    <div class="card-body">
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <label class="setting-name" for="wgExpose" data-i18n="wireguard.expose_label">Dashboard reachable over WireGuard</label>
+                                <div id="wgExposeState" class="setting-desc" aria-live="polite" data-i18n="wireguard.status_loading">Checking status...</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="wgExpose" disabled aria-describedby="wgExposeWarning wgExposeApply" onchange="WG.changeExposure()">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                        <div id="wgExposeWarning" class="hint" data-i18n="wireguard.expose_warning">Every peer that can reach the car's tunnel address can open the login page. Restrict access on the WireGuard server.</div>
+                        <div id="wgExposeApply" class="hint" data-i18n="wireguard.expose_apply">This is the saved setting, not live reachability. It applies the next time the tunnel starts. If it is running, restart WireGuard from the car's Daemons screen.</div>
                     </div>
                 </div>
 
@@ -114,7 +135,7 @@
     <script src="../shared/auth.js?v=18"></script>
     <script src="../shared/core.js?v=31"></script>
     <script src="../shared/update-flow.js?v=6"></script>
-    <script src="../shared/wireguard.js?v=1"></script>
+    <script src="../shared/wireguard.js?v=2"></script>
     <script>
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');
