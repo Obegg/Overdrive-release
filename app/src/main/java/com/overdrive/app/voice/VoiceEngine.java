@@ -21,6 +21,7 @@ import com.overdrive.app.voice.local.SpeechDenoiser;
 import com.overdrive.app.voice.local.WakeEnrollment;
 import com.overdrive.app.voice.ui.VoiceOrbView;
 import com.overdrive.app.voice.ui.VoiceOverlay;
+import com.overdrive.app.voice.wake.VoiceMatch;
 import com.overdrive.app.voice.wake.WakeWordDetector;
 
 import org.json.JSONArray;
@@ -417,6 +418,11 @@ final class VoiceEngine implements PcmSink {
     private final short[] enrollBuf = new short[ENROLL_LEAD_SAMPLES + ENROLL_MAX_SPEECH_SAMPLES + ENROLL_TAIL_SAMPLES];
     private final List<short[]> enrollTakes = new ArrayList<>();
     private final List<Float> enrollPeaks = new ArrayList<>();
+    /** Each take's stage-1 frames for voice match (no audio). */
+    private final List<VoiceMatch.Take> enrollMatchTakes = new ArrayList<>();
+    /** The enrolled voices' templates (immutable; the worker reads it through WakeCheck) and their config key. */
+    private VoiceMatch voiceMatch;
+    private String voiceMatchKey = "";
     private String enrollId;
     private String enrollSeenId = "";
     private int enrollLen;
@@ -433,6 +439,10 @@ final class VoiceEngine implements PcmSink {
     private boolean enrollMusic;
     /** The retrained voice's current lines, offered back to the learner. */
     private List<String> enrollPrevious = java.util.Collections.emptyList();
+    /** The trained voice's current templates (merged with this training's), 0 for none. */
+    private long enrollMatchAt;
+    private String enrollVoice = VoiceAssistantConfig.MAIN_VOICE;
+    private double enrollPriorCutoff = Double.NaN;
     private DecoderLoad enrollDecoderLoad;
 
     /** The phone decoder loads while the takes are recorded; whoever finishes last closes it. */
@@ -1132,6 +1142,58 @@ final class VoiceEngine implements PcmSink {
             double personal = personalCutoff(cfg, false);
             wake.setCutoffOverride(Double.isNaN(personal) ? Float.NaN : (float) personal);
         }
+        applyVoiceMatch(cfg);
+    }
+
+    /** Loads the voices' templates on the io executor when their references change, and drops orphaned files. */
+    private void applyVoiceMatch(VoiceAssistantConfig cfg) {
+        final String key = VoiceAssistantConfig.matchKey(cfg.personalVoices);
+        if (key.equals(voiceMatchKey) || wake == null) return;
+        voiceMatchKey = key;
+        final List<VoiceAssistantConfig.PersonalVoice> voices = cfg.personalVoices;
+        submitMedia(() -> {
+            List<VoiceMatch.Saved> saved = new ArrayList<>();
+            for (VoiceAssistantConfig.PersonalVoice v : voices) {
+                VoiceMatch.Saved s = v.matchAt > 0 ? readMatch(v.id, v.matchAt) : null;
+                if (s != null) saved.add(s);
+            }
+            if (dry == null) pruneMatch(voices);
+            final VoiceMatch m = VoiceMatch.of(saved);
+            post(() -> {
+                if (key.equals(voiceMatchKey)) voiceMatch = m;
+            });
+        });
+    }
+
+    private File matchDir() {
+        return new File(app.getFilesDir(), "voice_match");
+    }
+
+    /** A voice's templates of one training, or null when missing or not that training. Any thread. */
+    private VoiceMatch.Saved readMatch(String voice, long at) {
+        File f = new File(matchDir(), voice + "-" + at + ".bin");
+        if (!f.isFile() || f.length() > 4L << 20) return null;
+        try (InputStream in = new java.io.BufferedInputStream(new java.io.FileInputStream(f))) {
+            return VoiceMatch.Saved.decode(in, voice, at);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Deletes template files no voice references, sparing ones younger than 10 min (a save still in flight). */
+    private void pruneMatch(List<VoiceAssistantConfig.PersonalVoice> voices) {
+        File[] files = matchDir().listFiles();
+        if (files == null) return;
+        java.util.Set<String> kept = new java.util.HashSet<>();
+        for (VoiceAssistantConfig.PersonalVoice v : voices) {
+            if (v.matchAt > 0) kept.add(v.id + "-" + v.matchAt + ".bin");
+        }
+        long now = System.currentTimeMillis();
+        for (File f : files) {
+            if (!kept.contains(f.getName()) && now - f.lastModified() > 10 * 60_000L && !f.delete()) {
+                Log.w(TAG, "could not delete " + f.getName());
+            }
+        }
     }
 
     /** The lowest enrolled cutoff (reference units) of the voices measured on the loaded wake model, or NaN. */
@@ -1415,7 +1477,12 @@ final class VoiceEngine implements PcmSink {
         LocalCommandSpotter kws;
         CommandTranscriber stt;
         PhoneDecoder phones;
+        VoiceMatch match;
+        short[] feats;
+        int featFrames;
         // Verdict (worker).
+        float tmplD = Float.NaN;
+        float tmplThr = Float.NaN;
         int end = LocalCommandSpotter.WAKE_NOT_HEARD;
         boolean heard;
         String by;
@@ -1486,6 +1553,14 @@ final class VoiceEngine implements PcmSink {
         c.stt = transcriber;
         c.phones = wakePhones;
         c.turnAt = turn;
+        // Voice match: stage 1's own frames of the window, for a confident enough trigger with speech in it.
+        VoiceMatch match = voiceMatch;
+        if (match != null && c.peak >= wake.toModel(VoiceMatch.GATE_P_REF) - 1e-4f
+                && dbfs(c.level) >= VoiceMatch.MIN_LEVEL_DBFS) {
+            c.match = match;
+            c.feats = new short[VoiceMatch.WINDOW_FRAMES * com.overdrive.app.voice.wake.MicroFrontend.NUM_CHANNELS];
+            c.featFrames = wake.copyFeatures(c.feats, VoiceMatch.WINDOW_FRAMES);
+        }
         WakeCheck running = runningCheck;
         if (running != null && c.peak >= running.peak + PREEMPT_PEAK_MARGIN) running.cancelled = true;
         if (!worker.submit(StageWorker.KIND_WAKE, queued -> {
@@ -1518,6 +1593,19 @@ final class VoiceEngine implements PcmSink {
         boolean heard = end != LocalCommandSpotter.WAKE_NOT_HEARD;
         c.by = heard ? (kws.lastWakeWasPersonal() ? "kwsp" : "kws") : null;
         long firstMs = SystemClock.elapsedRealtime() - started;
+        // The enrolled people's own takes: a few ms of DTW over stage 1's frames, allowed under media too.
+        if (!heard && !c.cancelled && c.match != null && c.featFrames > 0) {
+            VoiceMatch.Verdict v = c.match.check(c.feats, c.featFrames, cancel);
+            if (v != null) {
+                c.tmplD = v.distance;
+                c.tmplThr = v.threshold;
+                if (v.accepted) {
+                    heard = true;
+                    c.by = "tmpl";
+                    end = LocalCommandSpotter.WAKE_END_UNKNOWN;
+                }
+            }
+        }
         // Accents the keyword model misses are often transcribed correctly; either one is enough.
         if (!heard && !c.cancelled && n > 0 && c.sttAllowed && c.stt != null) {
             boolean[] said = new boolean[1];
@@ -1563,7 +1651,7 @@ final class VoiceEngine implements PcmSink {
         String by = c.by;
         noteCheck(heard, by, c.level, c.gain, c.tookMs,
                 heard && !"stt".equals(by) ? null : CommandTranscriber.logSafe(c.text, 40), c.media,
-                c.peak, c.echo, c.queuedMs);
+                c.peak, c.echo, c.queuedMs, c.tmplD, c.tmplThr);
         if (!heard) {
             rejectedWakes.incrementAndGet();
             // Under media a rejected check is followed by a short refractory so the verifier is
@@ -3967,12 +4055,12 @@ final class VoiceEngine implements PcmSink {
         enrollSeenId = id;
         long age = System.currentTimeMillis() - c.enrollRequestedAt;
         if (Math.abs(age) > ENROLL_REQUEST_MAX_AGE_MS) {
-            postEnrollEnd(id, null, "expired", false);
+            postEnrollEnd(id, null, "expired", false, null);
             return;
         }
         if (wake == null || spotter == null) {
             noteEnroll(id, "failed", 0, "unavailable");
-            postEnrollEnd(id, null, "unavailable", false);
+            postEnrollEnd(id, null, "unavailable", false, null);
             return;
         }
         long now = SystemClock.elapsedRealtime();
@@ -3983,8 +4071,12 @@ final class VoiceEngine implements PcmSink {
         enrollMusic = c.enrollRequestMusic;
         VoiceAssistantConfig.PersonalVoice prior = VoiceAssistantConfig.findVoice(c.personalVoices, c.enrollRequestVoice);
         enrollPrevious = prior == null ? java.util.Collections.<String>emptyList() : prior.lines;
+        enrollMatchAt = prior == null ? 0L : prior.matchAt;
+        enrollVoice = c.enrollRequestVoice;
+        enrollPriorCutoff = prior != null && prior.model.equals(wake.modelId()) ? prior.cutoff : Double.NaN;
         enrollTakes.clear();
         enrollPeaks.clear();
+        enrollMatchTakes.clear();
         enrollPrompts = 0;
         if (!enrollMusic) startDecoderLoad();
         // Takes are recorded with media held exactly as a command turn holds it, except over music.
@@ -4072,6 +4164,8 @@ final class VoiceEngine implements PcmSink {
             int end = Math.min(enrollLen, enrollLastLoud + ENROLL_TAIL_SAMPLES);
             enrollTakes.add(java.util.Arrays.copyOf(enrollBuf, end));
             enrollPeaks.add(enrollTakePeak);
+            VoiceMatch.Take t = enrollMatchTake(end);
+            if (t != null) enrollMatchTakes.add(t);
             enrollWaitFrom = now;
         }
         // A click or a cough is not a take: keep listening for the same one, no new chime.
@@ -4089,6 +4183,50 @@ final class VoiceEngine implements PcmSink {
                 overlay.text(R.string.voice_enroll_next, take, WakeEnrollment.TAKES));
         noteEnroll(enrollId, "recording", take, null);
         host.onActivity();
+    }
+
+    /**
+     * The take's stage-1 frames: the detector heard every enrollment chunk, so the take's {@code enrollLen}
+     * samples are its newest frames (less the ones after {@code end}); speech began near {@code enrollOnset}.
+     */
+    private VoiceMatch.Take enrollMatchTake(int end) {
+        if (wake == null) return null;
+        int step = com.overdrive.app.voice.wake.MicroFrontend.SAMPLE_RATE / 100;
+        int frames = Math.min(WakeWordDetector.FEATURE_RING_FRAMES, Math.max(0, (enrollLen - 2 * step) / step));
+        short[] f = new short[frames * com.overdrive.app.voice.wake.MicroFrontend.NUM_CHANNELS];
+        int got = wake.copyFeatures(f, frames);
+        int keep = got - (enrollLen - end) / step;
+        int onset = (enrollOnset - (enrollLen - got * step - 2 * step)) / step;
+        return keep <= 0 ? null : VoiceMatch.Take.of(f, keep, Math.max(0, onset),
+                enrollMusic ? VoiceMatch.KIND_MUSIC : VoiceMatch.KIND_QUIET);
+    }
+
+    /**
+     * This training's templates merged with the voice's earlier ones of the other kind, calibrated and
+     * written to the app-private file the voice record will reference; null when too few takes or no threshold.
+     */
+    private VoiceMatch.Saved learnMatch(String voice, long priorAt, List<VoiceMatch.Take> fresh) {
+        if (fresh.size() < WakeEnrollment.MIN_TAKES) return null;
+        VoiceMatch.Saved prior = priorAt > 0 ? readMatch(voice, priorAt) : null;
+        List<VoiceMatch.Take> takes = VoiceMatch.merge(fresh,
+                prior == null ? java.util.Collections.<VoiceMatch.Take>emptyList() : prior.takes);
+        float thr = VoiceMatch.calibrate(takes);
+        if (Float.isNaN(thr)) return null;
+        VoiceMatch.Saved saved = new VoiceMatch.Saved(voice, System.currentTimeMillis(), thr, takes);
+        if (dry != null) return saved;
+        File dir = matchDir();
+        try {
+            if (!dir.isDirectory() && !dir.mkdirs()) return null;
+            File tmp = new File(dir, voice + "-" + saved.at + ".tmp");
+            try (java.io.FileOutputStream out = new java.io.FileOutputStream(tmp)) {
+                out.write(saved.encode());
+                out.getFD().sync();
+            }
+            return tmp.renameTo(new File(dir, voice + "-" + saved.at + ".bin")) ? saved : null;
+        } catch (Exception e) {
+            Log.w(TAG, "voice match save failed: " + e.getMessage());
+            return null;
+        }
     }
 
     private void tickEnroll(long now) {
@@ -4119,13 +4257,26 @@ final class VoiceEngine implements PcmSink {
         final List<short[]> raw = new ArrayList<>(enrollTakes);
         final float[] peaks = new float[enrollTakes.size()];
         for (int i = 0; i < peaks.length; i++) peaks[i] = enrollPeaks.get(i);
+        final String id = enrollId;
+        final String voice = enrollVoice;
+        final long priorAt = enrollMatchAt;
+        final List<VoiceMatch.Take> fresh = new ArrayList<>(enrollMatchTakes);
         if (enrollMusic) {
             WakeEnrollment.Result music = WakeEnrollment.overMusic(enrollPeaks);
             submitMedia(() -> dumpEnrollTakes(raw, peaks, music, true));
-            endEnroll(music, music.reason);
+            if (!music.ok()) {
+                endEnroll(music, music.reason);
+                return;
+            }
+            // The takes over music become this voice's music templates (file I/O off this thread).
+            submitMedia(() -> {
+                VoiceMatch.Saved saved = learnMatch(voice, priorAt, fresh);
+                post(() -> {
+                    if (phase == ENROLL && id.equals(enrollId)) endEnroll(music, null, saved);
+                });
+            });
             return;
         }
-        final String id = enrollId;
         final List<short[]> normed = new ArrayList<>();
         for (int i = 0; i < enrollTakes.size(); i++) {
             short[] pcm = enrollTakes.get(i).clone();
@@ -4137,6 +4288,7 @@ final class VoiceEngine implements PcmSink {
         final LocalCommandSpotter kws = spotter;
         final DecoderLoad load = enrollDecoderLoad;
         final List<String> previous = enrollPrevious;
+        final double priorCutoff = enrollPriorCutoff;
         // Its own thread: the io executor keeps renewing the media duck meanwhile.
         Thread learn = new Thread(() -> {
             WakeEnrollment.Result result = null;
@@ -4162,11 +4314,18 @@ final class VoiceEngine implements PcmSink {
             } finally {
                 if (load != null) load.abandon();
             }
+            // Takes no keyword line hears still teach voice match: saved keeping the voice's earlier lines and cutoff.
+            VoiceMatch.Saved saved = null;
+            if (result != null && (result.ok() || WakeEnrollment.REASON_INCONSISTENT.equals(result.reason))) {
+                saved = learnMatch(voice, priorAt, fresh);
+                if (saved != null && !result.ok()) result = result.voiceMatchOnly(previous, priorCutoff);
+            }
             dumpEnrollTakes(raw, peaks, result, false);
             final WakeEnrollment.Result done = result;
+            final VoiceMatch.Saved match = saved;
             post(() -> {
                 if (phase == ENROLL && id.equals(enrollId)) {
-                    endEnroll(done, done == null ? "unavailable" : done.reason);
+                    endEnroll(done, done == null ? "unavailable" : done.reason, match);
                 }
             });
         }, "VoiceEnrollLearn");
@@ -4236,6 +4395,10 @@ final class VoiceEngine implements PcmSink {
 
     /** Applies and reports a result (or a failure) and returns to listening for the wake word. */
     private void endEnroll(WakeEnrollment.Result result, String reason) {
+        endEnroll(result, reason, null);
+    }
+
+    private void endEnroll(WakeEnrollment.Result result, String reason, VoiceMatch.Saved match) {
         if (phase != ENROLL) return;
         String id = enrollId;
         long now = SystemClock.elapsedRealtime();
@@ -4244,7 +4407,7 @@ final class VoiceEngine implements PcmSink {
             spotter.setPersonalWake(String.join("/", result.lines));
             wake.setCutoffOverride(Double.isNaN(result.cutoff) ? Float.NaN : (float) result.cutoff);
         }
-        postEnrollEnd(id, result, ok ? null : reason, enrollMusic);
+        postEnrollEnd(id, result, ok ? null : reason, enrollMusic, ok ? match : null);
         int text = ok ? R.string.voice_enroll_done
                 : "cancelled".equals(reason) ? R.string.voice_overlay_cancelled : R.string.voice_enroll_failed;
         overlay.finish(ok ? VoiceOrbView.STATE_SUCCESS : VoiceOrbView.STATE_ERROR, overlay.text(text), 2500);
@@ -4253,6 +4416,7 @@ final class VoiceEngine implements PcmSink {
         noteEnroll(id, ok ? "saved" : "failed", enrollTakes.size(), ok ? null : reason);
         enrollTakes.clear();
         enrollPeaks.clear();
+        enrollMatchTakes.clear();
         enrollId = null;
         enrollMusic = false;
         if (enrollDecoderLoad != null) {
@@ -4287,7 +4451,8 @@ final class VoiceEngine implements PcmSink {
     }
 
     /** {@code save} with the learned lines, or {@code fail} with the reason, to the daemon. */
-    private void postEnrollEnd(String id, WakeEnrollment.Result result, String reason, boolean music) {
+    private void postEnrollEnd(String id, WakeEnrollment.Result result, String reason, boolean music,
+                               VoiceMatch.Saved match) {
         if (id == null || id.isEmpty()) return;
         JSONObject body = new JSONObject();
         try {
@@ -4313,6 +4478,10 @@ final class VoiceEngine implements PcmSink {
                 JSONArray peaks = new JSONArray();
                 for (Float f : result.peaks) peaks.put(round2(f));
                 body.put("decodes", new JSONArray(result.decodes)).put("peaks", peaks);
+            }
+            if (match != null) {
+                body.put("match", new JSONObject().put("at", match.at).put("takes", match.takes.size())
+                        .put("thr", Math.round(match.threshold * 1000f) / 1000.0));
             }
         } catch (Exception e) {
             return;
@@ -4842,7 +5011,7 @@ final class VoiceEngine implements PcmSink {
     }
 
     private void noteCheck(boolean heard, String by, float level, float gain, int ms, String text,
-                           boolean media, float peak, float echo, int queuedMs) {
+                           boolean media, float peak, float echo, int queuedMs, float tmplD, float tmplThr) {
         try {
             JSONObject check = new JSONObject()
                     .put("at", System.currentTimeMillis())
@@ -4857,6 +5026,11 @@ final class VoiceEngine implements PcmSink {
             // Echo likeness of the trigger window (car array under media) and the worker queue wait.
             if (!Float.isNaN(echo)) check.put("echo", round2(echo));
             if (queuedMs > 0) check.put("qMs", queuedMs);
+            // Voice match: the best voice's distance (capped) and its threshold.
+            if (!Float.isNaN(tmplD)) {
+                check.put("tmplD", Math.round(Math.min(tmplD, 9.99f) * 1000f) / 1000.0)
+                        .put("tmplThr", Math.round(tmplThr * 1000f) / 1000.0);
+            }
             synchronized (diagLock) {
                 lastCheck = check;
                 if (checkLog.size() >= MAX_QUEUED_CHECKS) {

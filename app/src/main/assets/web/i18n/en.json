@@ -6292,6 +6292,7 @@
     "enroll_voice_main": "Main voice",
     "enroll_voice_trained": "{name}: trained {when}",
     "enroll_voice_music": "{name}: trained {when}, tuned for music",
+    "enroll_voice_rematch": "train again to add voice match",
     "enroll_voice_forget": "Forget",
     "enroll_voices_count": "{count} of {max} voices trained.",
     "enroll_full": "Four voices are trained. Forget one first.",

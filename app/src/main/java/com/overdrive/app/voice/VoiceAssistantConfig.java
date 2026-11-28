@@ -133,6 +133,8 @@ public final class VoiceAssistantConfig {
     public static final int VOICE_NAME_MAX_CHARS = 24;
     /** Per voice. */
     public static final int PERSONAL_WAKE_MAX_LINES = 6;
+    /** Voice-match templates kept per voice: a normal and a with-music training of 4 takes each. */
+    public static final int VOICE_MATCH_MAX_TAKES = 8;
     public static final int PERSONAL_WAKE_MAX_LINE_CHARS = 160;
     /*
      * Hidden tuning knobs (POST /api/voice/config only, not in the UI); docs/VOICE_ASSISTANT.md.
@@ -264,9 +266,17 @@ public final class VoiceAssistantConfig {
         public final long trainedAt;
         /** Wake model (manifest {@code model_id}) the cutoffs were measured on; "" before ids existed. */
         public final String model;
+        /** Voice-match templates: the app-private file of this training time ({@code match.at}), 0 for none. */
+        public final long matchAt;
+        public final int matchTakes;
 
         public PersonalVoice(String id, String name, java.util.List<String> lines, double cutoff,
                              double mediaCutoff, long trainedAt, String model) {
+            this(id, name, lines, cutoff, mediaCutoff, trainedAt, model, 0L, 0);
+        }
+
+        public PersonalVoice(String id, String name, java.util.List<String> lines, double cutoff,
+                             double mediaCutoff, long trainedAt, String model, long matchAt, int matchTakes) {
             this.id = id;
             this.name = name;
             this.lines = lines;
@@ -274,6 +284,9 @@ public final class VoiceAssistantConfig {
             this.mediaCutoff = mediaCutoff;
             this.trainedAt = trainedAt;
             this.model = isModelId(model) ? model : "";
+            boolean match = matchAt > 0 && matchTakes > 0;
+            this.matchAt = match ? matchAt : 0L;
+            this.matchTakes = match ? Math.min(matchTakes, VOICE_MATCH_MAX_TAKES) : 0;
         }
 
         /** The persisted form inside {@code personalWake.voices}. */
@@ -285,10 +298,30 @@ public final class VoiceAssistantConfig {
                 if (!Double.isNaN(mediaCutoff)) out.put("mediaCutoff", mediaCutoff);
                 if (trainedAt > 0) out.put("trainedAt", trainedAt);
                 if (!model.isEmpty()) out.put("model", model);
+                if (matchAt > 0) out.put("match", new JSONObject().put("at", matchAt).put("takes", matchTakes));
             } catch (Exception ignored) {
             }
             return out;
         }
+    }
+
+    /** {@code match} of a stored voice or an enrollment report: {@code {at, takes}}, or null. */
+    public static long[] matchRef(JSONObject holder) {
+        JSONObject m = holder == null ? null : holder.optJSONObject("match");
+        if (m == null) return null;
+        long at = m.optLong("at", 0L);
+        int takes = m.optInt("takes", 0);
+        if (at <= 0 || takes < 1 || takes > VOICE_MATCH_MAX_TAKES) return null;
+        return new long[] {at, takes};
+    }
+
+    /** The voices' template references ({@code id@at}), so a new training re-applies the config. */
+    static String matchKey(java.util.List<PersonalVoice> voices) {
+        StringBuilder out = new StringBuilder();
+        for (PersonalVoice v : voices) {
+            if (v.matchAt > 0) out.append(v.id).append('@').append(v.matchAt).append(';');
+        }
+        return out.toString();
     }
 
     /** {@code personalWake.voices}, or the single unnamed voice stored before voices had names. */
@@ -324,7 +357,9 @@ public final class VoiceAssistantConfig {
         long trainedAt = Math.max(0L, v.optLong("trainedAt", 0L));
         // A training that needed nothing learned still names the voice on the settings page.
         if (lines.isEmpty() && Double.isNaN(cutoff) && Double.isNaN(media) && trainedAt == 0L) return null;
-        return new PersonalVoice(id, name, lines, cutoff, media, trainedAt, v.optString("model", ""));
+        long[] match = matchRef(v);
+        return new PersonalVoice(id, name, lines, cutoff, media, trainedAt, v.optString("model", ""),
+                match == null ? 0L : match[0], match == null ? 0 : (int) match[1]);
     }
 
     public static PersonalVoice findVoice(java.util.List<PersonalVoice> voices, String id) {
@@ -474,7 +509,8 @@ public final class VoiceAssistantConfig {
             org.json.JSONArray voices = new org.json.JSONArray();
             for (PersonalVoice v : personalVoices) {
                 JSONObject item = new JSONObject().put("id", v.id).put("name", v.name)
-                        .put("lines", v.lines.size()).put("music", !Double.isNaN(v.mediaCutoff));
+                        .put("lines", v.lines.size()).put("music", !Double.isNaN(v.mediaCutoff))
+                        .put("match", v.matchAt > 0);
                 if (v.trainedAt > 0) item.put("trainedAt", v.trainedAt);
                 voices.put(item);
             }
@@ -621,7 +657,8 @@ public final class VoiceAssistantConfig {
                 && sensitivity.equals(other.sensitivity)
                 && commandLanguage.equals(other.commandLanguage)
                 && personalWakeLines.equals(other.personalWakeLines)
-                && sameDouble(personalWakeCutoff, other.personalWakeCutoff);
+                && sameDouble(personalWakeCutoff, other.personalWakeCutoff)
+                && matchKey(personalVoices).equals(matchKey(other.personalVoices));
     }
 
     private static boolean sameDouble(double a, double b) {

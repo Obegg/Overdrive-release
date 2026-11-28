@@ -42,6 +42,8 @@ public final class WakeWordDetector implements AutoCloseable {
     static final float MIN_MEDIA_CUTOFF = 0.20f;
     private static final int MAX_MODEL_BYTES = 4 << 20;
     private static final int MAX_MANIFEST_BYTES = 64 << 10;
+    /** Frontend frames kept for voice match: 5.12 s, an enrollment take with its lead. */
+    public static final int FEATURE_RING_FRAMES = 512;
 
     private final String wakeWord;
     private final String modelId;
@@ -67,6 +69,9 @@ public final class WakeWordDetector implements AutoCloseable {
     private volatile boolean candidateMode;
     private volatile float candidatePeak;
     private boolean closed;
+    private final short[] featureRing = new short[FEATURE_RING_FRAMES * MicroFrontend.NUM_CHANNELS];
+    private int featurePos;
+    private int featureFrames;
 
     WakeWordDetector(String wakeWord, float manifestCutoff, int windowSize, int stepMs,
                      StreamingModel wakeModel) {
@@ -299,6 +304,22 @@ public final class WakeWordDetector implements AutoCloseable {
             }
             lastProbability = 0f;
             peakProbability = 0f;
+            featureFrames = 0;
+        }
+    }
+
+    /**
+     * The last {@code maxFrames} frontend frames since the last reset, oldest first, as
+     * {@link MicroFrontend#NUM_CHANNELS} values each (unsigned 16-bit); returns how many were copied.
+     */
+    public int copyFeatures(short[] dst, int maxFrames) {
+        synchronized (this) {
+            int n = Math.min(Math.min(maxFrames, featureFrames), dst.length / MicroFrontend.NUM_CHANNELS);
+            for (int i = 0; i < n; i++) {
+                int src = Math.floorMod(featurePos - n + i, FEATURE_RING_FRAMES) * MicroFrontend.NUM_CHANNELS;
+                System.arraycopy(featureRing, src, dst, i * MicroFrontend.NUM_CHANNELS, MicroFrontend.NUM_CHANNELS);
+            }
+            return n;
         }
     }
 
@@ -310,6 +331,10 @@ public final class WakeWordDetector implements AutoCloseable {
     }
 
     private boolean onSlice(int[] features) {
+        int base = featurePos * MicroFrontend.NUM_CHANNELS;
+        for (int i = 0; i < MicroFrontend.NUM_CHANNELS; i++) featureRing[base + i] = (short) features[i];
+        featurePos = (featurePos + 1) % FEATURE_RING_FRAMES;
+        if (featureFrames < FEATURE_RING_FRAMES) featureFrames++;
         boolean fresh = wake.push(features);
         if (!decider.onSlice(fresh, wake.last, true)) return false;
         if (!decider.candidateMode()) wake.reset();
