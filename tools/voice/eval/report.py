@@ -9,7 +9,7 @@ from collections import defaultdict
 import numpy as np
 
 COND_ORDER = ['quiet', 'road20', 'road10', 'road5', 'road0', 'music_ser+10', 'music_ser0', 'music_ser-10',
-              'music_field', 'music_untracked', 'roomir_road15']
+              'music_field', 'music_untracked', 'roomir_road15', 'car_doubletalk']
 SCENES = ['libri_direct', 'libri_car', 'music', 'talk_radio', 'car_music']
 
 
@@ -57,6 +57,8 @@ def summarize(results, bench=None):
             r = S['recall'][fe].setdefault(b['cond'], {'n': 0, 'wake': 0, 'stage1': 0, 'kinds': defaultdict(lambda: [0, 0]),
                                                        'gap_fa': 0, 'gap_hours': 0.0, 'by': defaultdict(int)})
             for u in b['fe'][fe]['utts']:
+                if u.get('by') == 'tmpl':
+                    groups[(b['cond'], 'by_tmpl')][0] += 1
                 if u.get('group') == 'accented':
                     # eval-only accented group: reported on its own, kept out of the condition rows
                     groups[(b['cond'], 'accented')][0] += u['wake']
@@ -186,6 +188,20 @@ def render(S):
             vals = [g.get(f'{c}|{k}') for c in ('quiet', 'road10', 'music_ser0')]
             cells.append(' / '.join(fmt(pct(*v), 0, '%') if v else '-' for v in vals))
         w(f'| {fe} | ' + ' | '.join(cells) + ' |')
+    w('')
+    w('### Recall by voice source, every condition (say / en_IN / accented; tmpl = utterances voice match woke)\n')
+    w('| condition | ' + ' | '.join(f'{fe} say | {fe} en_IN | {fe} accented | {fe} tmpl' for fe in fes if fe != 'direct') + ' |')
+    w('|---|' + '---|---|---|---|' * len([f for f in fes if f != 'direct']))
+    for c in COND_ORDER:
+        row = []
+        for fe in fes:
+            if fe == 'direct':
+                continue
+            g = S['by_group'].get(fe, {})
+            cells = [fmt(pct(*g[f'{c}|{k}']), 0, '%') if g.get(f'{c}|{k}') else '-' for k in ('say', 'en_IN', 'accented')]
+            row += cells + [str(g.get(f'{c}|by_tmpl', [0])[0]) if any(x != '-' for x in cells) else '-']
+        if any(x != '-' for x in row):
+            w(f'| {c} | ' + ' | '.join(row) + ' |')
     w('')
     w('### Which stage-2 check accepted (quiet)\n')
     for fe in fes:

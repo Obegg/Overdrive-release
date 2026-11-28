@@ -69,6 +69,7 @@
         enroll_voice_main: 'Main voice',
         enroll_voice_trained: '{name}: trained {when}',
         enroll_voice_music: '{name}: trained {when}, tuned for music',
+        enroll_voice_rematch: 'train again to add voice match',
         enroll_voice_forget: 'Forget',
         enroll_voices_count: '{count} of {max} voices trained.',
         enroll_full: 'Four voices are trained. Forget one first.',
@@ -457,7 +458,7 @@
                 label.textContent = t(voice.music ? 'enroll_voice_music' : 'enroll_voice_trained', {
                     name: voice.name || t('enroll_voice_main'),
                     when: voice.trainedAt ? formatWakeTime(voice.trainedAt) : ''
-                });
+                }) + (voice.match === false ? ' · ' + t('enroll_voice_rematch') : '');
                 var forget = document.createElement('button');
                 forget.type = 'button';
                 forget.className = 'btn btn-secondary';

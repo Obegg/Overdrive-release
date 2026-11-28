@@ -45,7 +45,43 @@ MEDIA_SCENES = ('music', 'talk_radio', 'car_music')
 G = {}
 
 
-def init_worker(repo, data, fe_names, use_stt, smart):
+def voice_key(m):
+    """gen_enroll.voice_key: the enrolled person an utterance belongs to."""
+    return m['engine'] + '|' + str(m['voice']) + ('|' + m['pron'] if m.get('pron') else '')
+
+
+def enroll_task(task):
+    """One voice's enrollment (gen_enroll.py takes) in a quiet parked car, through every front-end: the takes'
+    stage-1 frames as the engine keeps them (lead, word, 0.3 s tail)."""
+    import zlib
+    import microfrontend as mf
+    import voicematch as vm
+    key, takes = task
+    seed = zlib.crc32(key.encode()) & 0x7FFFFFFF
+    rng = np.random.default_rng(seed)
+    talker = cs.IRBank(G['data'], seed).talker('driver')
+    speech, layout, pos = [], [], 2 * RATE
+    for t in takes:
+        x = load_mono(os.path.join(G['data'], t['path']))
+        lead = int(rng.uniform(0.5, 1.5) * RATE)
+        speech.append((x, pos))
+        layout.append((pos + t['speech_start'], pos + t['speech_end'], lead))
+        pos += len(x) + int(rng.uniform(2.5, 3.5) * RATE)
+    n = pos + RATE
+    noise, _ = G['noise'].get(rng, n, 'car')
+    x4, _ = cs.mix(rng, n, speech=speech, talker_ir=talker, speech_dbfs=float(rng.uniform(-36, -28)), noise=noise,
+                   snr_db=30)
+    P = vm.Params(G['repo'])
+    out = {}
+    for fe in G['fes']:
+        f = mf.MicroFrontend().process(fe.run(x4)[0])
+        fr = lambda s: max(0, (s - 480) // 160)  # noqa: E731
+        tk = [vm.Take(P, f[fr(a - lead):fr(b + int(0.3 * RATE)) + 1]) for a, b, lead in layout]
+        out[fe.name] = vm.enrolled(P, key, tk)
+    return key, out
+
+
+def init_worker(repo, data, fe_names, use_stt, smart, voices=None):
     import cascade
     import endpoint
     import frontends
@@ -59,6 +95,8 @@ def init_worker(repo, data, fe_names, use_stt, smart):
     G['irs'] = None
     G['noise'] = cs.NoiseBank(data)
     G['music'] = cs.MusicBank(data)
+    # voice match: {fe: {voice key: voicematch.Voice}} (--voice-match), else None
+    G['vm'] = voices
 
 
 def libri_files(data, split):
@@ -71,15 +109,24 @@ def load_mono(path):
     return x if x.ndim == 1 else x.mean(axis=1)
 
 
-def run_cascade(pcm, utt_windows=None, media=False):
+def run_cascade(pcm, utt_windows=None, media=False, voices_at=None):
     """Stage 1 + stage 2 over one processed stream. Returns per-trigger records and timing. ``media``: media
-    plays (speech-to-text never runs on a wake trigger, as in VoiceEngine.checkWake)."""
+    plays (speech-to-text never runs on a wake trigger, as in VoiceEngine.checkWake). ``voices_at(check)``: the
+    enrolled voices a check is matched against (voice match), or None."""
     s1, s2 = G['s1'], G['s2']
     accepted = []
+    scale = s1.manifest_cutoff / 0.45
 
     def skip(ev):
-        heard, by, text = s2.check(pcm[:ev['check']], peak=ev['peak'], media=media, weak=ev.get('weak', False))
+        voices = voices_at(ev['check']) if voices_at else None
+        frames = s1.raw[:max(0, (ev['check'] - 480) // 160 + 1)] if voices else None
+        heard, by, text = s2.check(pcm[:ev['check']], peak=ev['peak'], media=media, weak=ev.get('weak', False),
+                                   voices=voices, frames=frames, scale=scale)
         ev.update(heard=heard, by=by, text=(text or '')[:60])
+        if s2.last_tmpl:
+            ev['tm'] = [round(s2.last_tmpl[1], 4), round(s2.last_tmpl[2], 4)]
+            if len(voices) > 1:
+                ev['tma'] = s2.last_tmpl_all
         if s2.features:
             ev['f'] = s2.last_features
         if heard:
@@ -190,7 +237,16 @@ def positives_block(task):
     media = cond_c.get('ser') is not None or bool(cond_c.get('car'))
     for fe in G['fes']:
         mono, fe_s, _ = fe.run(x4)
-        events, timing = run_cascade(mono, media=media)
+        own = (G['vm'] or {}).get(fe.name) or {}
+
+        def voices_at(check, own=own):
+            # the utterance's own voice is enrolled (the car's one person); gaps hear no one
+            for u, (p, ln) in zip(utts, layout):
+                if p <= check <= p + ln + int(1.6 * RATE):
+                    v = own.get(voice_key(u))
+                    return [v] if v else None
+            return None
+        events, timing = run_cascade(mono, media=media, voices_at=voices_at if own else None)
         res_utts = []
         for u, (p, ln) in zip(utts, layout):
             a, b = p + u['speech_start'], p + u['speech_end']
@@ -199,6 +255,8 @@ def positives_block(task):
             r = {'id': u['path'], 'kind': u['kind'], 'engine': u['engine'].split(':')[0], 'accent': u['accent'],
                  'group': u.get('group', u['engine'].split(':')[0]),
                  'stage1': bool(s1_hit), 'wake': bool(acc), 'by': acc[0]['by'] if acc else None,
+                 'enrolled': bool(own.get(voice_key(u))),
+                 'tm': [e['tm'] for e in events if 'tm' in e and a <= e['check'] <= b + int(1.6 * RATE)][:3],
                  'latency_ms': int((acc[0]['check'] - b) * 1000 / RATE) if acc else None}
             if G['s2'].features:
                 r['ev'] = [e['f'] for e in events if 'f' in e and a <= e['check'] <= b + int(1.6 * RATE)]
@@ -279,8 +337,9 @@ def stream_block(task):
     scene, block = task['scene'], task['block']
     x4, direct, info, n = negative_mix(G['data'], scene, task['seed'], task['seconds'], task.get('files', ()),
                                        G['noise'], G['music'])
+    every = lambda name: (lambda check, v=[x for x in ((G['vm'] or {}).get(name) or {}).values() if x]: v or None)  # noqa: E731
     if direct is not None:
-        events, timing = run_cascade(direct)
+        events, timing = run_cascade(direct, voices_at=every('speex') if G['vm'] else None)
         return {'scene': scene, 'block': block, 'seconds': n / RATE, 'info': info,
                 'fe': {'direct': summarize(events, timing, 0.0, direct)}}
     out = {'scene': scene, 'block': block, 'seconds': n / RATE, 'info': info, 'fe': {}}
@@ -289,7 +348,7 @@ def stream_block(task):
         if scene == 'erle':
             out['fe'][fe.name] = {'fe_s': fe_s, **erle(x4, mono)}
             continue
-        events, timing = run_cascade(mono, media=scene in MEDIA_SCENES)
+        events, timing = run_cascade(mono, media=scene in MEDIA_SCENES, voices_at=every(fe.name) if G['vm'] else None)
         out['fe'][fe.name] = summarize(events, timing, fe_s, mono)
     return out
 
@@ -312,6 +371,7 @@ def summarize(events, timing, fe_s, mono):
     return {'triggers': len(events), 'false_accepts': len(acc), 'fa_by': [e['by'] for e in acc],
             'fa_text': [e['text'] for e in acc][:10], 'trigger_peaks': [e['peak'] for e in events][:2000],
             'trigger_checks': [int(e['check']) for e in events][:2000], 'fe_s': fe_s,
+            'trigger_tm': [e.get('tm') for e in events][:2000], 'trigger_tma': [e.get('tma') for e in events][:2000],
             'trigger_feats': [e['f'] for e in events if 'f' in e][:2000], **timing}
 
 
@@ -371,6 +431,9 @@ def main():
     ap.add_argument('--fa-hours', type=float, default=1.0, help='hours each of libri_car / music / talk_radio')
     ap.add_argument('--no-stt', action='store_true')
     ap.add_argument('--accented', action='store_true', help='add the accented eval group (gen_accented.py)')
+    ap.add_argument('--voice-match', action='store_true',
+                    help='enroll every gen_enroll.py voice (quiet car, 4 takes): positives match their own voice, '
+                         'negatives every voice')
     ap.add_argument('--no-smart-turn', action='store_true')
     ap.add_argument('--jobs', type=int, default=4)
     ap.add_argument('--seed', type=int, default=7)
@@ -383,15 +446,32 @@ def main():
     tasks.sort(key=lambda t: -(t.get('seconds') or 400))
     print(f'{len(tasks)} tasks, fe={a.fe}, smart_turn={smart}', flush=True)
     t0 = time.time()
+    voices = None
+    if a.voice_match:
+        man = [json.loads(line) for line in open(os.path.join(a.data, 'tts', 'enroll_manifest.jsonl'))]
+        by_key = {}
+        for m in man:
+            by_key.setdefault(m['key'], []).append(m)
+        fes = a.fe.split(',') + (['speex'] if 'libri_direct' in (a.scenes or 'libri_direct') and 'speex' not in a.fe else [])
+        voices = {}
+        with Pool(min(4, a.jobs), initializer=init_worker, initargs=(a.repo, a.data, fes, False, None)) as pool:
+            for key, per in pool.imap_unordered(enroll_task, sorted(by_key.items())):
+                for fe, v in per.items():
+                    voices.setdefault(fe, {})[key] = v
+        print('enrolled ' + ', '.join(f'{fe}: {sum(1 for v in d.values() if v)}/{len(d)}' for fe, d in voices.items())
+              + f' voices in {time.time() - t0:.0f}s', flush=True)
     results = []
     with Pool(min(4, a.jobs), initializer=init_worker,
-              initargs=(a.repo, a.data, a.fe.split(','), not a.no_stt, smart)) as pool:
+              initargs=(a.repo, a.data, a.fe.split(','), not a.no_stt, smart, voices)) as pool:
         for i, r in enumerate(pool.imap_unordered(run_task, tasks)):
             results.append(r)
             print(f'[{i + 1}/{len(tasks)}] {r["scene"]} {r.get("cond", "")} #{r["block"]} '
                   f'{r["seconds"]:.0f}s audio in {r["wall_s"]:.0f}s', flush=True)
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
-    meta = {'args': vars(a), 'smart_turn': smart, 'wall_s': time.time() - t0,
+    vm_meta = {fe: {k: [round(v.threshold, 4), round(v.loo, 4)] if v else None
+                    for k, v in sorted(d.items())} for fe, d in (voices or {}).items()}
+    order = {fe: [k for k, v in d.items() if v] for fe, d in (voices or {}).items()}  # trigger_tma's columns
+    meta = {'args': vars(a), 'smart_turn': smart, 'wall_s': time.time() - t0, 'voices': vm_meta, 'voice_order': order,
             'host': os.uname().machine, 'when': time.strftime('%Y-%m-%d %H:%M')}
     with open(a.out, 'w') as f:
         json.dump({'meta': meta, 'blocks': results}, f)

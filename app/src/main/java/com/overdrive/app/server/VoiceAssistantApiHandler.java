@@ -179,6 +179,11 @@ public final class VoiceAssistantApiHandler {
                 }
                 String model = input.optString("model", "");
                 if (!VoiceAssistantConfig.isModelId(model)) model = "";
+                // Voice-match templates (an app-private file per training): this training's, else the earlier ones.
+                long[] match = VoiceAssistantConfig.matchRef(input);
+                if (match == null && prior != null && prior.matchAt > 0) match = new long[] {prior.matchAt, prior.matchTakes};
+                long matchAt = match == null ? 0L : match[0];
+                int matchTakes = match == null ? 0 : (int) match[1];
                 if ("save".equals(action) && current.enrollRequestMusic) {
                     double c = input.optDouble("mediaCutoff", Double.NaN);
                     if (Double.isNaN(c) || c < VoiceAssistantConfig.WAKE_CUTOFF_UNDER_MEDIA_MIN
@@ -192,12 +197,12 @@ public final class VoiceAssistantApiHandler {
                             current.enrollRequestVoice, name,
                             prior == null ? java.util.Collections.<String>emptyList() : prior.lines,
                             sameModel ? prior.cutoff : Double.NaN, media,
-                            prior == null ? System.currentTimeMillis() : prior.trainedAt, model);
+                            prior == null ? System.currentTimeMillis() : prior.trainedAt, model, matchAt, matchTakes);
                     patch.put("personalWake", VoiceAssistantConfig.personalWakeJson(
                             withVoice(current.personalVoices, voice)));
                     summary = "over music saved: cutoff under media " + media
                             + ", takes " + clamp(input.optInt("takes"), 0, 10)
-                            + " (heard " + clamp(input.optInt("hits"), 0, 10) + ")";
+                            + " (heard " + clamp(input.optInt("hits"), 0, 10) + ")" + matchSummary(input);
                 } else if ("save".equals(action)) {
                     JSONObject personal = personalWakeFrom(input);
                     if (personal == null) {
@@ -210,14 +215,14 @@ public final class VoiceAssistantApiHandler {
                             current.enrollRequestVoice, name, lines,
                             personal.has("cutoff") ? personal.getDouble("cutoff") : Double.NaN,
                             prior != null && prior.model.equals(model) ? prior.mediaCutoff : Double.NaN,
-                            personal.getLong("trainedAt"), model);
+                            personal.getLong("trainedAt"), model, matchAt, matchTakes);
                     patch.put("personalWake", VoiceAssistantConfig.personalWakeJson(
                             withVoice(current.personalVoices, voice)));
                     summary = "saved: " + learned.length() + " lines, cutoff "
                             + (personal.has("cutoff") ? personal.optDouble("cutoff") : "normal")
                             + ", takes " + clamp(input.optInt("takes"), 0, 10)
                             + " (built-in heard " + clamp(input.optInt("baseHits"), 0, 10)
-                            + ", with learned " + clamp(input.optInt("hits"), 0, 10) + ")";
+                            + ", with learned " + clamp(input.optInt("hits"), 0, 10) + ")" + matchSummary(input);
                 } else {
                     String reason = input.optString("reason", action);
                     summary = action + ": " + (reason.matches("[a-z_]{1,24}") ? reason : action);
@@ -274,6 +279,16 @@ public final class VoiceAssistantApiHandler {
         }
         if (!replaced) out.add(voice);
         return out;
+    }
+
+    /** ", voice match N takes thr T" when the training stored templates. */
+    static String matchSummary(JSONObject input) {
+        long[] match = VoiceAssistantConfig.matchRef(input);
+        if (match == null) return "";
+        JSONObject m = input.optJSONObject("match");
+        double thr = m == null ? Double.NaN : m.optDouble("thr", Double.NaN);
+        return ", voice match " + match[1] + " takes"
+                + (Double.isNaN(thr) ? "" : String.format(java.util.Locale.US, " thr %.2f", thr));
     }
 
     /** " | takes: <tokens> (p=0.62); …" from the app's report: phones and syllables only, capped. */
@@ -525,6 +540,12 @@ public final class VoiceAssistantApiHandler {
                         .putOpt("p", unitProbability(c))
                         .putOpt("echo", probability(c, "echo")));
                 copyClamped(c, out.getJSONObject(out.length() - 1), "qMs", 0, 60_000);
+                double d = c.optDouble("tmplD", Double.NaN);
+                double thr = c.optDouble("tmplThr", Double.NaN);
+                if (d >= 0 && d < 10 && thr > 0 && thr < 10) {
+                    out.getJSONObject(out.length() - 1).put("tmplD", Math.round(d * 1000.0) / 1000.0)
+                            .put("tmplThr", Math.round(thr * 1000.0) / 1000.0);
+                }
             }
             if (out.length() > 0) clean.put("checks", out);
         }
@@ -789,6 +810,10 @@ public final class VoiceAssistantApiHandler {
                 if (v.has("media")) line.append(" media");
                 if (v.has("p")) line.append(String.format(java.util.Locale.US, " p=%.2f", v.optDouble("p")));
                 if (v.has("echo")) line.append(String.format(java.util.Locale.US, " echo=%.2f", v.optDouble("echo")));
+                if (v.has("tmplD")) {
+                    line.append(String.format(java.util.Locale.US, " tmpl d=%.3f thr=%.3f",
+                            v.optDouble("tmplD"), v.optDouble("tmplThr")));
+                }
                 if (v.has("qMs")) line.append(" queued ").append(v.optInt("qMs")).append(" ms");
                 if (v.has("text")) line.append(" heard \"").append(v.optString("text")).append('"');
             }

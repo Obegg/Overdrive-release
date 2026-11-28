@@ -9,6 +9,7 @@ import time
 import numpy as np
 
 import microfrontend as mf
+import voicematch as vm
 
 RATE = 16000
 ENGINE_CHUNK = 1024                  # VoiceEngine reads the ring in 1024-sample chunks
@@ -197,8 +198,10 @@ class Stage1:
 
     def triggers(self, pcm, skip=None):
         """Engine-timed stage-1 events: list of dicts {fire, check, peak}. ``skip(check)`` returns a
-        sample before which the engine would not be listening (a turn after an accept), or None."""
-        feats = mf.quantize(mf.MicroFrontend().process(pcm), self.divisor, self.zero_point)
+        sample before which the engine would not be listening (a turn after an accept), or None.
+        The raw frontend frames stay in self.raw (voice match reads the check window's frames)."""
+        self.raw = mf.MicroFrontend().process(pcm)
+        feats = mf.quantize(self.raw, self.divisor, self.zero_point)
         dec = WakeDecider(self.window, round(REFRACTORY_MS / self.step_ms), round(SECOND_CHANCE_MS / self.step_ms),
                           self.cutoff, self.candidates)
         self._new()
@@ -327,6 +330,9 @@ class Stage2:
         self.lines = [wake_phone_lines(line)[0] for line in self.keywords.split('/') if '#0.10' in line]
         self.features = os.environ.get('OD_FEATURES') == '1'
         self._phones = None
+        # VoiceMatch (absent in older trees = no voice match); the gate is in reference units
+        self.vm = vm.Params(repo) if os.path.exists(os.path.join(repo, vm.SRC)) else None
+        self.last_tmpl = None
 
     def verify(self, pcm, keywords=None):
         """Returns the wake word's end (samples), -2 when heard without timestamps, -1 when not heard."""
@@ -384,10 +390,12 @@ class Stage2:
             r.decode_stream(s)
         return [t.strip() for t in r.get_result_all(s).tokens if t.strip()]
 
-    def check(self, history, peak=0.0, media=False, weak=False):
+    def check(self, history, peak=0.0, media=False, weak=False, voices=None, frames=None, scale=1.0):
         """VoiceEngine.verifyOnWorker on ``history`` (audio up to the check, any length): (heard, by, text).
-        KWS, speech-to-text (never under media), the phone decode within phone_d of a wake line, then the
-        1.8 s second look. With OD_FEATURES=1 every variant runs and self.last_features holds them."""
+        KWS, voice match against ``voices`` over stage 1's ``frames`` (``scale``: model / reference units),
+        speech-to-text (never under media), the phone decode within phone_d of a wake line, then the 1.8 s
+        second look. With OD_FEATURES=1 every variant runs and self.last_features holds them."""
+        self.last_tmpl = None
         buf = history[-VERIFY_SAMPLES:]
         if len(buf) == 0:
             return False, None, None
@@ -402,6 +410,15 @@ class Stage2:
             return self._features(g, gs, peak, media, buf)
         if self.verify(g) != -1:
             return True, 'kws', None
+        lvl = 20 * np.log10(max(speech_level(buf), 0.1) / 32768)
+        if (voices and frames is not None and self.vm is not None and len(frames)
+                and peak >= self.vm.GATE_P_REF * scale - 1e-4 and lvl >= self.vm.MIN_LEVEL_DBFS):
+            t = time.perf_counter()
+            self.last_tmpl_all = []
+            self.last_tmpl = vm.check(self.vm, voices, frames, self.last_tmpl_all)
+            self.ms['kws'] += (time.perf_counter() - t) * 1000
+            if self.last_tmpl and self.last_tmpl[1] <= self.last_tmpl[2]:
+                return True, 'tmpl', None
         text = None
         if self.stt is not None and not media:
             text = self.transcribe(g)

@@ -6276,6 +6276,7 @@
     "enroll_voice_main": "קול ראשי",
     "enroll_voice_trained": "{name}: אומן {when}",
     "enroll_voice_music": "{name}: אומן {when}, מכוונן למוזיקה",
+    "enroll_voice_rematch": "אמנו שוב כדי להוסיף התאמת קול",
     "enroll_voice_forget": "שכחה",
     "enroll_voices_count": "{count} מתוך {max} קולות אומנו.",
     "enroll_full": "כבר אומנו ארבעה קולות. יש לשכוח אחד קודם.",

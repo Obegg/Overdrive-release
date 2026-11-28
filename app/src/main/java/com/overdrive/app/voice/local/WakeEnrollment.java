@@ -97,8 +97,24 @@ public final class WakeEnrollment {
             this.peaks = Collections.unmodifiableList(p);
         }
 
+        private Result(List<String> lines, double cutoff, Result of) {
+            this.lines = lines;
+            this.cutoff = cutoff;
+            this.takes = of.takes;
+            this.baseHits = of.baseHits;
+            this.hits = of.hits;
+            this.reason = null;
+            this.decodes = of.decodes;
+            this.peaks = of.peaks;
+        }
+
         public boolean ok() {
             return reason == null;
+        }
+
+        /** This failed training saved for its voice-match templates alone: the voice keeps its earlier lines and cutoff. */
+        public Result voiceMatchOnly(List<String> keptLines, double keptCutoff) {
+            return new Result(keptLines == null ? Collections.<String>emptyList() : keptLines, keptCutoff, this);
         }
     }
 
