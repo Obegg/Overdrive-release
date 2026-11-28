@@ -414,7 +414,8 @@ class Stage2:
         if (voices and frames is not None and self.vm is not None and len(frames)
                 and peak >= self.vm.GATE_P_REF * scale - 1e-4 and lvl >= self.vm.MIN_LEVEL_DBFS):
             t = time.perf_counter()
-            self.last_tmpl = vm.check(self.vm, voices, frames)
+            self.last_tmpl_all = []
+            self.last_tmpl = vm.check(self.vm, voices, frames, self.last_tmpl_all)
             self.ms['kws'] += (time.perf_counter() - t) * 1000
             if self.last_tmpl and self.last_tmpl[1] <= self.last_tmpl[2]:
                 return True, 'tmpl', None

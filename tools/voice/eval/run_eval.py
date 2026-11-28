@@ -125,6 +125,8 @@ def run_cascade(pcm, utt_windows=None, media=False, voices_at=None):
         ev.update(heard=heard, by=by, text=(text or '')[:60])
         if s2.last_tmpl:
             ev['tm'] = [round(s2.last_tmpl[1], 4), round(s2.last_tmpl[2], 4)]
+            if len(voices) > 1:
+                ev['tma'] = s2.last_tmpl_all
         if s2.features:
             ev['f'] = s2.last_features
         if heard:
@@ -369,7 +371,7 @@ def summarize(events, timing, fe_s, mono):
     return {'triggers': len(events), 'false_accepts': len(acc), 'fa_by': [e['by'] for e in acc],
             'fa_text': [e['text'] for e in acc][:10], 'trigger_peaks': [e['peak'] for e in events][:2000],
             'trigger_checks': [int(e['check']) for e in events][:2000], 'fe_s': fe_s,
-            'trigger_tm': [e.get('tm') for e in events][:2000],
+            'trigger_tm': [e.get('tm') for e in events][:2000], 'trigger_tma': [e.get('tma') for e in events][:2000],
             'trigger_feats': [e['f'] for e in events if 'f' in e][:2000], **timing}
 
 
@@ -466,7 +468,10 @@ def main():
             print(f'[{i + 1}/{len(tasks)}] {r["scene"]} {r.get("cond", "")} #{r["block"]} '
                   f'{r["seconds"]:.0f}s audio in {r["wall_s"]:.0f}s', flush=True)
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
-    meta = {'args': vars(a), 'smart_turn': smart, 'wall_s': time.time() - t0,
+    vm_meta = {fe: {k: [round(v.threshold, 4), round(v.loo, 4), round(v.ambient, 4)] if v else None
+                    for k, v in sorted(d.items())} for fe, d in (voices or {}).items()}
+    order = {fe: [k for k, v in d.items() if v] for fe, d in (voices or {}).items()}  # trigger_tma's columns
+    meta = {'args': vars(a), 'smart_turn': smart, 'wall_s': time.time() - t0, 'voices': vm_meta, 'voice_order': order,
             'host': os.uname().machine, 'when': time.strftime('%Y-%m-%d %H:%M')}
     with open(a.out, 'w') as f:
         json.dump({'meta': meta, 'blocks': results}, f)

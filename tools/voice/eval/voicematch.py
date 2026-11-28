@@ -14,7 +14,7 @@ KIND_QUIET, KIND_MUSIC = 0, 1
 
 
 class Params:
-    NAMES = ('DECIMATE', 'COSINE', 'MAX_STEP', 'GATE_P_REF', 'MIN_LEVEL_DBFS', 'MARGIN', 'FLOOR', 'CAP', 'AMBIENT',
+    NAMES = ('DECIMATE', 'COSINE', 'FRAME_MEAN', 'MAX_STEP', 'GATE_P_REF', 'MIN_LEVEL_DBFS', 'MARGIN', 'FLOOR', 'CAP', 'AMBIENT',
              'TRIM_REL', 'TRIM_PAD', 'MIN_TEMPLATE_FRAMES', 'MAX_TEMPLATE_FRAMES', 'WINDOW_FRAMES', 'REPORT_UP_TO',
              'AMBIENT_GUARD_FRAMES', 'MAX_TAKES')
 
@@ -35,10 +35,12 @@ class Params:
 
 
 def prepare(P, frames, a, b):
-    """VoiceMatch.prepare: DECIMATE frames averaged, /256, unit length for cosine (float32)."""
+    """VoiceMatch.prepare: DECIMATE frames averaged, /256, the frame mean removed, unit length for cosine."""
     n = (b - a) // P.DECIMATE
     x = frames[a:a + n * P.DECIMATE].astype(np.float32).reshape(n, P.DECIMATE, CHANNELS).sum(axis=1)
     x = x / np.float32(256 * P.DECIMATE)
+    if P.FRAME_MEAN:
+        x = x - x.sum(axis=1, keepdims=True) / np.float32(CHANNELS)
     if P.COSINE:
         x = x / (np.sqrt((x * x).sum(axis=1, keepdims=True)) + np.float32(1e-3))
     return x.astype(np.float32)
@@ -103,8 +105,13 @@ class Take:
 
 def calibrate(P, takes):
     """VoiceMatch.calibrate: worst leave-one-out take x (1 + MARGIN) in [FLOOR, CAP], under AMBIENT x the cabin."""
+    return calibration(P, takes)[0]
+
+
+def calibration(P, takes):
+    """(threshold, worst leave-one-out distance, nearest cabin distance); the last two let a sweep re-derive it."""
     if len(takes) < 2:
-        return float('nan')
+        return float('nan'), float('nan'), float('nan')
     tpl = [prepare(P, t.frames, t.start, t.end) for t in takes]
     worst, ambient = 0.0, float(INF)
     for i, t in enumerate(takes):
@@ -115,17 +122,18 @@ def calibrate(P, takes):
             cab = prepare(P, t.frames, 0, quiet)
             ambient = min([ambient] + [distance(P, x, cab) for x in tpl])
     if worst >= INF:
-        return float('nan')
+        return float('nan'), float('nan'), ambient
     thr = np.float32(max(P.FLOOR, min(P.CAP, np.float32(worst) * np.float32(1 + P.MARGIN))))
     if ambient < INF:
         thr = min(thr, np.float32(P.AMBIENT) * np.float32(ambient))
-    return float(thr) if thr >= P.FLOOR - 1e-6 else float('nan')
+    return (float(thr) if thr >= P.FLOOR - 1e-6 else float('nan')), worst, ambient
 
 
 class Voice:
-    def __init__(self, P, key, takes, threshold):
+    def __init__(self, P, key, takes, threshold, loo=float('nan'), ambient=float('nan')):
         self.key = key
         self.threshold = threshold
+        self.loo, self.ambient = loo, ambient
         self.templates = [prepare(P, t.frames, t.start, t.end) for t in takes]
 
 
@@ -134,13 +142,13 @@ def enrolled(P, key, takes):
     ok = [t for t in takes if t.ok]
     if len(ok) < 3:
         return None
-    thr = calibrate(P, ok[:P.MAX_TAKES])
-    return None if np.isnan(thr) else Voice(P, key, ok[:P.MAX_TAKES], thr)
+    thr, loo, amb = calibration(P, ok[:P.MAX_TAKES])
+    return None if np.isnan(thr) else Voice(P, key, ok[:P.MAX_TAKES], thr, loo, amb)
 
 
-def check(P, voices, frames):
+def check(P, voices, frames, every=None):
     """VoiceMatch.check over the last WINDOW_FRAMES frames: (voice key, distance, threshold) of the voice nearest
-    to its threshold, or None."""
+    to its threshold, or None. ``every`` (a list) receives each voice's distance, for sweeps."""
     win = frames[max(0, len(frames) - P.WINDOW_FRAMES):]
     test = prepare(P, win, 0, len(win))
     if len(test) == 0:
@@ -150,6 +158,8 @@ def check(P, voices, frames):
         d = float(INF)
         for tp in v.templates:
             d = min(d, distance(P, tp, test, min(d, P.REPORT_UP_TO * v.threshold)))
+        if every is not None:
+            every.append(round(d, 4))
         if best is None or d / v.threshold < best[1] / best[2]:
             best = (v.key, d, v.threshold)
     return best
