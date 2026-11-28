@@ -4,6 +4,7 @@ import android.app.ActivityManager;
 import android.content.Context;
 import android.os.Debug;
 import android.os.Process;
+import android.os.SystemClock;
 
 import com.overdrive.app.logging.DaemonLogger;
 
@@ -126,6 +127,7 @@ public class PerformanceMonitor {
     private final Object samplingLock = new Object();
     
     // SOTA: Client connection tracking for on-demand polling
+    // Last heartbeat in elapsed realtime milliseconds, not epoch time.
     private final java.util.concurrent.ConcurrentHashMap<String, Long> activeClients = new java.util.concurrent.ConcurrentHashMap<>();
     private ScheduledExecutorService clientCleanupScheduler;
     
@@ -198,7 +200,7 @@ public class PerformanceMonitor {
         }
         
         boolean wasEmpty = activeClients.isEmpty();
-        activeClients.put(clientId, System.currentTimeMillis());
+        activeClients.put(clientId, SystemClock.elapsedRealtime());
         
         logger.debug("Client connected: " + clientId + " (total: " + activeClients.size() + ")");
         
@@ -216,7 +218,7 @@ public class PerformanceMonitor {
      */
     public synchronized void clientHeartbeat(String clientId) {
         if (clientId != null && activeClients.containsKey(clientId)) {
-            activeClients.put(clientId, System.currentTimeMillis());
+            activeClients.put(clientId, SystemClock.elapsedRealtime());
         } else if (clientId != null) {
             // New client via heartbeat - register it
             clientConnected(clientId);
@@ -273,7 +275,7 @@ public class PerformanceMonitor {
      * Remove clients that haven't sent a heartbeat within the timeout period.
      */
     private void cleanupStaleClients() {
-        long now = System.currentTimeMillis();
+        long now = SystemClock.elapsedRealtime();
         java.util.List<String> staleClients = new java.util.ArrayList<>();
         
         for (java.util.Map.Entry<String, Long> entry : activeClients.entrySet()) {
