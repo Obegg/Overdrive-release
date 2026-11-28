@@ -30,7 +30,7 @@
                      timestamp + native scrubber off-screen. We render our own
                      transport chrome below this surface (see .video-transport)
                      which lives outside the zooming subtree. -->
-                <video id="videoPlayer" autoplay muted playsinline webkit-playsinline preload="auto"></video>
+                <video id="videoPlayer" muted playsinline webkit-playsinline preload="auto"></video>
                 <!-- Playback-time lens dewarp canvas. Hidden by default; events.js shows it for raw clips. -->
                 <canvas id="videoDewarpCanvas" aria-hidden="true"></canvas>
                 <!-- Quadrant selector. The four AVM cameras are baked into a
@@ -110,7 +110,7 @@
                     </span>
                     <button type="button" class="video-ctrl-btn" id="videoMuteBtn" data-i18n-attr="title:events.player_mute;aria-label:events.player_mute" title="Mute" aria-label="Mute">
                         <svg id="videoMuteIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <!-- Initial state — muted (the player starts muted for autoplay). -->
+                            <!-- Initial state — muted until the listening preference is applied. -->
                             <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
                             <line x1="23" y1="9" x2="17" y2="15"/>
                             <line x1="17" y1="9" x2="23" y2="15"/>

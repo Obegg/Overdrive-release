@@ -66,11 +66,8 @@ BYD.events = {
     _placeSearchTimer: null,
     _placeSearchWired: false,
 
-    // Last observed player.muted value, used by the volumechange handler in
-    // playVideo() to debounce slider-drag events from actual mute-button
-    // transitions. Initialized lazily on first playVideo so we can tell the
-    // first listener invocation apart from a real transition.
-    _lastMutedState: null,
+    // A clip owns its pending settings lookup and initial play attempt.
+    _clipAudioStart: null,
 
     // Quadrant zoom state. Recordings are written as a single 2x2 mosaic
     // (Front=TL, Right=TR, Rear=BL, Left=BR by GpuMosaicRecorder convention);
@@ -2535,6 +2532,7 @@ BYD.events = {
     },
 
     openRecording(rec) {
+        this._clipAudioStart = null;
         this._cancelPlaylistRequest();
         document.getElementById('videoTitle').textContent = rec.filename;
         document.getElementById('videoDate').innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg> ' + (rec.dateFormatted || '');
@@ -2579,44 +2577,66 @@ BYD.events = {
         // CSS rule installed below; closeVideo() removes it.
         document.documentElement.classList.add('video-modal-open');
 
-        // Browser autoplay policy requires muted=true to start without a
-        // user gesture. After play begins we apply the user's persisted
-        // mute preference (or the audio-recording-enabled fallback for
-        // first-run). The mute-icon SVG re-paints via the volumechange
-        // listener registered in bindTransport.
-        const self = this;
-        player.oncanplay = function() {
-            player.play().catch(function() {});
-            try {
-                // Saved listening level (1..100); muting is kept separately below.
-                const savedVolume = localStorage.getItem('byd.events.volume');
-                const level = savedVolume === null ? NaN : Number(savedVolume);
-                if (isFinite(level) && level >= 1 && level <= 100) player.volume = level / 100;
-                const stored = localStorage.getItem('byd.events.unmuted');
-                if (stored !== null) {
-                    player.muted = stored !== '1';
-                } else {
-                    // Loopback fetch (~5ms). Keep muted while in flight —
-                    // autoplay is gated on it, so the muted→unmuted flip
-                    // is imperceptible.
-                    player.muted = true;
-                    self.getAudioRecordingEnabled().then(function(enabled) {
-                        if (enabled) player.muted = false;
-                    });
-                }
-            } catch (e) {
-                player.muted = true;
-            }
-            self._lastMutedState = player.muted;
-            player.oncanplay = null;
-        };
+        this._startClipPlayback(player);
 
         // Load event-timeline marker overlay for this recording (the
         // scrubber itself stays visible even with no markers).
         this.loadTimeline(rec, player);
     },
     
+    _startClipPlayback(player) {
+        const start = this._clipAudioStart = {};
+        const current = () => this._clipAudioStart === start;
+        const finish = () => { if (current()) this._clipAudioStart = null; };
+        const play = (muted) => {
+            if (!current()) return;
+            player.muted = muted;
+            // Set the desired mute state BEFORE play; do not unmute a muted autoplay.
+            Promise.resolve(player.play()).then(finish, (error) => {
+                if (!current()) return;
+                if (error && error.name === 'NotAllowedError' && !player.muted) {
+                    // A browser may block audible autoplay (e.g. playlist advance).
+                    // This fallback is not a change to the saved listening preference.
+                    player.muted = true;
+                    Promise.resolve(player.play()).then(finish, finish);
+                } else {
+                    finish();
+                }
+            });
+        };
+        let stored = null;
+        try {
+            const level = Number(localStorage.getItem('byd.events.volume'));
+            if (isFinite(level) && level >= 1 && level <= 100) player.volume = level / 100;
+            stored = localStorage.getItem('byd.events.unmuted');
+        } catch (_) { /* storage may be unavailable */ }
+        if (stored !== null) {
+            // Stay in the original click's activation window where possible.
+            play(stored !== '1');
+            return;
+        }
+        player.muted = true;
+        // Do not let an unavailable settings endpoint prevent clip playback.
+        let timer;
+        Promise.race([
+            this.getAudioRecordingEnabled(),
+            new Promise(resolve => { timer = setTimeout(() => resolve(false), 3000); })
+        ]).then(enabled => {
+            clearTimeout(timer);
+            play(!enabled);
+        });
+    },
+
+    _takeClipAudioControl(player) {
+        const start = this._clipAudioStart;
+        this._clipAudioStart = null;
+        // An explicit audio gesture during startup can start the clip now,
+        // without being overridden by the pending lookup or play rejection.
+        if (start && player.paused) Promise.resolve(player.play()).catch(function() {});
+    },
+
     closeVideo() {
+        this._clipAudioStart = null;
         this._cancelPlaylistRequest();
         const playlistSettings = document.getElementById('videoPlaylistSettings');
         if (playlistSettings) playlistSettings.open = false;
@@ -2643,11 +2663,6 @@ BYD.events = {
         this.hideQuadrantBarNow();
         const bar = document.getElementById('quadrantBar');
         if (bar) bar.classList.remove('hidden');
-        // Reset the cross-modal mute snapshot so the next playVideo's
-        // first volumechange fires with a clean reference. Without this,
-        // a stale value from the prior clip can mis-classify the next
-        // clip's auto-applied mute as a "user change" and re-persist it.
-        this._lastMutedState = null;
         // SOTA: Clean up timeline
         this.destroyTimeline();
         if (this._externalRecordingKey) {
@@ -3189,6 +3204,7 @@ BYD.events = {
 
         const onPlayPause = (e) => {
             if (e) e.stopPropagation();
+            self._clipAudioStart = null;
             if (videoEl.paused) {
                 const p = videoEl.play();
                 if (p && typeof p.catch === 'function') p.catch(function() {});
@@ -3203,8 +3219,8 @@ BYD.events = {
             // Persist explicit user gesture so the next clip honors it.
             try {
                 localStorage.setItem('byd.events.unmuted', videoEl.muted ? '0' : '1');
-                self._lastMutedState = videoEl.muted;
             } catch (_) {}
+            self._takeClipAudioControl(videoEl);
             refreshMuteIcon();
         };
 
@@ -3224,8 +3240,8 @@ BYD.events = {
             try {
                 if (level > 0) localStorage.setItem('byd.events.volume', String(level));
                 localStorage.setItem('byd.events.unmuted', videoEl.muted ? '0' : '1');
-                self._lastMutedState = videoEl.muted;
             } catch (_) {}
+            self._takeClipAudioControl(videoEl);
             refreshMuteIcon();
         };
         const onVolumeClick = (e) => { if (e) e.stopPropagation(); };
@@ -3242,8 +3258,8 @@ BYD.events = {
             try {
                 if (level > 0) localStorage.setItem('byd.events.volume', String(level));
                 localStorage.setItem('byd.events.unmuted', videoEl.muted ? '0' : '1');
-                self._lastMutedState = videoEl.muted;
             } catch (_) {}
+            self._takeClipAudioControl(videoEl);
             refreshMuteIcon();
             syncVolumeSlider();
         };
