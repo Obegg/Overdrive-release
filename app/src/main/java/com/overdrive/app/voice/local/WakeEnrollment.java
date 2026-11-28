@@ -222,12 +222,14 @@ public final class WakeEnrollment {
         for (Float p : peaks) {
             if (p == null || p < MEDIA_ATTEMPT_MIN_PEAK) continue;
             takes.add(new Take(new short[1], Collections.<String>emptyList(), p));
-            min = Math.min(min, p);
+            // A take under the floor never fires at any allowed cutoff: lowering for it only adds music triggers.
+            if (p >= MEDIA_CUTOFF_MIN) min = Math.min(min, p);
         }
         if (takes.size() < MIN_TAKES) {
             return new Result(Collections.<String>emptyList(), Double.NaN, takes.size(), 0, 0, REASON_TOO_FEW, takes);
         }
-        float c = Math.max(MEDIA_CUTOFF_MIN, Math.min(MEDIA_CUTOFF_MAX, min - MEDIA_CUTOFF_MARGIN));
+        float c = min == Float.MAX_VALUE ? MEDIA_CUTOFF_MAX
+                : Math.max(MEDIA_CUTOFF_MIN, Math.min(MEDIA_CUTOFF_MAX, min - MEDIA_CUTOFF_MARGIN));
         return new Result(Collections.<String>emptyList(), Math.round(c * 100f) / 100.0, takes.size(), 0,
                 takes.size(), null, takes);
     }
@@ -235,7 +237,8 @@ public final class WakeEnrollment {
     /** Just under the weakest take when that is below the model's cutoff; NaN keeps the normal one. */
     static double cutoffFor(List<Take> takes) {
         float min = Float.MAX_VALUE;
-        for (Take t : takes) min = Math.min(min, t.stage1Peak);
+        // Takes under the floor cannot fire at any allowed cutoff; they would only drag it to the floor.
+        for (Take t : takes) if (t.stage1Peak >= CUTOFF_MIN) min = Math.min(min, t.stage1Peak);
         if (min == Float.MAX_VALUE || min >= CUTOFF_MAX) return Double.NaN;
         float c = Math.max(CUTOFF_MIN, Math.min(CUTOFF_MAX, min - CUTOFF_MARGIN));
         return Math.round(c * 100f) / 100.0;
