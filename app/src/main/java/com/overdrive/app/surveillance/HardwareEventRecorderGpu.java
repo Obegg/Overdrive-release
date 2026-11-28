@@ -1900,7 +1900,7 @@ public class HardwareEventRecorderGpu {
                 + "wedged during teardown) — refusing re-init; trip-safe restart pending");
         }
         try {
-            initOnce();
+            initOnceAfterBackgroundExport();
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             throw interrupted;
@@ -1949,6 +1949,36 @@ public class HardwareEventRecorderGpu {
             return com.overdrive.app.camera.dilink5.DiLink5Platform.isSelected();
         } catch (Throwable t) {
             return false;
+        }
+    }
+
+    /**
+     * {@link #initOnce} with one retry (create + configure + surface + start) after 200 ms, only when
+     * it failed while a background export held hardware codecs within the last second.
+     */
+    /** A codec init stage that did not return within its timeout (message unchanged for logs). */
+    private static final class EncoderInitTimeoutException extends RuntimeException {
+        EncoderInitTimeoutException(String message) {
+            super(message);
+        }
+    }
+
+    private void initOnceAfterBackgroundExport() throws Exception {
+        try {
+            initOnce();
+        } catch (InterruptedException | CpuInputRejectedException | EncoderInitTimeoutException e) {
+            // Timeouts are a wedged codec stage, not a busy codec: never retried here.
+            throw e;
+        } catch (Exception first) {
+            if (teardownWedged || !CameraLoadProbe.backgroundCodecsRecentlyHeld()) throw first;
+            logger.warn("Encoder init failed right after a background export ("
+                + first.getMessage() + ") — retrying once");
+            try { if (inputSurface != null) inputSurface.release(); } catch (Throwable ignored) {}
+            inputSurface = null;
+            try { if (encoder != null) encoder.release(); } catch (Throwable ignored) {}
+            encoder = null;
+            Thread.sleep(200L);
+            initOnce();
         }
     }
 
@@ -2127,7 +2157,7 @@ public class HardwareEventRecorderGpu {
                 }
             }
             createThread.interrupt();
-            throw new RuntimeException("Encoder create timeout - try restarting mediaserver");
+            throw new EncoderInitTimeoutException("Encoder create timeout - try restarting mediaserver");
         }
         if (createError[0] != null) {
             throw createError[0];
@@ -2193,7 +2223,7 @@ public class HardwareEventRecorderGpu {
                 configThread.interrupt();
                 try { encoder.release(); } catch (Exception e) {}
                 encoder = null;
-                throw new RuntimeException("Encoder configure timeout");
+                throw new EncoderInitTimeoutException("Encoder configure timeout");
             }
             if (configError[0] != null) {
                 if (cpuFrames) {
@@ -2259,7 +2289,7 @@ public class HardwareEventRecorderGpu {
                 surfaceThread.interrupt();
                 try { encoder.release(); } catch (Exception e) {}
                 encoder = null;
-                throw new RuntimeException("Surface create timeout");
+                throw new EncoderInitTimeoutException("Surface create timeout");
             }
             if (surfaceError[0] != null) {
                 throw surfaceError[0];
@@ -2320,7 +2350,7 @@ public class HardwareEventRecorderGpu {
                     }
                     inputSurface = null;
                 }
-                throw new RuntimeException("Encoder start timeout - hardware encoder busy or stuck");
+                throw new EncoderInitTimeoutException("Encoder start timeout - hardware encoder busy or stuck");
             }
             if (startError[0] != null) {
                 throw startError[0];
@@ -3413,6 +3443,13 @@ public class HardwareEventRecorderGpu {
         lensTagSupplier = supplier;
     }
 
+    // Recorder-side grid geometry: arg = segment start wall ms (MIN_VALUE: frames proven grid); null = no tag.
+    private volatile java.util.function.LongFunction<org.json.JSONObject> gridTagSupplier;
+
+    public void setGridTagSupplier(java.util.function.LongFunction<org.json.JSONObject> supplier) {
+        gridTagSupplier = supplier;
+    }
+
     // Lens state of a queued CPU frame. STRIP: raw, with the overlay band burned opaque.
     static final int LENS_OTHER = 0;
     static final int LENS_RAW = 1;
@@ -3491,7 +3528,7 @@ public class HardwareEventRecorderGpu {
      * Majority of the segment's frames decides; minority frames only occur at a state edge.
      * The recorder's tag carries the strip height, kept only for strip clips.
      */
-    private void rememberLensTag(String finalPath, boolean raw, boolean strip) {
+    private void rememberLensTag(String finalPath, boolean raw, boolean strip, long segStartWallMs) {
         if (finalPath == null) return;
         org.json.JSONObject tag = null;
         java.util.function.Supplier<org.json.JSONObject> s = lensTagSupplier;
@@ -3500,6 +3537,16 @@ public class HardwareEventRecorderGpu {
         }
         if (tag != null && !strip) tag.remove(LensTag.STRIP);
         LensTag.remember(new File(finalPath), tag);
+        // Raw frames are grid frames; otherwise the grid must predate the clip (pre-roll margin).
+        org.json.JSONObject grid = null;
+        java.util.function.LongFunction<org.json.JSONObject> g = gridTagSupplier;
+        if (g != null && (!raw || tag != null)) {
+            long since = raw ? Long.MIN_VALUE
+                    : segStartWallMs > 0 ? segStartWallMs - LensTag.GRID_PRE_ROLL_MS : 0L;
+            try { grid = g.apply(since); } catch (Throwable ignored) {}
+            if (grid != null) LensTag.finishGrid(grid, tag);
+        }
+        LensTag.rememberGrid(new File(finalPath), grid);
     }
 
     /** True when this encoder takes YUV buffers instead of an input surface. */
@@ -3615,6 +3662,7 @@ public class HardwareEventRecorderGpu {
      */
     public boolean triggerEventRecording(String outputPath, long postRecordDurationMs,
             VideoUploadPolicy uploadPolicy) {
+        CameraLoadProbe.recordingStarting("recording");
         // Format barrier (LOCK-FREE): refuse to build a muxer until the encoder
         // has published its OUTPUT_FORMAT_CHANGED. Run BEFORE startStopLock
         // entry so a 2-s busy poll doesn't block concurrent stopEventRecording
@@ -4539,7 +4587,7 @@ public class HardwareEventRecorderGpu {
             seg.tempFile = tempFile;
             seg.outputPath = outputPath;
             rememberLensTag(outputPath, segLensRawFrames > segLensOtherFrames,
-                    segLensStripFrames * 2 > segLensRawFrames);
+                    segLensStripFrames * 2 > segLensRawFrames, segmentStartTime);
             seg.segmentNumber = segmentNumber;
             seg.ptsOriginUs = ptsOriginUs;
             seg.lastSourcePtsUs = lastSourcePtsUs;
@@ -5332,6 +5380,7 @@ public class HardwareEventRecorderGpu {
      * immediately from live frames.
      */
     public boolean tryReserveManualClip() {
+        CameraLoadProbe.recordingStarting("recording");
         synchronized (startStopLock) {
             if (flushInProgress || manualClipExportInProgress) return false;
             manualClipExportInProgress = true;
@@ -5618,7 +5667,8 @@ public class HardwareEventRecorderGpu {
 
             // No sidecar writer runs for replays: the tag goes on disk here.
             boolean replayRaw = replayLensRaw > replayLensOther;
-            rememberLensTag(outputFile.getAbsolutePath(), replayRaw, replayLensStrip * 2 > replayLensRaw);
+            rememberLensTag(outputFile.getAbsolutePath(), replayRaw, replayLensStrip * 2 > replayLensRaw,
+                    tlExportWallMs - Math.max(0L, lastVideoPtsUs - firstVideoPtsUs) / 1000L);
             if (replayRaw) LensTag.writeSidecarIfAbsent(outputFile);
             double durationSec = lastMuxedVideoPtsUs > 0L
                     ? lastMuxedVideoPtsUs / 1_000_000.0 : 0.0;
@@ -7210,6 +7260,7 @@ public class HardwareEventRecorderGpu {
         final int oldLensStripFrames;
         final long oldFirstPtsUs;
         final long oldLastPtsUs;
+        final long oldSegStartWallMs;
         final long listenerGenAtCommit;
         final SegmentListener listenerAtCommit;
         final com.overdrive.app.geo.GeoSnapshot closedGeoAtCommit;
@@ -7287,6 +7338,7 @@ public class HardwareEventRecorderGpu {
             final long oldLastSourceDrainUs = lastSourceDrainUs;
             final long oldLastAudioPtsUs = lastAudioPtsUs;
             final long oldSegmentStartTime = segmentStartTime;
+            oldSegStartWallMs = oldSegmentStartTime;
             final long oldLastDiskWrittenMs = lastDiskWrittenMs;
             final double prevStartGeoLat = startGeoLat;
             final double prevStartGeoLng = startGeoLng;
@@ -7477,7 +7529,7 @@ public class HardwareEventRecorderGpu {
         // the live volatile is shared across all in-flight finalizers; a
         // later transient hiccup must not poison this fine segment).
         rememberLensTag(oldOutputPath, oldLensRawFrames > oldLensOtherFrames,
-                oldLensStripFrames * 2 > oldLensRawFrames);
+                oldLensStripFrames * 2 > oldLensRawFrames, oldSegStartWallMs);
         finalizeOldSegmentAsync(oldMuxer, oldTemp, oldOutputPath,
                 oldSegmentNumber, oldRecordedFrames, oldFirstPtsUs, oldLastPtsUs,
                 writerAbortedCorrupt, new File(newPath),

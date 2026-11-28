@@ -12,6 +12,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <memory>
 #include <thread>
 #include <vector>
 #if defined(__ANDROID__) || defined(__linux__)
@@ -187,6 +188,163 @@ static inline uint16_t clampU16(double v) {
 // rgba: premultiplied RGBA8 (Android ARGB_8888 memory order), drawn over the
 // top w x h of the frame with bilinear scaling, like the GL overlay pass.
 // Colour math is BT.601 limited range, the encoder's RGB->YUV conversion.
+//
+// The row, column and run helpers below are deliberately not inlined: a full
+// build (prepareOverlay) and a partial one (updateOverlay) run the same compiled
+// code on the same inputs, so they write the same bits under any float flags.
+
+// Horizontal bilinear mapping of one output column; identical for every row.
+struct OverlayColumn {
+    int x0, x1;
+    double wx;
+};
+
+// Vertical bilinear mapping of one output row.
+struct OverlayRow {
+    const uint8_t* r0;
+    const uint8_t* r1;
+    double wy;
+    int y0, y1;
+};
+
+// Bilinear weights on four identical texels return that texel exactly
+// (p + 0 * w == p, fused or not), so a uniform footprint depends only on its
+// colour. Opaque strips are mostly one colour: reuse the last uniform result.
+struct OverlayMemo {
+    uint32_t pix = 0;
+    bool valid = false;
+    uint16_t y = 0, inv = 256;
+    float a = 0.f, u = 0.f, v = 0.f;
+};
+
+// Preserve the original double expression and clamping (no accumulated step).
+__attribute__((noinline))
+static void overlayColumns(OverlayColumn* columns, int bw, int w) {
+    for (int x = 0; x < w; x++) {
+        double fx = ((double) x + 0.5) * bw / w - 0.5;
+        if (fx < 0) fx = 0;
+        if (fx > bw - 1) fx = bw - 1;
+        const int x0 = (int) fx;
+        columns[x] = {x0, x0 + 1 < bw ? x0 + 1 : x0, fx - x0};
+    }
+}
+
+__attribute__((noinline))
+static OverlayRow overlayRow(const uint8_t* rgba, int rowBytes, int bh, int h, int y) {
+    double fy = ((double) y + 0.5) * bh / h - 0.5;
+    if (fy < 0) fy = 0;
+    if (fy > bh - 1) fy = bh - 1;
+    const int y0 = (int) fy;
+    const int y1 = y0 + 1 < bh ? y0 + 1 : y0;
+    return {rgba + (size_t) y0 * rowBytes, rgba + (size_t) y1 * rowBytes, fy - y0, y0, y1};
+}
+
+// Luma entries, and each pixel's alpha and alpha-weighted U/V, for columns
+// [xa, xb) of one output row.
+__attribute__((noinline))
+static void overlayLumaRun(const OverlayRow& row, const OverlayColumn* columns, int xa, int xb,
+                           uint16_t* ty, float* rowA, float* rowU, float* rowV,
+                           OverlayMemo& sharedMemo) {
+    const uint8_t* r0 = row.r0;
+    const uint8_t* r1 = row.r1;
+    const double wy = row.wy;
+    OverlayMemo memo = sharedMemo;
+    for (int x = xa; x < xb; x++) {
+        const OverlayColumn& column = columns[x];
+        const int x0 = column.x0;
+        const int x1 = column.x1;
+        const double wx = column.wx;
+        const uint8_t* p00 = r0 + (size_t) x0 * 4;
+        const uint8_t* p01 = r0 + (size_t) x1 * 4;
+        const uint8_t* p10 = r1 + (size_t) x0 * 4;
+        const uint8_t* p11 = r1 + (size_t) x1 * 4;
+        if ((p00[3] | p01[3] | p10[3] | p11[3]) == 0) {
+            // Premultiplied: zero alpha means zero colour too.
+            ty[x * 2] = 0;
+            ty[x * 2 + 1] = 256;
+            rowA[x] = rowU[x] = rowV[x] = 0.0f;
+            continue;
+        }
+        uint32_t q00, q01, q10, q11;
+        memcpy(&q00, p00, 4);
+        memcpy(&q01, p01, 4);
+        memcpy(&q10, p10, 4);
+        memcpy(&q11, p11, 4);
+        const bool uniform = q00 == q01 && q00 == q10 && q00 == q11;
+        if (uniform && memo.valid && q00 == memo.pix) {
+            ty[x * 2] = memo.y;
+            ty[x * 2 + 1] = memo.inv;
+            rowA[x] = memo.a;
+            rowU[x] = memo.u;
+            rowV[x] = memo.v;
+            continue;
+        }
+        double c[4];
+        for (int ch = 0; ch < 4; ch++) {
+            const double top = p00[ch] + (p01[ch] - p00[ch]) * wx;
+            const double bot = p10[ch] + (p11[ch] - p10[ch]) * wx;
+            c[ch] = top + (bot - top) * wy;
+        }
+        const double a = c[3] / 255.0;
+        const double yv = 16.0 + (65.481 * c[0] + 128.553 * c[1] + 24.966 * c[2]) / 255.0;
+        const double uv = 128.0 + (-37.797 * c[0] - 74.203 * c[1] + 112.0 * c[2]) / 255.0;
+        const double vv = 128.0 + (112.0 * c[0] - 93.786 * c[1] - 18.214 * c[2]) / 255.0;
+        const long a256 = lround(a * 256.0);
+        ty[x * 2] = a256 > 0 ? clampU16(a * yv * 256.0) : 0;
+        ty[x * 2 + 1] = (uint16_t) (256 - (a256 < 0 ? 0 : a256 > 256 ? 256 : a256));
+        rowA[x] = (float) a;
+        rowU[x] = (float) (a * uv);
+        rowV[x] = (float) (a * vv);
+        if (uniform) {
+            memo.pix = q00;
+            memo.valid = true;
+            memo.y = ty[x * 2];
+            memo.inv = ty[x * 2 + 1];
+            memo.a = rowA[x];
+            memo.u = rowU[x];
+            memo.v = rowV[x];
+        }
+    }
+    sharedMemo = memo;
+}
+
+// Chroma entries for cells [xca, xcb) from the two luma rows computed above.
+__attribute__((noinline))
+static void overlayChromaRun(float* const rowA[2], float* const rowU[2], float* const rowV[2],
+                             int xca, int xcb, uint16_t* tc) {
+    for (int xc = xca; xc < xcb; xc++) {
+        const int x = xc * 2;
+        const double a = ((double) rowA[0][x] + rowA[0][x + 1] + rowA[1][x] + rowA[1][x + 1]) * 0.25;
+        // Zero (or rounded-to-zero) alpha is an identity blend. Do not
+        // load/average the two chroma channels when their weights are unused.
+        const long a256 = a == 0.0 ? 0 : lround(a * 256.0);
+        if (a256 <= 0) {
+            tc[xc * 3] = tc[xc * 3 + 1] = 0;
+            tc[xc * 3 + 2] = 256;
+            continue;
+        }
+        const double pu = ((double) rowU[0][x] + rowU[0][x + 1] + rowU[1][x] + rowU[1][x + 1]) * 0.25;
+        const double pv = ((double) rowV[0][x] + rowV[0][x + 1] + rowV[1][x] + rowV[1][x + 1]) * 0.25;
+        tc[xc * 3] = clampU16(pu * 256.0);
+        tc[xc * 3 + 1] = clampU16(pv * 256.0);
+        tc[xc * 3 + 2] = (uint16_t) (256 - (a256 > 256 ? 256 : a256));
+    }
+}
+
+// [first, last + 1) of the entries that blend something (inverse alpha below 256), or {0, 0}.
+static void overlaySpan(const uint16_t* inv, int n, int step, int32_t* span) {
+    int first = 0;
+    while (first < n && inv[(size_t) first * step] == 256) first++;
+    if (first == n) {
+        span[0] = span[1] = 0;
+        return;
+    }
+    int last = n - 1;
+    while (inv[(size_t) last * step] == 256) last--;
+    span[0] = first;
+    span[1] = last + 1;
+}
+
 bool prepareOverlay(const uint8_t* rgba, size_t rgbaCap, int bw, int bh, int rowBytes,
                     uint8_t* out, size_t outCap, int w, int h) {
     const size_t need = overlayBytes(w, h);
@@ -213,106 +371,161 @@ bool prepareOverlay(const uint8_t* rgba, size_t rgbaCap, int bw, int bh, int row
     float* rowU[2] = {scratch + 2 * (size_t) w, scratch + 3 * (size_t) w};
     float* rowV[2] = {scratch + 4 * (size_t) w, scratch + 5 * (size_t) w};
 
-    // The horizontal bilinear mapping is identical for every output row.
-    // Preserve the original double expression and clamping (no accumulated step).
-    struct Column {
-        int x0, x1;
-        double wx;
-    };
-    Column* columns = new (std::nothrow) Column[w];
+    OverlayColumn* columns = new (std::nothrow) OverlayColumn[w];
     if (!columns) {
         delete[] scratch;
         return false;
     }
-    for (int x = 0; x < w; x++) {
-        double fx = ((double) x + 0.5) * bw / w - 0.5;
-        if (fx < 0) fx = 0;
-        if (fx > bw - 1) fx = bw - 1;
-        const int x0 = (int) fx;
-        columns[x] = {x0, x0 + 1 < bw ? x0 + 1 : x0, fx - x0};
-    }
+    overlayColumns(columns, bw, w);
 
+    OverlayMemo memo;
     for (int yc = 0; yc < h / 2; yc++) {
         for (int k = 0; k < 2; k++) {
             const int y = yc * 2 + k;
-            double fy = ((double) y + 0.5) * bh / h - 0.5;
-            if (fy < 0) fy = 0;
-            if (fy > bh - 1) fy = bh - 1;
-            const int y0 = (int) fy;
-            const int y1 = y0 + 1 < bh ? y0 + 1 : y0;
-            const double wy = fy - y0;
-            const uint8_t* r0 = rgba + (size_t) y0 * rowBytes;
-            const uint8_t* r1 = rgba + (size_t) y1 * rowBytes;
-            int first = -1, last = -1;
+            const OverlayRow row = overlayRow(rgba, rowBytes, bh, h, y);
             uint16_t* ty = tabY + (size_t) y * w * 2;
-            for (int x = 0; x < w; x++) {
-                const Column& column = columns[x];
-                const int x0 = column.x0;
-                const int x1 = column.x1;
-                const double wx = column.wx;
-                const uint8_t* p00 = r0 + (size_t) x0 * 4;
-                const uint8_t* p01 = r0 + (size_t) x1 * 4;
-                const uint8_t* p10 = r1 + (size_t) x0 * 4;
-                const uint8_t* p11 = r1 + (size_t) x1 * 4;
-                if ((p00[3] | p01[3] | p10[3] | p11[3]) == 0) {
-                    // Premultiplied: zero alpha means zero colour too.
-                    ty[x * 2] = 0;
-                    ty[x * 2 + 1] = 256;
-                    rowA[k][x] = rowU[k][x] = rowV[k][x] = 0.0f;
-                    continue;
-                }
-                double c[4];
-                for (int ch = 0; ch < 4; ch++) {
-                    const double top = p00[ch] + (p01[ch] - p00[ch]) * wx;
-                    const double bot = p10[ch] + (p11[ch] - p10[ch]) * wx;
-                    c[ch] = top + (bot - top) * wy;
-                }
-                const double a = c[3] / 255.0;
-                const double yv = 16.0 + (65.481 * c[0] + 128.553 * c[1] + 24.966 * c[2]) / 255.0;
-                const double uv = 128.0 + (-37.797 * c[0] - 74.203 * c[1] + 112.0 * c[2]) / 255.0;
-                const double vv = 128.0 + (112.0 * c[0] - 93.786 * c[1] - 18.214 * c[2]) / 255.0;
-                const long a256 = lround(a * 256.0);
-                ty[x * 2] = a256 > 0 ? clampU16(a * yv * 256.0) : 0;
-                ty[x * 2 + 1] = (uint16_t) (256 - (a256 < 0 ? 0 : a256 > 256 ? 256 : a256));
-                if (a256 > 0) {
-                    if (first < 0) first = x;
-                    last = x;
-                }
-                rowA[k][x] = (float) a;
-                rowU[k][x] = (float) (a * uv);
-                rowV[k][x] = (float) (a * vv);
-            }
-            spansY[y * 2] = first < 0 ? 0 : first;
-            spansY[y * 2 + 1] = first < 0 ? 0 : last + 1;
+            overlayLumaRun(row, columns, 0, w, ty, rowA[k], rowU[k], rowV[k], memo);
+            overlaySpan(ty + 1, w, 2, spansY + (size_t) y * 2);
         }
-        int first = -1, last = -1;
         uint16_t* tc = tabC + (size_t) yc * wc * 3;
-        for (int xc = 0; xc < wc; xc++) {
-            const int x = xc * 2;
-            const double a = ((double) rowA[0][x] + rowA[0][x + 1] + rowA[1][x] + rowA[1][x + 1]) * 0.25;
-            // Zero (or rounded-to-zero) alpha is an identity blend. Do not
-            // load/average the two chroma channels when their weights are unused.
-            const long a256 = a == 0.0 ? 0 : lround(a * 256.0);
-            if (a256 <= 0) {
-                tc[xc * 3] = tc[xc * 3 + 1] = 0;
-                tc[xc * 3 + 2] = 256;
-                continue;
-            }
-            const double pu = ((double) rowU[0][x] + rowU[0][x + 1] + rowU[1][x] + rowU[1][x + 1]) * 0.25;
-            const double pv = ((double) rowV[0][x] + rowV[0][x + 1] + rowV[1][x] + rowV[1][x + 1]) * 0.25;
-            tc[xc * 3] = clampU16(pu * 256.0);
-            tc[xc * 3 + 1] = clampU16(pv * 256.0);
-            tc[xc * 3 + 2] = (uint16_t) (256 - (a256 > 256 ? 256 : a256));
-            if (first < 0) first = xc;
-            last = xc;
-        }
-        spansC[yc * 2] = first < 0 ? 0 : first;
-        spansC[yc * 2 + 1] = first < 0 ? 0 : last + 1;
+        overlayChromaRun(rowA, rowU, rowV, 0, wc, tc);
+        overlaySpan(tc + 2, wc, 3, spansC + (size_t) yc * 2);
     }
     delete[] columns;
     delete[] scratch;
     hdr[3] = 1;
     return true;
+}
+
+// Sets every texel's alpha to 255: premultiplied RGB at full alpha is the overlay
+// drawn over black (the opaque recording strip).
+bool forceOpaque(uint8_t* rgba, size_t rgbaCap, int bw, int bh, int rowBytes) {
+    if (!rgba || bw <= 0 || bh <= 0 || rowBytes < bw * 4) return false;
+    if ((uint64_t) (bh - 1) * (uint64_t) rowBytes + (uint64_t) bw * 4u > (uint64_t) rgbaCap) return false;
+    for (int y = 0; y < bh; y++) {
+        uint8_t* alpha = rgba + (size_t) y * rowBytes + 3;
+        for (int x = 0; x < bw; x++) alpha[(size_t) x * 4] = 0xFF;
+    }
+    return true;
+}
+
+// out holds the table prepareOverlay built from prev. Rewrites only the cells whose
+// source texels differ in rgba, leaving exactly the table prepareOverlay(rgba) writes.
+// Returns the chroma cells recomputed (0: same bitmap), or -1 when it cannot run and
+// the caller must rebuild with prepareOverlay; out is untouched in that case.
+int updateOverlay(const uint8_t* prev, size_t prevCap, const uint8_t* rgba, size_t rgbaCap,
+                  int bw, int bh, int rowBytes, uint8_t* out, size_t outCap, int w, int h) {
+    const size_t need = overlayBytes(w, h);
+    if (!prev || !rgba || !out || need == 0 || need > outCap) return -1;
+    if (bw <= 0 || bh <= 0 || rowBytes < bw * 4) return -1;
+    const uint64_t bitmapBytes = (uint64_t) (bh - 1) * (uint64_t) rowBytes + (uint64_t) bw * 4u;
+    if (bitmapBytes > (uint64_t) rgbaCap || bitmapBytes > (uint64_t) prevCap) return -1;
+    if (((uintptr_t) out & 3u) != 0) return -1;
+    int32_t* hdr = (int32_t*) out;
+    if (hdr[0] != kOverlayMagic || hdr[1] != w || hdr[2] != h || hdr[3] != 1) return -1;
+
+    // Changed source rows, and changed columns in tiles of 8 texels (text edits are
+    // narrow). Their product over-covers the changed texels, which is always safe.
+    constexpr int kTile = 8;
+    const int tiles = (bw + kTile - 1) / kTile;
+    const int wc = w / 2, hc = h / 2;
+    // rowsBefore[r] / tilesBefore[t]: changed rows below r / changed tiles below t.
+    int32_t* counts = new (std::nothrow) int32_t[(size_t) bh + tiles + 2];
+    if (!counts) return -1;
+    int32_t* rowsBefore = counts;
+    int32_t* tilesBefore = counts + bh + 1;
+    uint8_t* tileChanged = new (std::nothrow) uint8_t[(size_t) tiles + wc];
+    if (!tileChanged) {
+        delete[] counts;
+        return -1;
+    }
+    uint8_t* cellChanged = tileChanged + tiles;
+    memset(tileChanged, 0, (size_t) tiles);
+    rowsBefore[0] = 0;
+    for (int r = 0; r < bh; r++) {
+        const uint8_t* was = prev + (size_t) r * rowBytes;
+        const uint8_t* now = rgba + (size_t) r * rowBytes;
+        const bool changed = memcmp(was, now, (size_t) bw * 4) != 0;
+        rowsBefore[r + 1] = rowsBefore[r] + (changed ? 1 : 0);
+        if (!changed) continue;
+        for (int t = 0; t < tiles; t++) {
+            if (tileChanged[t]) continue;
+            const int x = t * kTile;
+            const int n = bw - x < kTile ? bw - x : kTile;
+            if (memcmp(was + (size_t) x * 4, now + (size_t) x * 4, (size_t) n * 4) != 0) tileChanged[t] = 1;
+        }
+    }
+    if (rowsBefore[bh] == 0) {
+        delete[] tileChanged;
+        delete[] counts;
+        return 0;
+    }
+    tilesBefore[0] = 0;
+    for (int t = 0; t < tiles; t++) tilesBefore[t + 1] = tilesBefore[t] + tileChanged[t];
+
+    float* scratch = new (std::nothrow) float[(size_t) w * 6];
+    OverlayColumn* columns = new (std::nothrow) OverlayColumn[w];
+    if (!scratch || !columns) {
+        delete[] columns;
+        delete[] scratch;
+        delete[] tileChanged;
+        delete[] counts;
+        return -1;
+    }
+    float* rowA[2] = {scratch, scratch + w};
+    float* rowU[2] = {scratch + 2 * (size_t) w, scratch + 3 * (size_t) w};
+    float* rowV[2] = {scratch + 4 * (size_t) w, scratch + 5 * (size_t) w};
+    overlayColumns(columns, bw, w);
+
+    // A chroma cell covers luma columns 2xc and 2xc + 1; x0 never decreases with x,
+    // so their texels lie in [columns[2xc].x0, columns[2xc + 1].x1].
+    for (int xc = 0; xc < wc; xc++) {
+        const int ta = columns[xc * 2].x0 / kTile;
+        const int tb = columns[xc * 2 + 1].x1 / kTile;
+        cellChanged[xc] = tilesBefore[tb + 1] - tilesBefore[ta] > 0;
+    }
+
+    int32_t* spansY = hdr + 4;
+    int32_t* spansC = spansY + (size_t) h * 2;
+    uint16_t* tabY = (uint16_t*) (spansC + (size_t) hc * 2);
+    uint16_t* tabC = tabY + (size_t) w * h * 2;
+    OverlayMemo memo;
+    int cells = 0;
+    for (int yc = 0; yc < hc; yc++) {
+        const OverlayRow rows[2] = {overlayRow(rgba, rowBytes, bh, h, yc * 2),
+                                    overlayRow(rgba, rowBytes, bh, h, yc * 2 + 1)};
+        // Same argument vertically: the cell's texels lie in rows [rows[0].y0, rows[1].y1].
+        if (rowsBefore[rows[1].y1 + 1] - rowsBefore[rows[0].y0] == 0) continue;
+        uint16_t* tc = tabC + (size_t) yc * wc * 3;
+        bool touched = false;
+        for (int xc = 0; xc < wc;) {
+            if (!cellChanged[xc]) {
+                xc++;
+                continue;
+            }
+            int xe = xc + 1;
+            while (xe < wc && cellChanged[xe]) xe++;
+            for (int k = 0; k < 2; k++) {
+                overlayLumaRun(rows[k], columns, xc * 2, xe * 2,
+                               tabY + (size_t) (yc * 2 + k) * w * 2, rowA[k], rowU[k], rowV[k], memo);
+            }
+            overlayChromaRun(rowA, rowU, rowV, xc, xe, tc);
+            cells += xe - xc;
+            touched = true;
+            xc = xe;
+        }
+        if (!touched) continue;
+        for (int k = 0; k < 2; k++) {
+            const int y = yc * 2 + k;
+            overlaySpan(tabY + (size_t) y * w * 2 + 1, w, 2, spansY + (size_t) y * 2);
+        }
+        overlaySpan(tc + 2, wc, 3, spansC + (size_t) yc * 2);
+    }
+    delete[] columns;
+    delete[] scratch;
+    delete[] tileChanged;
+    delete[] counts;
+    return cells;
 }
 
 static inline uint8_t mix(uint32_t premul, uint32_t inv, uint32_t dst) {
@@ -771,6 +984,143 @@ static void gatherUV(const RemapSource& sr, int n, const int32_t* __restrict lu,
     }
 }
 
+// A separable remap uses the same horizontal coordinates on every row. Plan
+// eight gathers at a time, once per column segment rather than per scanline.
+struct FixedXBlock {
+    int start;
+    uint8_t left[8], right[8];
+    uint16_t fx[8];
+};
+
+static void planFixedX(const int32_t* u, int n, int off, int width, FixedXBlock* blocks) {
+    for (int i = 0; i + 8 <= n; i += 8) {
+        FixedXBlock& block = blocks[i / 8];
+        block.start = -1;
+        if (width < 16) continue;
+        int x[8], next[8], first = width - 16, last = 0;
+        for (int k = 0; k < 8; ++k) {
+            const int uf = clampFx(u[i + k] + off, (width - 1) * 256);
+            x[k] = uf >> 8;
+            next[k] = std::min(x[k] + 1, width - 1);
+            first = std::min(first, x[k]);
+            last = std::max(last, next[k]);
+            block.fx[k] = (uint16_t) (uf & 255);
+        }
+        if (last - first >= 16) continue;
+        block.start = first;
+        for (int k = 0; k < 8; ++k) {
+            block.left[k] = (uint8_t) (x[k] - first);
+            block.right[k] = (uint8_t) (next[k] - first);
+        }
+    }
+}
+
+#ifdef OD_REMAP_NEON
+static uint8x8_t blendFixed8(const FixedXBlock& block, uint8x16_t a, uint8x16_t b, int fy) {
+    const uint8x8_t left = vld1_u8(block.left), right = vld1_u8(block.right);
+    const uint16x8_t fx = vld1q_u16(block.fx);
+    const uint16x8_t ifx = vsubq_u16(vdupq_n_u16(256), fx);
+    const uint16x8_t top = vmlaq_u16(vmulq_u16(vmovl_u8(vqtbl1_u8(a, left)), ifx),
+                                    vmovl_u8(vqtbl1_u8(a, right)), fx);
+    if (fy == 0) return vrshrn_n_u16(top, 8);
+    const uint16x8_t bot = vmlaq_u16(vmulq_u16(vmovl_u8(vqtbl1_u8(b, left)), ifx),
+                                    vmovl_u8(vqtbl1_u8(b, right)), fx);
+    const uint16x8_t wy = vdupq_n_u16((uint16_t) fy), iy = vdupq_n_u16((uint16_t) (256 - fy));
+    const uint32x4_t lo = vmlal_u16(vmull_u16(vget_low_u16(top), vget_low_u16(iy)),
+                                   vget_low_u16(bot), vget_low_u16(wy));
+    const uint32x4_t hi = vmlal_high_u16(vmull_high_u16(top, iy), bot, wy);
+    return vmovn_u16(vcombine_u16(vrshrn_n_u32(lo, 16), vrshrn_n_u32(hi, 16)));
+}
+#endif
+
+static void gatherFixedPlane(const FixedSampleRow& row, int n, const int32_t* u, int off,
+                             const FixedXBlock* blocks, uint8_t* out) {
+    const int maxFx = (row.width - 1) * 256;
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const FixedXBlock& block = blocks[i / 8];
+        if (block.start < 0) {
+            for (int k = 0; k < 8; ++k) out[i + k] = row.sample(clampFx(u[i + k] + off, maxFx));
+            continue;
+        }
+        const uint8_t* a = row.a + block.start;
+        const uint8_t* b = row.b + block.start;
+#ifdef OD_REMAP_NEON
+        const uint8x16_t av = vld1q_u8(a);
+        const int fy = row.a == row.b ? 0 : row.fy;
+        const uint8x16_t bv = fy == 0 ? av : vld1q_u8(b);
+        vst1_u8(out + i, blendFixed8(block, av, bv, fy));
+#else
+        for (int k = 0; k < 8; ++k) {
+            const int l = block.left[k], r = block.right[k];
+            out[i + k] = (uint8_t) lerp2(a[l], a[r], b[l], b[r], block.fx[k], row.fy);
+        }
+#endif
+    }
+    for (; i < n; ++i) out[i] = row.sample(clampFx(u[i] + off, maxFx));
+}
+
+static void gatherFixedY(const RemapSource& sr, int n, const int32_t* u, int vf, int off,
+                         const FixedXBlock* blocks, uint8_t* out) {
+    const FixedSampleRow row(sr.pl.y, sr.pl.rowY, sr.w, sr.h, 1, vf);
+    gatherFixedPlane(row, n, u, off, blocks, out);
+}
+
+static void gatherFixedUV(const RemapSource& sr, int n, const int32_t* u, int vf, int off,
+                          const FixedXBlock* blocks, uint8_t* ou, uint8_t* ov, int dPix) {
+    const Planes& s = sr.pl;
+    const int cw = sr.w / 2, ch = sr.h / 2;
+    if (s.pixUV == 1 && dPix == 1) {
+        gatherFixedPlane(FixedSampleRow(s.u, s.rowUV, cw, ch, 1, vf), n, u, off, blocks, ou);
+        gatherFixedPlane(FixedSampleRow(s.v, s.rowUV, cw, ch, 1, vf), n, u, off, blocks, ov);
+        return;
+    }
+    const Chroma sc = chromaOf(s.u, s.v, s.pixUV), dc = chromaOf(ou, ov, dPix);
+    if (sc == kStrided || (dc == kStrided && dPix != 1)) {
+        gatherUV<true>(sr, n, u, &vf, off, ou, ov, dPix);
+        return;
+    }
+    const FixedSampleRow ur(s.u, s.rowUV, cw, ch, s.pixUV, vf);
+    const FixedSampleRow vr(s.v, s.rowUV, cw, ch, s.pixUV, vf);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const FixedXBlock& block = blocks[i / 8];
+        if (block.start < 0) {
+            gatherUV<true>(sr, 8, u + i, &vf, off, ou + (size_t) i * dPix,
+                           ov + (size_t) i * dPix, dPix);
+            continue;
+        }
+        const size_t start = (size_t) block.start * 2;
+#ifdef OD_REMAP_NEON
+        const FixedSampleRow& base = sc == kNv12 ? ur : vr;
+        const uint8x16x2_t a = vld2q_u8(base.a + start);
+        const int fy = base.a == base.b ? 0 : base.fy;
+        const uint8x16x2_t b = fy == 0 ? a : vld2q_u8(base.b + start);
+        const int ui = sc == kNv12 ? 0 : 1;
+        const uint8x8_t ru = blendFixed8(block, a.val[ui], b.val[ui], fy);
+        const uint8x8_t rv = blendFixed8(block, a.val[1 - ui], b.val[1 - ui], fy);
+        if (dPix == 1) {
+            vst1_u8(ou + i, ru);
+            vst1_u8(ov + i, rv);
+        } else {
+            uint8x8x2_t pair;
+            pair.val[0] = dc == kNv12 ? ru : rv;
+            pair.val[1] = dc == kNv12 ? rv : ru;
+            vst2_u8((dc == kNv12 ? ou : ov) + (size_t) i * 2, pair);
+        }
+#else
+        for (int k = 0; k < 8; ++k) {
+            const size_t l = start + block.left[k] * 2, r = start + block.right[k] * 2;
+            const size_t dst = (size_t) (i + k) * dPix;
+            ou[dst] = (uint8_t) lerp2(ur.a[l], ur.a[r], ur.b[l], ur.b[r], block.fx[k], ur.fy);
+            ov[dst] = (uint8_t) lerp2(vr.a[l], vr.a[r], vr.b[l], vr.b[r], block.fx[k], vr.fy);
+        }
+#endif
+    }
+    if (i < n) gatherUV<true>(sr, n - i, u + i, &vf, off,
+                              ou + (size_t) i * dPix, ov + (size_t) i * dPix, dPix);
+}
+
 // Only bypass the general sampler when every horizontal coordinate is an
 // in-bounds integer texel in a contiguous run. Check once per column plan,
 // not once per output row; rounding and nonstandard offsets retain the fallback.
@@ -951,6 +1301,7 @@ struct DashcamColumns {
     int32_t bottomY[kMaxRow], bottomC[kMaxRow / 2];
     bool topReady, bottomReady;
     int topStart[2], bottomStart[2][3];  // luma/chroma, then cell
+    FixedXBlock topBlocks[2][kMaxRow / 8], bottomBlocks[2][kMaxRow / 8];
 };
 
 static void dashcamColumns(const RemapSpec& p, const RemapSource* src,
@@ -975,6 +1326,9 @@ static void dashcamColumns(const RemapSpec& p, const RemapSource* src,
         const int topOff = p.windshield ? 0 : offsetFx(p.off[0], sw);
         cols.topStart[plane] = cols.topReady
                 ? contiguousStart(top, n, topOff, topWidth) : -1;
+        if (cols.topReady && cols.topStart[plane] < 0) {
+            planFixedX(top, n, topOff, topWidth, cols.topBlocks[plane]);
+        }
         std::fill_n(cols.bottomStart[plane], 3, -1);
         if (!cols.bottomReady) continue;
         const int* bounds = div == 1 ? cb.luma : cb.chroma;
@@ -985,18 +1339,294 @@ static void dashcamColumns(const RemapSpec& p, const RemapSource* src,
             identityX(b - a, tx0, dvx * 3.f, 0.25f * (float) sw, bottom + a);
             cols.bottomStart[plane][c] = contiguousStart(bottom + a, b - a,
                     offsetFx(p.off[3 - c], sw), sw);
+            if (cols.bottomStart[plane][c] < 0) {
+                planFixedX(bottom + a, b - a, offsetFx(p.off[3 - c], sw), sw,
+                           cols.bottomBlocks[plane] + a / 8);
+            }
         }
     }
 }
 
+// The CPU recording lane owns a bounded, geometry-only cache. Keep the
+// directly sampled int32 rows when they fit; otherwise pack exact 20-bit
+// coordinates (16 low bits + one shared high-nibble byte per sample).
+// For larger frames, try a lossless block predictor to retain every row within
+// the same budget. A row that cannot be represented stays on the original path.
+// No frame pointers or pixels are retained. The lane's exit frees the cache.
+struct DashcamRemapCache {
+    struct Plane {
+        int first = 0, last = 0, width = 0;
+        size_t offset = 0;  // elements in the selected storage format
+
+        uint64_t samples() const { return (uint64_t) (last - first) * width; }
+    };
+    std::unique_ptr<int32_t[]> data;
+    std::unique_ptr<uint16_t[]> packed;
+
+    // Store the exact fixed-point coordinates as a linear predictor plus signed
+    // byte residuals. Each block is independent, including at camera seams.
+    static constexpr int kBlock = 32;
+    struct Block {
+        int32_t u0, v0, du, dv;
+        int8_t u[kBlock], v[kBlock];
+    };
+    struct CompactPlane {
+        size_t blocksPerRow = 0, offset = 0, flagOffset = 0;
+    };
+    std::unique_ptr<Block[]> compact;
+    std::unique_ptr<uint8_t[]> validRows;
+    CompactPlane compactPlanes[2];
+    Plane planes[2];
+    int outW = 0, outH = 0, sw = 0, sh = 0, windshield = 0;
+    float k1 = 0, k2 = 0, aspect = 0, split = 0;
+    bool needsFill = false;
+
+    void clear() {
+        data.reset();
+        packed.reset();
+        compact.reset();
+        validRows.reset();
+        outW = 0;
+        needsFill = false;
+    }
+
+    bool matches(const RemapSpec& p, const RemapSource& sr) const {
+        return outW == p.outW && outH == p.outH && sw == sr.w && sh == sr.h
+                && windshield == p.windshield && k1 == p.k1 && k2 == p.k2
+                && aspect == p.aspect && split == p.split;
+    }
+
+    static float rowV(const RemapSpec& p, int y, int div) {
+        return div == 2 ? (float) (2 * y + 1) / (float) p.outH
+                        : ((float) y + 0.5f) / (float) p.outH;
+    }
+
+    uint64_t samples() const { return planes[0].samples() + planes[1].samples(); }
+
+    void prepare(const RemapSpec& p, const RemapSource& sr, bool allowCompact = true) {
+        if (p.k1 == 0.f && p.k2 == 0.f) {
+            clear();
+            return;
+        }
+        if (matches(p, sr)) return;
+        clear();  // release old storage before allocating its replacement
+        outW = p.outW; outH = p.outH; sw = sr.w; sh = sr.h;
+        windshield = p.windshield; k1 = p.k1; k2 = p.k2;
+        aspect = p.aspect; split = p.split;
+
+        int bottom[2];
+        for (int div : {1, 2}) {
+            Plane& plane = planes[div - 1];
+            plane.last = p.outH / div;
+            plane.width = p.outW / div;
+            int lo = 0, hi = plane.last;
+            while (lo < hi) {
+                const int mid = lo + (hi - lo) / 2;
+                if (rowV(p, mid, div) < p.split) lo = mid + 1;
+                else hi = mid;
+            }
+            bottom[div - 1] = lo;
+            plane.first = p.windshield ? lo : 0;
+        }
+        constexpr size_t budget = 16 * 1024 * 1024;
+        // U is tile-local [-128, sw/4*256-128]; V is [0, (sh-1)*256].
+        // The packed format biases U by 128 and preserves all fractional bits.
+        // remapGrid already bounds sw <= 8192; keep a raw fallback for taller sources.
+        if (samples() > budget / 8 && sr.h <= 4096 && sr.w <= 8192) {
+            // Try the full compact map only where the existing packed map
+            // would drop rows. Keep the small/fully packed paths unchanged.
+            if (allowCompact && samples() > budget / 5 && prepareCompact(budget)) return;
+            // Retain complete luma/chroma row pairs up to the budget, preferring
+            // the three-camera bottom band. A windshield never needs a table.
+            if (samples() > budget / 5) {
+                const int pairs = (int) (budget / ((size_t) p.outW * 25 / 2));
+                const int first = std::max(0, p.outH - pairs * 2);
+                planes[0].first = std::max(planes[0].first, first);
+                planes[1].first = std::max(planes[1].first, first / 2);
+            }
+            const uint64_t count = samples();
+            if (count > 0 && count <= budget / 5) {
+                planes[0].offset = 0;
+                // Every row width is even, so the high bytes leave the next row aligned.
+                planes[1].offset = (size_t) planes[0].samples() * 5 / 2;
+                packed.reset(new (std::nothrow) uint16_t[(size_t) count * 5 / 2]);
+                if (packed) {
+                    needsFill = true;
+                    return;
+                }
+            }
+        }
+        // Preserve the original raw path for small geometries and allocation fallback.
+        planes[0].first = p.windshield ? bottom[0] : 0;
+        planes[1].first = p.windshield ? bottom[1] : 0;
+        if (samples() > budget / 8) {
+            planes[0].first = bottom[0];
+            planes[1].first = bottom[1];
+        }
+        const uint64_t count = samples();
+        if (count == 0 || count > budget / 8) return;
+        planes[0].offset = 0;
+        planes[1].offset = (size_t) planes[0].samples() * 2;
+        data.reset(new (std::nothrow) int32_t[(size_t) count * 2]);
+        needsFill = data != nullptr;
+    }
+
+    bool prepareCompact(size_t budget) {
+        size_t blocks = 0, rows = 0;
+        for (int i = 0; i < 2; ++i) {
+            const Plane& p = planes[i];
+            CompactPlane& c = compactPlanes[i];
+            // Splitting at two cell boundaries can add at most two blocks.
+            c.blocksPerRow = (p.width + kBlock - 1) / kBlock + 2;
+            c.offset = blocks;
+            c.flagOffset = rows;
+            const size_t height = p.last - p.first;
+            if (height > (budget / sizeof(Block) - blocks) / c.blocksPerRow) return false;
+            blocks += height * c.blocksPerRow;
+            rows += height;
+        }
+        if (!blocks || rows > budget - blocks * sizeof(Block)) return false;
+        compact.reset(new (std::nothrow) Block[blocks]);
+        if (!compact) return false;
+        validRows.reset(new (std::nothrow) uint8_t[rows]());
+        if (!validRows) {
+            compact.reset();
+            return false;
+        }
+        needsFill = true;
+        return true;
+    }
+
+    void finishFrame(const RemapSpec& p, const RemapSource& sr) {
+        if (compact && needsFill) {
+            // Very strong distortion can defeat the predictor. Keep the old
+            // packed path if the compact map does not cover substantially
+            // more samples; do not retry until the geometry changes.
+            constexpr size_t budget = 16 * 1024 * 1024;
+            const int pairs = (int) (budget / ((size_t) p.outW * 25 / 2));
+            const int first = std::max(0, p.outH - pairs * 2);
+            uint64_t validSamples = 0, packedSamples = 0;
+            for (int i = 0; i < 2; ++i) {
+                const Plane& plane = planes[i];
+                const CompactPlane& c = compactPlanes[i];
+                for (int y = plane.first; y < plane.last; ++y) {
+                    if (validRows[c.flagOffset + y - plane.first]) validSamples += plane.width;
+                }
+                const int start = std::max(plane.first, first / (i + 1));
+                packedSamples += (uint64_t) (plane.last - start) * plane.width;
+            }
+            if (validSamples * 4 < packedSamples * 5) {
+                clear();
+                prepare(p, sr, false);
+                return; // fill the packed map on the next frame
+            }
+        }
+        needsFill = false;
+    }
+
+    // Bounds also protect the integer predictor from unexpected coordinates.
+    static bool encodeBlock(Block& b, int n, const int32_t* u, const int32_t* v) {
+        const int last = n - 1;
+        if (u[0] < -128 || u[0] > 524160 || u[last] < -128 || u[last] > 524160
+                || v[0] < 0 || v[0] > 1048320 || v[last] < 0 || v[last] > 1048320) return false;
+        b.u0 = u[0];
+        b.v0 = v[0];
+        b.du = last ? (u[last] - b.u0) / last : 0;
+        b.dv = last ? (v[last] - b.v0) / last : 0;
+        for (int i = 0; i < n; ++i) {
+            const int64_t ru = (int64_t) u[i] - (b.u0 + i * b.du);
+            const int64_t rv = (int64_t) v[i] - (b.v0 + i * b.dv);
+            if (ru < -128 || ru > 127 || rv < -128 || rv > 127) return false;
+            b.u[i] = (int8_t) ru;
+            b.v[i] = (int8_t) rv;
+        }
+        return true;
+    }
+
+    static void decodeBlock(const Block& b, int n, int32_t* u, int32_t* v) {
+        for (int i = 0; i < n; ++i) {
+            u[i] = b.u0 + i * b.du + b.u[i];
+            v[i] = b.v0 + i * b.dv + b.v[i];
+        }
+    }
+
+    // Each worker owns a complete row. A validity byte is published only
+    // after all blocks encode successfully; failed rows are recomputed.
+    bool compactRow(int y, int div, const int* bounds, int segments,
+                    int32_t* u, int32_t* v) const {
+        const Plane& p = planes[div - 1];
+        if (!compact || y < p.first || y >= p.last) return false;
+        const CompactPlane& c = compactPlanes[div - 1];
+        const size_t rowIndex = (size_t) (y - p.first);
+        uint8_t& valid = validRows[c.flagOffset + rowIndex];
+        if (!needsFill && !valid) return false;
+        Block* block = compact.get() + c.offset + rowIndex * c.blocksPerRow;
+        for (int segment = 0; segment < segments; ++segment) {
+            for (int x = bounds[segment]; x < bounds[segment + 1]; x += kBlock, ++block) {
+                const int n = std::min(kBlock, bounds[segment + 1] - x);
+                if (needsFill) {
+                    if (!encodeBlock(*block, n, u + x, v + x)) return false;
+                } else {
+                    decodeBlock(*block, n, u + x, v + x);
+                }
+            }
+        }
+        if (needsFill) valid = 1;
+        return true;
+    }
+
+    int32_t* row(int y, int div) const {
+        const Plane& plane = planes[div - 1];
+        if (!data || y < plane.first || y >= plane.last) return nullptr;
+        return data.get() + plane.offset + (size_t) (y - plane.first) * plane.width * 2;
+    }
+
+    uint16_t* packedRow(int y, int div) const {
+        const Plane& plane = planes[div - 1];
+        if (!packed || y < plane.first || y >= plane.last) return nullptr;
+        return packed.get() + plane.offset + (size_t) (y - plane.first) * plane.width * 5 / 2;
+    }
+
+    static void packRow(uint16_t* __restrict dst, int n, const int32_t* __restrict u,
+                        const int32_t* __restrict v) {
+        uint8_t* high = reinterpret_cast<uint8_t*>(dst + 2 * n);
+        for (int i = 0; i < n; ++i) {
+            const uint32_t x = (uint32_t) (u[i] + 128), y = (uint32_t) v[i];
+            dst[i] = (uint16_t) x;
+            dst[n + i] = (uint16_t) y;
+            high[i] = (uint8_t) ((x >> 16) | ((y >> 16) << 4));
+        }
+    }
+
+    static void unpackRow(const uint16_t* __restrict src, int n, int32_t* __restrict u,
+                          int32_t* __restrict v) {
+        const uint8_t* high = reinterpret_cast<const uint8_t*>(src + 2 * n);
+        for (int i = 0; i < n; ++i) {
+            u[i] = (int32_t) (src[i] | ((high[i] & 15) << 16)) - 128;
+            v[i] = src[n + i] | ((high[i] >> 4) << 16);
+        }
+    }
+};
+
 // Dashcam: 360 front (or windshield) on top, left / rear / right below.
 static void dashcamRow(const RemapSpec& p, const RemapSource* src, const Planes& d,
-                       const CellBounds& cb, const DashcamColumns& cols, int y, bool chroma) {
+                       const CellBounds& cb, const DashcamColumns& cols,
+                       const DashcamRemapCache& cache, int y, bool chroma) {
     int32_t lu[kMaxRow], lv[kMaxRow];
     const int div = chroma ? 2 : 1;
     const int n = p.outW / div;
-    const float vy = chroma ? (float) (2 * y + 1) / (float) p.outH
-                            : ((float) y + 0.5f) / (float) p.outH;
+    int32_t* cached = cache.row(y, div);
+    uint16_t* packed = cache.packedRow(y, div);
+    int32_t* rowU = cached ? cached : lu;
+    int32_t* rowV = cached ? cached + n : lv;
+    const float vy = DashcamRemapCache::rowV(p, y, div);
+    const int topBounds[2] = {0, n};
+    const bool top = vy < p.split;
+    const int* bounds = top ? topBounds : (chroma ? cb.chroma : cb.luma);
+    const int segments = top ? 1 : 3;
+    const bool warm = !cache.needsFill && ((cached || packed)
+            || cache.compactRow(y, div, bounds, segments, lu, lv));
+    if (packed && warm) cache.unpackRow(packed, n, lu, lv);
     // Output pixel i sits at vx = (i * div + 0.5 * div) / outW.
     const float vx0 = (0.5f * (float) div) / (float) p.outW;
     const float dvx = (float) div / (float) p.outW;
@@ -1017,43 +1647,52 @@ static void dashcamRow(const RemapSpec& p, const RemapSource* src, const Planes&
             if (start >= 0) {
                 if (chroma) verticalUV(ws, start, n, lv[0], ou, ov, d.pixUV);
                 else verticalY(ws, start, n, lv[0], oy);
-            } else if (chroma) gatherUV<true>(ws, n, u, lv, 0, ou, ov, d.pixUV);
-            else gatherY<true>(ws, n, u, lv, 0, oy);
+            } else if (chroma) gatherFixedUV(ws, n, u, lv[0], 0, cols.topBlocks[div - 1], ou, ov, d.pixUV);
+            else gatherFixedY(ws, n, u, lv[0], 0, cols.topBlocks[div - 1], oy);
             return;
         }
         const int32_t* u = lu;
+        const int32_t* v = lv;
         const int start = cols.topStart[div - 1];
         if (cols.topReady) {
             u = chroma ? cols.topC : cols.topY;
             identityY(1, ly, p.aspect, (float) sh, lv);
         } else {
-            rectifyRow(p, n, vx0, dvx, ly, 0.25f * (float) sw, (float) sh, lu, lv);
+            if (!warm) rectifyRow(p, n, vx0, dvx, ly, 0.25f * (float) sw,
+                                  (float) sh, rowU, rowV);
+            if (packed && !warm) cache.packRow(packed, n, rowU, rowV);
+            if (cache.needsFill && cache.compact) cache.compactRow(y, div, bounds, segments, lu, lv);
+            u = rowU;
+            v = rowV;
         }
         const int off = offsetFx(p.off[0], sw);
         if (start >= 0) {
             if (chroma) verticalUV(strip, start, n, lv[0], ou, ov, d.pixUV);
             else verticalY(strip, start, n, lv[0], oy);
         } else if (cols.topReady) {
-            if (chroma) gatherUV<true>(strip, n, u, lv, off, ou, ov, d.pixUV);
-            else gatherY<true>(strip, n, u, lv, off, oy);
-        } else if (chroma) gatherUV(strip, n, u, lv, off, ou, ov, d.pixUV);
-        else gatherY(strip, n, u, lv, off, oy);
+            if (chroma) gatherFixedUV(strip, n, u, lv[0], off, cols.topBlocks[div - 1], ou, ov, d.pixUV);
+            else gatherFixedY(strip, n, u, lv[0], off, cols.topBlocks[div - 1], oy);
+        } else if (chroma) gatherUV(strip, n, u, v, off, ou, ov, d.pixUV);
+        else gatherY(strip, n, u, v, off, oy);
         return;
     }
     const float by = (vy - p.split) / (1.f - p.split);
     const float cellOff[3] = {p.off[3], p.off[2], p.off[1]};  // left, rear, right
     for (int c = 0; c < 3; c++) {
-        const int* bounds = chroma ? cb.chroma : cb.luma;
         const int a = bounds[c], b = bounds[c + 1];
         if (b <= a) continue;
         const float tx0 = (vx0 + (float) a * dvx) * 3.f - (float) c;
         const int32_t* u = lu;
+        const int32_t* v = lv;
         const int start = cols.bottomStart[div - 1][c];
         if (cols.bottomReady) {
             u = (chroma ? cols.bottomC : cols.bottomY) + a;
             identityY(1, by, p.aspect, (float) sh, lv);
         } else {
-            rectifyRow(p, b - a, tx0, dvx * 3.f, by, 0.25f * (float) sw, (float) sh, lu, lv);
+            if (!warm) rectifyRow(p, b - a, tx0, dvx * 3.f, by,
+                                  0.25f * (float) sw, (float) sh, rowU + a, rowV + a);
+            u = rowU + a;
+            v = rowV + a;
         }
         const int off = offsetFx(cellOff[c], sw);
         if (start >= 0) {
@@ -1061,12 +1700,15 @@ static void dashcamRow(const RemapSpec& p, const RemapSource* src, const Planes&
                     ou + (size_t) a * d.pixUV, ov + (size_t) a * d.pixUV, d.pixUV);
             else verticalY(strip, start, b - a, lv[0], oy + a);
         } else if (cols.bottomReady) {
-            if (chroma) gatherUV<true>(strip, b - a, u, lv, off,
+            const FixedXBlock* blocks = cols.bottomBlocks[div - 1] + a / 8;
+            if (chroma) gatherFixedUV(strip, b - a, u, lv[0], off, blocks,
                     ou + (size_t) a * d.pixUV, ov + (size_t) a * d.pixUV, d.pixUV);
-            else gatherY<true>(strip, b - a, u, lv, off, oy + a);
-        } else if (chroma) gatherUV(strip, b - a, u, lv, off, ou + (size_t) a * d.pixUV, ov + (size_t) a * d.pixUV, d.pixUV);
-        else gatherY(strip, b - a, u, lv, off, oy + a);
+            else gatherFixedY(strip, b - a, u, lv[0], off, blocks, oy + a);
+        } else if (chroma) gatherUV(strip, b - a, u, v, off, ou + (size_t) a * d.pixUV, ov + (size_t) a * d.pixUV, d.pixUV);
+        else gatherY(strip, b - a, u, v, off, oy + a);
     }
+    if (packed && !warm) cache.packRow(packed, n, rowU, rowV);
+    if (cache.needsFill && cache.compact) cache.compactRow(y, div, bounds, segments, lu, lv);
 }
 
 // Small persistent pool; the caller also works. Helpers prefer the slowest
@@ -1219,6 +1861,7 @@ struct BandJob {
     int per;
     CellBounds cb;
     const DashcamColumns* columns;
+    const DashcamRemapCache* cache;
 };
 
 static void gridBand(void* ctx, int b) {
@@ -1233,9 +1876,9 @@ static void dashcamBand(void* ctx, int b) {
     const int c0 = b * j.per;
     const int c1 = c0 + j.per < j.rows ? c0 + j.per : j.rows;
     for (int yc = c0; yc < c1; yc++) {
-        dashcamRow(*j.p, j.src, *j.d, j.cb, *j.columns, yc * 2, false);
-        dashcamRow(*j.p, j.src, *j.d, j.cb, *j.columns, yc * 2 + 1, false);
-        dashcamRow(*j.p, j.src, *j.d, j.cb, *j.columns, yc, true);
+        dashcamRow(*j.p, j.src, *j.d, j.cb, *j.columns, *j.cache, yc * 2, false);
+        dashcamRow(*j.p, j.src, *j.d, j.cb, *j.columns, *j.cache, yc * 2 + 1, false);
+        dashcamRow(*j.p, j.src, *j.d, j.cb, *j.columns, *j.cache, yc, true);
     }
 }
 
@@ -1254,11 +1897,13 @@ int remapGrid(const RemapSpec& p, const RemapSource& strip, const RemapSource* w
     RemapSource src[2] = {strip, strip};
     if (p.layout == 1 && p.windshield) src[1] = *windshield;
     if (bands < 1) bands = 1;
+    thread_local DashcamRemapCache cache;
     BandJob job;
     job.p = &p;
     job.src = src;
     job.d = &d;
     if (p.layout == 0) {
+        cache.clear();
         // Bands of tile rows, even-aligned so each owns its chroma rows.
         const int th = p.outH / 2;
         job.rows = th;
@@ -1269,10 +1914,14 @@ int remapGrid(const RemapSpec& p, const RemapSource& strip, const RemapSource* w
         job.rows = ch;
         job.per = (ch + bands - 1) / bands;  // chroma rows per band
         cellBounds(p.outW, &job.cb);
-        DashcamColumns columns;
+        // Worker bands borrow this bounded geometry scratch until Pool::run returns.
+        thread_local DashcamColumns columns;
         dashcamColumns(p, src, job.cb, columns);
         job.columns = &columns;
+        cache.prepare(p, strip);
+        job.cache = &cache;
         Pool::get().run(bands, dashcamBand, &job);
+        cache.finishFrame(p, strip);
     }
     return 0;
 }
@@ -1343,6 +1992,23 @@ Java_com_overdrive_app_surveillance_CpuMosaicCompositor_nativePrepareOverlay(
     if (!src || !out || srcCap <= 0 || outCap <= 0) return JNI_FALSE;
     return odcpu::prepareOverlay(src, (size_t) srcCap, bw, bh, rowBytes, out, (size_t) outCap, w, h)
             ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_overdrive_app_surveillance_CpuMosaicCompositor_nativeUpdateOverlay(
+        JNIEnv* env, jclass, jobject previous, jobject rgba, jint bw, jint bh, jint rowBytes,
+        jboolean opaque, jobject table, jint w, jint h) {
+    if (!previous || !rgba || !table) return -1;
+    const uint8_t* was = (const uint8_t*) env->GetDirectBufferAddress(previous);
+    uint8_t* now = (uint8_t*) env->GetDirectBufferAddress(rgba);
+    uint8_t* out = (uint8_t*) env->GetDirectBufferAddress(table);
+    const jlong wasCap = env->GetDirectBufferCapacity(previous);
+    const jlong nowCap = env->GetDirectBufferCapacity(rgba);
+    const jlong outCap = env->GetDirectBufferCapacity(table);
+    if (!was || !now || !out || was == now || wasCap <= 0 || nowCap <= 0 || outCap <= 0) return -1;
+    if (opaque == JNI_TRUE && !odcpu::forceOpaque(now, (size_t) nowCap, bw, bh, rowBytes)) return -1;
+    return odcpu::updateOverlay(was, (size_t) wasCap, now, (size_t) nowCap, bw, bh, rowBytes,
+                                out, (size_t) outCap, w, h);
 }
 
 extern "C" JNIEXPORT jint JNICALL

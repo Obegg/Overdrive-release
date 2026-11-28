@@ -108,6 +108,22 @@ static void check(int w, int h, int sw, int sh, int ww, int wh,
     }
     assert(remapGrid(p, src[0], windshield ? &src[1] : nullptr, actual.planes, bands) == 0);
     assert(actual.y == expected.y && actual.u == expected.u && actual.v == expected.v);
+
+    // Same geometry, different frame content and destination. Exercise the
+    // warm coordinate cache, including offsets that are intentionally not keys.
+    if (k1 != 0.f || k2 != 0.f) {
+        for (auto* pixels : {&strip.y, &strip.u, &strip.v, &ws.y, &ws.u, &ws.v}) {
+            for (uint8_t& pixel : *pixels) pixel ^= 0x5a;
+        }
+        p.off[0] = 0.029f;
+        for (int yc = 0; yc < h / 2; yc++) {
+            referenceDashcamRow(p, src, expected.planes, cb, yc * 2, false);
+            referenceDashcamRow(p, src, expected.planes, cb, yc * 2 + 1, false);
+            referenceDashcamRow(p, src, expected.planes, cb, yc, true);
+        }
+        assert(remapGrid(p, src[0], windshield ? &src[1] : nullptr, actual.planes, bands) == 0);
+        assert(actual.y == expected.y && actual.u == expected.u && actual.v == expected.v);
+    }
 }
 // A horizontally exact grid with vertical scaling uses the new path even
 // though it does not qualify for the separate 1:1 composeGrid fast path.
@@ -261,6 +277,138 @@ int main() {
             cases++;
         }
     }
+    // Preplanned gathers: unaligned cell boundaries, narrow and wide source
+    // windows, clipped offsets, and all planar/interleaved format combinations.
+    for (int sm = 0; sm < 3; ++sm) {
+        for (int dm = 0; dm < 3; ++dm) {
+            odcpu::check(100, 32, 256, 48, 34, 24, sm, dm, true,
+                         0.f, 0.f, 0.75f, 0.7f, 0.f, 4, rng);
+            odcpu::check(132, 48, 1024, 80, 512, 48, sm, dm, false,
+                         0.f, 0.f, 0.75f, 0.7f, 0.f, 4, rng);
+            cases += 2;
+        }
+    }
+    odcpu::check(2560, 1920, 5120, 960, 1920, 1080, 1, 2, false,
+                 0.f, 0.f, 0.75f, 0.7f, 0.f, 16, rng);
+    cases++;
+    // Small geometries use raw coordinates; 1080p fits entirely when packed.
+    odcpu::check(640, 480, 2560, 480, 1280, 720, 0, 2, false,
+                 0.3f, 0.07f, 0.75f, 0.7f, 0.f, 16, rng);
+    odcpu::check(1920, 1080, 2560, 480, 1280, 720, 1, 0, false,
+                 0.3f, 0.07f, 0.75f, 0.7f, 0.f, 16, rng);
+    cases += 2;
+    // Exercise the signed U bias, high nibble boundaries and full V range.
+    {
+        const int32_t u[] = {-128, -1, 0, 65407, 65408, 524160};
+        const int32_t v[] = {0, 65535, 65536, 524287, 524288, 1048320};
+        uint16_t packed[15];
+        int32_t actualU[6], actualV[6];
+        odcpu::DashcamRemapCache::packRow(packed, 6, u, v);
+        odcpu::DashcamRemapCache::unpackRow(packed, 6, actualU, actualV);
+        assert(std::equal(u, u + 6, actualU) && std::equal(v, v + 6, actualV));
+    }
+    {
+        odcpu::DashcamRemapCache cache;
+        odcpu::RemapSource sr = {};
+        sr.w = 2560;
+        sr.h = 480;
+        odcpu::RemapSpec p = {1920, 1080, 1, {0.f, 0.25f, 0.5f, 0.75f},
+                              0.3f, 0.07f, 0.75f, 0, 0.12f, 0.7f};
+        cache.prepare(p, sr);
+        assert(cache.packed && !cache.data && cache.needsFill);
+        assert(cache.planes[0].first == 0 && cache.planes[1].first == 0);
+        assert(cache.samples() * 5 == 12960000);
+        cache.needsFill = false;
+        cache.prepare(p, sr);
+        assert(!cache.needsFill);
+        p.k1 = 0.4f;
+        cache.prepare(p, sr);
+        assert(cache.packed && cache.needsFill);
+        p.windshield = 1;
+        cache.prepare(p, sr);
+        assert(!cache.packed && cache.data && cache.needsFill);
+        p.k1 = p.k2 = 0.f;
+        cache.prepare(p, sr);
+        assert(!cache.packed && !cache.data && !cache.needsFill);
+        p.k1 = 0.3f;
+        p.windshield = 0;
+        sr.h = 4098;
+        cache.prepare(p, sr);
+        assert(!cache.packed && cache.data);
+    }
+    // Compact predictor: exact reconstruction, signed residuals, partial
+    // blocks, and rejection rather than truncation for unrepresentable rows.
+    {
+        using Cache = odcpu::DashcamRemapCache;
+        Cache::Block block;
+        int32_t u[Cache::kBlock], v[Cache::kBlock], actualU[Cache::kBlock], actualV[Cache::kBlock];
+        for (int n : {1, 7, Cache::kBlock}) {
+            for (int i = 0; i < n; ++i) {
+                u[i] = -128 + i * 437 + (i % 2 ? 7 : 0);
+                v[i] = 1048320 - i * 311 - (i % 2 ? 9 : 0);
+            }
+            assert(Cache::encodeBlock(block, n, u, v));
+            Cache::decodeBlock(block, n, actualU, actualV);
+            assert(std::equal(u, u + n, actualU) && std::equal(v, v + n, actualV));
+        }
+        u[12] += 200;
+        assert(!Cache::encodeBlock(block, Cache::kBlock, u, v));
+
+        Cache cache;
+        cache.planes[0].last = 2;
+        cache.planes[0].width = Cache::kBlock;
+        assert(cache.prepareCompact(4096));
+        const int bounds[] = {0, Cache::kBlock};
+        assert(!cache.compactRow(0, 1, bounds, 1, u, v));
+        u[12] -= 200;
+        assert(cache.compactRow(1, 1, bounds, 1, u, v));
+        cache.needsFill = false;
+        assert(!cache.compactRow(0, 1, bounds, 1, actualU, actualV));
+        assert(cache.compactRow(1, 1, bounds, 1, actualU, actualV));
+        assert(std::equal(u, u + Cache::kBlock, actualU));
+        assert(std::equal(v, v + Cache::kBlock, actualV));
+    }
+    // Legacy panoramic recording: use the raw lower band with a windshield,
+    // or try the full compact map when all four cameras need lens correction.
+    for (int ws : {0, 1}) {
+        odcpu::DashcamRemapCache cache;
+        odcpu::RemapSpec p = {2560, 1920, 1, {0.75f, 0.5f, 0.f, 0.25f},
+                              0.12f, 0.04f, 0.75f, ws, 0.12f, 0.7f};
+        odcpu::RemapSource sr = {};
+        sr.w = 5120;
+        sr.h = 960;
+        cache.prepare(p, sr);
+        assert(cache.needsFill);
+        if (ws) {
+            assert(cache.data && !cache.packed);
+            assert(cache.planes[0].first == 1344 && cache.planes[1].first == 672);
+        } else {
+            assert(cache.compact && !cache.packed && !cache.data);
+            assert(cache.planes[0].first == 0 && cache.planes[1].first == 0);
+            const size_t blocks = cache.compactPlanes[1].offset
+                    + cache.compactPlanes[1].blocksPerRow * cache.planes[1].last;
+            assert(blocks * sizeof(odcpu::DashcamRemapCache::Block)
+                    + cache.planes[0].last + cache.planes[1].last <= 16 * 1024 * 1024);
+            // No rows encoded: choose the original partial packed fallback,
+            // and do not retry the compact map on the same geometry.
+            cache.finishFrame(p, sr);
+            assert(cache.packed && !cache.compact && cache.needsFill);
+            assert(cache.planes[0].first == 872 && cache.planes[1].first == 436);
+            cache.prepare(p, sr);
+            assert(cache.packed && !cache.compact && cache.needsFill);
+        }
+        odcpu::check(2560, 1920, 5120, 960, 1920, 1080, 1, 0, ws == 1,
+                     0.12f, 0.04f, 0.75f, 0.7f, 0.12f, 32, rng);
+        cases++;
+    }
+    // A highly nonlinear map may reject compact rows and return to the packed path.
+    odcpu::check(2560, 1920, 5120, 960, 1920, 1080, 2, 1, false,
+                 5.f, 0.04f, 0.75f, 0.7f, 0.12f, 16, rng);
+    cases++;
+    // An oversized lower band must still respect the budget and render uncached rows.
+    odcpu::check(1920, 1080, 2560, 480, 1280, 720, 2, 1, true,
+                 0.3f, 0.07f, 0.75f, 0.1f, 0.12f, 16, rng);
+    cases++;
     // Same-width windshield, including nonlinear correction of the lower band.
     for (int src = 0; src < 3; src++) {
         for (int dst = 0; dst < 3; dst++) {

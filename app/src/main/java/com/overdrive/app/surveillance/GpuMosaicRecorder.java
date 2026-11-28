@@ -305,6 +305,10 @@ public class GpuMosaicRecorder {
     // camera thread is blending, so the builder never writes a table in use.
     private java.nio.ByteBuffer cpuOverlayRgba;
     private final java.nio.ByteBuffer[] cpuOverlayTables = new java.nio.ByteBuffer[3];
+    // The bitmap copy each table was last built from, with {gen, width, height, rowBytes}:
+    // the next build of that table only recomputes what changed. Builder thread only.
+    private final java.nio.ByteBuffer[] cpuOverlaySource = new java.nio.ByteBuffer[3];
+    private final int[][] cpuOverlaySourceKey = new int[3][4];
     private volatile int cpuOverlayFront = -1;
     private volatile int cpuOverlayHazard = -1;
     private int cpuOverlayGen;  // guarded by cpuOverlayTables; bumped on init/release
@@ -695,6 +699,7 @@ public class GpuMosaicRecorder {
         // CPU recording engine: no encoder surface or shaders (see submitCpuFrame).
         cpuEngine = encoder.isCpuInput();
         encoder.setLensTagSupplier(() -> LensTag.build(this));
+        encoder.setGridTagSupplier(since -> LensTag.buildGrid(this, since));
         if (cpuEngine) {
             initCpuEngine();
             return;
@@ -1137,6 +1142,7 @@ public class GpuMosaicRecorder {
         // Track draw duration to detect encoder backpressure
         long elapsedNs = tAfterSwapNs - startTime;
         lastDrawDurationNs = elapsedNs;
+        CameraLoadProbe.noteDraw(elapsedNs);
 
         if (elapsedNs > maxDrawDurationNs) {
             consecutiveSlowFrames++;
@@ -1716,8 +1722,34 @@ public class GpuMosaicRecorder {
         int v = (layout == 1) ? 1 : 0;
         if (v == this.recordLayout) return;
         this.recordLayout = v;
+        noteGridState();
         this.recordLayoutUniformDirty.set(true);
     }
+
+    // Wall time the 4-camera 2x2 grid composition last started or stopped (sidecar grid tag).
+    // 0: grid since construction. A new recorder always gets a new encoder (empty pre-record
+    // ring), so no earlier frame of another layout can land in its clips.
+    private volatile long gridChangedAtMs = 0L;
+
+    private void noteGridState() {
+        gridChangedAtMs = System.currentTimeMillis();
+    }
+
+    /** True while frames are the 4-camera 2x2 grid: TL front, TR right, BL rear, BR left. */
+    boolean recordsGrid() {
+        return cameraLayout == 0 && recordLayout == 0;
+    }
+
+    /** True when the grid has been the composition since {@code wallMs} without a change. */
+    boolean gridSince(long wallMs) {
+        return recordsGrid() && gridChangedAtMs < wallMs;
+    }
+
+    float windshieldCropY() { return cpuWindshieldCropY; }
+
+    static float dashcamSplit() { return DASHCAM_SPLIT; }
+
+    static float windshieldSourceAspect() { return WINDSHIELD_SOURCE_ASPECT; }
 
     /**
      * Wires the HAL-contention probe used by the safety valve. The valve only
@@ -1741,6 +1773,7 @@ public class GpuMosaicRecorder {
         if (layout == this.cameraLayout) return;
         this.apaMode = (layout == 1);
         this.cameraLayout = layout;
+        noteGridState();
         // Defer the actual glUniform1f to the next drawFrame on the
         // encoder GL thread; we don't own that context here.
         this.apaModeUniformDirty.set(true);
@@ -2065,6 +2098,7 @@ public class GpuMosaicRecorder {
         if (!cpuOverlayBuilding.get()) {
             cpuOverlayRgba = null;
             java.util.Arrays.fill(cpuOverlayTables, null);
+            java.util.Arrays.fill(cpuOverlaySource, null);
         }
         
         logger.info( "GpuMosaicRecorder released");
@@ -2073,6 +2107,11 @@ public class GpuMosaicRecorder {
     /** True when frames go through {@link #submitCpuFrame} instead of drawFrame. */
     public boolean isCpuEngine() {
         return cpuEngine;
+    }
+
+    /** Frames in a row over the draw budget (encoder backpressure); 0 when healthy. */
+    public int consecutiveSlowFrames() {
+        return consecutiveSlowFrames;
     }
 
     /** CPU recording queue drops plus frames that found a backlog, since this recorder was built (never reset). */
@@ -2298,6 +2337,7 @@ public class GpuMosaicRecorder {
 
         long elapsedNs = System.nanoTime() - start;
         lastDrawDurationNs = elapsedNs;
+        CameraLoadProbe.noteDraw(elapsedNs);
         if (elapsedNs > maxDrawDurationNs) consecutiveSlowFrames++;
         else consecutiveSlowFrames = 0;
         if (elapsedNs > cpuWorstTotalNs) {
@@ -2411,15 +2451,36 @@ public class GpuMosaicRecorder {
             int t = 0;
             while (t == front || t == hazard) t++;  // one of three is always free
             java.nio.ByteBuffer table = cpuOverlayTables[t];
-            // Premultiplied RGB at full alpha is the overlay drawn over black.
-            if (strip) makeOpaque(rgba, bw, bh, rowBytes);
-            if (table != null && CpuMosaicCompositor.nativePrepareOverlay(
-                    rgba, bw, bh, rowBytes, table, bandW, bandH)) {
-                synchronized (cpuOverlayTables) {
-                    if (gen == cpuOverlayGen) {  // not into a re-initialised session
-                        cpuOverlayTableStrip[t] = strip;
-                        cpuOverlayFront = t;
-                    }
+            if (table == null) return;
+            // Table t still holds what its last build wrote, and its source is the bitmap
+            // that build read: only what changed since is recomputed. The pairing is
+            // dropped first, so a failure below leaves a table that gets fully rebuilt.
+            java.nio.ByteBuffer source = cpuOverlaySource[t];
+            int[] key = cpuOverlaySourceKey[t];
+            boolean paired = source != null && source != rgba
+                && source.capacity() == rgba.capacity()
+                && key[0] == gen && key[1] == bw && key[2] == bh && key[3] == rowBytes;
+            cpuOverlaySource[t] = null;
+            boolean built = paired && CpuMosaicCompositor.nativeUpdateOverlay(
+                source, rgba, bw, bh, rowBytes, strip, table, bandW, bandH) >= 0;
+            if (!built) {
+                // Premultiplied RGB at full alpha is the overlay drawn over black.
+                if (strip) makeOpaque(rgba, bw, bh, rowBytes);
+                built = CpuMosaicCompositor.nativePrepareOverlay(
+                    rgba, bw, bh, rowBytes, table, bandW, bandH);
+            }
+            if (!built) return;
+            // rgba now belongs to table t; the bitmap it replaces takes the next copy.
+            cpuOverlaySource[t] = rgba;
+            key[0] = gen;
+            key[1] = bw;
+            key[2] = bh;
+            key[3] = rowBytes;
+            cpuOverlayRgba = source;
+            synchronized (cpuOverlayTables) {
+                if (gen == cpuOverlayGen) {  // not into a re-initialised session
+                    cpuOverlayTableStrip[t] = strip;
+                    cpuOverlayFront = t;
                 }
             }
         } catch (Throwable e) {

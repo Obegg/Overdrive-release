@@ -125,15 +125,6 @@ public final class RemovableStorageFs {
         return isRouted(f) ? stat(f, true).length : f.length();
     }
 
-    /** "length:mtime" from the listing, without reading the file; lags while a writer holds it open. */
-    public static String listingSignature(File f) {
-        if (f instanceof ListedFile) {
-            Stat snap = ((ListedFile) f).rawSnapshot();
-            return snap.length + ":" + snap.mtime;
-        }
-        return length(f) + ":" + lastModified(f);
-    }
-
     /** A listing entry's mtime as MediaStore recorded it (current once its writer closed it). */
     public static long listedLastModified(File f) {
         return f instanceof ListedFile ? ((ListedFile) f).rawSnapshot().mtime : lastModified(f);
@@ -161,6 +152,15 @@ public final class RemovableStorageFs {
             return new FileStamp(s.length, s.mtime);
         }
         return new FileStamp(f.length(), f.lastModified());
+    }
+
+    /** File type, size and time from one stat on a routed volume; null for a non-file. */
+    public static FileStamp fileStampIfFile(File f) {
+        if (isRouted(f)) {
+            Stat s = stat(f, true);
+            return s.exists && !s.dir ? new FileStamp(s.length, s.mtime) : null;
+        }
+        return f.isFile() ? new FileStamp(f.length(), f.lastModified()) : null;
     }
 
     /** A readable entry's modification time, or zero, using one exact routed stat. */

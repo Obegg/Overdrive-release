@@ -38,6 +38,8 @@ public final class TimelineData {
         public long sizeBytes;
         public long mp4Mtime;
         public boolean available;
+        /** Span source (SpanRules.SRC_*); null when built outside the index. */
+        public String spanSrc;
 
         public ClipRef() {}
 
@@ -137,7 +139,9 @@ public final class TimelineData {
         String layout;
 
         ClipRef toClip() {
-            return new ClipRef(id, type, absPath, layout, start, end, sizeBytes, mp4Mtime, available);
+            ClipRef clip = new ClipRef(id, type, absPath, layout, start, end, sizeBytes, mp4Mtime, available);
+            clip.spanSrc = spanSrc;
+            return clip;
         }
     }
 
@@ -803,6 +807,12 @@ public final class TimelineData {
 
     /** Playback plan over [from, to); throws when the index is unavailable. */
     public static List<PlanItem> playbackPlan(long from, long to, Set<String> types, String prefer) {
+        return playbackPlan(from, to, types, prefer, false);
+    }
+
+    /** @param oemOnly plan only OEM single-camera clips (a follower stream), gaps left open */
+    public static List<PlanItem> playbackPlan(long from, long to, Set<String> types, String prefer,
+                                              boolean oemOnly) {
         if (to <= from) return new ArrayList<>();
         // Planned beyond each edge, then cut: edge pieces get the same seam and sliver rules as the head unit's
         // (a sliver needs its neighbours, which can sit a few seams away).
@@ -811,7 +821,10 @@ public final class TimelineData {
         List<SegmentRow> rows = querySegments(planFrom, planTo, types, false);
         if (rows == null) throw new IllegalStateException("recordings index unavailable");
         List<ClipRef> clips = new ArrayList<>(rows.size());
-        for (SegmentRow r : rows) clips.add(r.toClip());
+        for (SegmentRow r : rows) {
+            ClipRef clip = r.toClip();
+            if (!oemOnly || TimelinePlan.oem(clip)) clips.add(clip);
+        }
         List<PlanItem> planned = TimelinePlan.build(clips, planFrom, planTo, prefer);
         List<PlanItem> out = new ArrayList<>(planned.size());
         for (PlanItem p : planned) {
