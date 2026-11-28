@@ -316,12 +316,12 @@ public class AppAudioCaptureController {
         return failed != -1 && failed == requestedAudioSource;
     }
 
-    /** Echo-canceller probe of the newest capture: null until a VOICE_COMMUNICATION capture asked. */
     /** The calling thread onto the fastest CPU cluster or back (the front-end library); the mask or -1. */
     public static int pinCallingThreadToFastCores(boolean on) {
         return VoiceFrontend.pinCallingThreadToFastCores(on);
     }
 
+    /** Echo-canceller probe of the newest capture: null until a VOICE_COMMUNICATION capture asked. */
     public static Boolean echoCancelerAvailable() {
         return aecAvailable;
     }
