@@ -39,6 +39,9 @@ final class StageWorker {
     private final ArrayDeque<Entry> queue = new ArrayDeque<>();
     private final Thread thread;
     private boolean closed;
+    // Car microphones: checks ran 3-5x slower with ACC on, on an idle-placed little core behind the UI.
+    private volatile boolean wantFast;
+    private boolean fast;
     // Diagnostics (guarded by this): tasks replaced or refused, busy time and the longest wait.
     private int replaced;
     private long busyMs;
@@ -101,6 +104,24 @@ final class StageWorker {
         return Thread.currentThread() == thread;
     }
 
+    /** From the next task on: the fastest CPU cluster at display priority (true) or default placement. */
+    void setFastCores(boolean on) {
+        wantFast = on;
+    }
+
+    private void applyPlacement() {
+        boolean want = wantFast;
+        if (want == fast) return;
+        fast = want;
+        try {
+            android.os.Process.setThreadPriority(want ? android.os.Process.THREAD_PRIORITY_DISPLAY
+                    : android.os.Process.THREAD_PRIORITY_DEFAULT);
+        } catch (Throwable ignored) {
+        }
+        int mask = com.overdrive.app.audio.AppAudioCaptureController.pinCallingThreadToFastCores(want);
+        Log.i(TAG, "worker " + (want ? "on the fast cores, mask 0x" + Integer.toHexString(mask) : "default placement"));
+    }
+
     private void loop() {
         try {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DEFAULT);
@@ -119,6 +140,7 @@ final class StageWorker {
                 if (closed) return;
                 e = queue.pollFirst();
             }
+            applyPlacement();
             long started = SystemClock.elapsedRealtime();
             long waited = started - e.queuedAt;
             try {

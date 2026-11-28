@@ -38,6 +38,9 @@ constexpr int kBalancedPipelineSamples = 96;
 constexpr int kMdfTail = 2048;
 constexpr int kPathIdleFrames = 200;
 constexpr int kSpeexNoiseDb = -25;
+// Speex residual-echo suppression without / with near-end speech (its defaults).
+constexpr int kSpeexEchoDb = -40;
+constexpr int kSpeexEchoActiveDb = -15;
 constexpr float kHighPassHz = 200.f;
 constexpr int kMeterFft = 512;
 #ifndef VFE_REFINED
@@ -333,6 +336,10 @@ extern "C" Vfe *vfe_create_mode(int rate, int frame, int mics, int refs, int ns_
     speex_preprocess_ctl(v->pre_state, SPEEX_PREPROCESS_SET_AGC, &off);
     speex_preprocess_ctl(v->pre_state, SPEEX_PREPROCESS_SET_DEREVERB, &off);
     speex_preprocess_ctl(v->pre_state, SPEEX_PREPROCESS_SET_ECHO_STATE, v->mdf->state());
+    int echo = static_cast<int>(Knob("VFE_SPEEX_ECHO", kSpeexEchoDb));
+    int echo_active = static_cast<int>(Knob("VFE_SPEEX_ECHO_ACTIVE", kSpeexEchoActiveDb));
+    speex_preprocess_ctl(v->pre_state, SPEEX_PREPROCESS_SET_ECHO_SUPPRESS, &echo);
+    speex_preprocess_ctl(v->pre_state, SPEEX_PREPROCESS_SET_ECHO_SUPPRESS_ACTIVE, &echo_active);
     v->hp[0].HighPass(kHighPassHz, kRate);
     v->hp[1].HighPass(kHighPassHz, kRate);
     for (Biquad *b : {&v->hm[0], &v->hm[1], &v->hr[0][0], &v->hr[0][1], &v->hr[1][0], &v->hr[1][1]}) {

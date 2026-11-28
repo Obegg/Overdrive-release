@@ -109,5 +109,20 @@ final class VoiceFrontend implements AutoCloseable {
     private static native boolean nativeProcess(long handle, short[] in, int channels, int frame, int frames,
                                                 short[] out, float[] stats, short[] taps);
 
+    /**
+     * The calling thread onto the fastest CPU cluster (on) or back onto every CPU (off); the CPU mask
+     * applied, -1 when the library is absent or the CPUs are all alike.
+     */
+    public static int pinCallingThreadToFastCores(boolean on) {
+        if (!isAvailable()) return -1;
+        try {
+            return nativePinFastCores(on);
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
     private static native void nativeDestroy(long handle);
+
+    private static native int nativePinFastCores(boolean on);
 }
