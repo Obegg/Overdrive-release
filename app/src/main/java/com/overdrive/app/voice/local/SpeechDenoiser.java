@@ -90,8 +90,9 @@ public final class SpeechDenoiser implements AutoCloseable {
         if (closed || in == null || out == null || n < 0 || off < 0 || off > in.length - n) return -1;
         if (n == 0) return 0;
         try {
-            if (scratch.length < n) scratch = new float[n];
-            float[] x = scratch.length == n ? scratch : java.util.Arrays.copyOf(scratch, n);
+            // The native call takes the whole array: keep one of the size in use.
+            if (scratch.length != n) scratch = new float[n];
+            float[] x = scratch;
             for (int i = 0; i < n; i++) x[i] = in[off + i] / 32768f;
             DenoisedAudio y = denoiser.run(x, SAMPLE_RATE);
             float[] s = y.getSamples();

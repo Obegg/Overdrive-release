@@ -454,13 +454,9 @@ final class VoiceEngine implements PcmSink {
 
     // Models the worker or the consumer use; loaded off the consumer, absent ones change nothing.
     /** Consumer-side streaming denoiser (cloud uplink, optional wake input); worker-side one for ASR. */
-    private SpeechDenoiser liveDenoiser;
+    private LiveDenoise liveDenoiser;
     private SpeechDenoiser asrDenoiser;
     private short[] denoised = new short[0];
-    /** Denoiser cost on the consumer, EWMA of ms per second of audio; over budget it is bypassed. */
-    private float liveDenoiseCost;
-    private boolean liveDenoiseOff;
-    private static final float LIVE_DENOISE_BUDGET = 250f;
     private boolean liveDenoiseForWake;
 
     // Measured echo health of the car array, refreshed twice a second by the consumer.
@@ -981,7 +977,7 @@ final class VoiceEngine implements PcmSink {
                 post(() -> {
                     AutoCloseable[] m = loadedSpeech.getAndSet(null);
                     if (m == null) return;
-                    liveDenoiser = (SpeechDenoiser) m[0];
+                    liveDenoiser = m[0] == null ? null : new LiveDenoise((SpeechDenoiser) m[0]);
                     asrDenoiser = (SpeechDenoiser) m[1];
                     Log.i(TAG, "Denoiser " + (liveDenoiser != null ? "on" : "absent"));
                 });
@@ -1088,7 +1084,7 @@ final class VoiceEngine implements PcmSink {
         // not mute a cloud turn's uplink; everything else keeps the half-duplex mute.
         boolean replyMutes = replySpeaking && !(phase == CLOUD && fullDuplexTurn);
         boolean muted = now < mutedUntil || replyMutes || briefReplySpeaking;
-        if (phase == ARMED && config.wakeInputDenoised && liveDenoiser != null && !liveDenoiseOff) {
+        if (phase == ARMED && config.wakeInputDenoised && liveDenoiser != null) {
             if (!liveDenoiseForWake) {
                 liveDenoiser.reset();
                 liveDenoiseForWake = true;
@@ -1162,7 +1158,7 @@ final class VoiceEngine implements PcmSink {
     /** Command-stage audio, already level-normalized. */
     private void onTurnAudio(short[] pcm, int off, int n, long now, boolean countSpeech) {
         // A cloud turn hears (Silero) and uplinks the denoised audio when the model is present.
-        if (phase == CLOUD && config.denoiseSpeech && liveDenoiser != null && !liveDenoiseOff) {
+        if (phase == CLOUD && config.denoiseSpeech && liveDenoiser != null) {
             if (liveDenoiseForWake) {
                 liveDenoiser.reset();
                 liveDenoiseForWake = false;
@@ -1261,38 +1257,12 @@ final class VoiceEngine implements PcmSink {
         return out;
     }
 
-    /** Streaming GTCRN on the consumer, bypassed for good once it costs too much real time. */
+    /** Streaming GTCRN on its own thread: queues this audio, takes what is denoised so far (in order). */
     private int denoiseLive(short[] pcm, int off, int n) {
-        int need = n + 2 * Math.max(160, liveDenoiser.frameShift()) + liveDenoiser.latencySamples();
+        // Room for twice the input, so output that arrives in a burst drains within a few chunks.
+        int need = 2 * n + 4 * liveDenoiser.frameShift();
         if (denoised.length < need) denoised = new short[need];
-        long t0 = System.nanoTime();
-        int m;
-        try {
-            m = liveDenoiser.process(pcm, off, n, denoised);
-        } catch (Throwable t) {
-            Log.w(TAG, "Denoiser failed; bypassed: " + t.getMessage());
-            liveDenoiseOff = true;
-            return n == 0 ? 0 : copyThrough(pcm, off, n);
-        }
-        if (m < 0) {
-            // -1 is the denoiser's failure return: bypass it rather than drop the audio.
-            Log.w(TAG, "Denoiser failed; bypassed");
-            liveDenoiseOff = true;
-            return n == 0 ? 0 : copyThrough(pcm, off, n);
-        }
-        float msPerSecond = (System.nanoTime() - t0) / 1e6f * RATE / Math.max(1, n);
-        liveDenoiseCost += (msPerSecond - liveDenoiseCost) * 0.05f;
-        if (liveDenoiseCost > LIVE_DENOISE_BUDGET) {
-            liveDenoiseOff = true;
-            Log.w(TAG, "Denoiser costs " + Math.round(liveDenoiseCost) + " ms/s on the audio thread; bypassed");
-        }
-        return m;
-    }
-
-    private int copyThrough(short[] pcm, int off, int n) {
-        if (denoised.length < n) denoised = new short[n];
-        System.arraycopy(pcm, off, denoised, 0, n);
-        return n;
+        return liveDenoiser.process(pcm, off, n, denoised);
     }
 
     private void tick(long now) {
