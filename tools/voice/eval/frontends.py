@@ -57,7 +57,7 @@ class Speex:
 class Vfe:
     """vfe.h: vfe_create(rate, frame, mics, refs, ns_level) / vfe_process(v, in, out, stats, taps)."""
     name = 'vfe'
-    STATS = 16
+    STATS = 24
 
     def __init__(self, lib, ns_level=2):
         self.lib = ctypes.CDLL(lib)

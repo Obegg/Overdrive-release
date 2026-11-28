@@ -104,6 +104,7 @@ void AlignedMdf::EstimateDelay(const short *mic, const short *ref0, const short 
     if (!d) continue;
     const int samples = static_cast<int>(render_->Delay()) * kBlock;
     delay_ms_ = samples * 1000 / rate_;
+    estimated_frame_ = frames_;
     const int want = std::max(0, samples - kMarginSamples);
     if (want == candidate_) {
       candidate_blocks_++;
@@ -131,6 +132,26 @@ void AlignedMdf::EstimateDelay(const short *mic, const short *ref0, const short 
   fifo_r1_.erase(fifo_r1_.begin(), fifo_r1_.begin() + used);
 }
 
+int AlignedMdf::delay_age_ms() const {
+  return estimated_frame_ < 0 ? -1 : static_cast<int>((frames_ - estimated_frame_) * frame_ * 1000 / rate_);
+}
+
+void AlignedMdf::Skip(const short *ref0, const short *ref1) {
+  for (int i = 0; i < frame_; i++) {
+    ring0_[(pos_ + i) & (kRing - 1)] = ref0[i];
+    ring1_[(pos_ + i) & (kRing - 1)] = ref1[i];
+  }
+  pos_ += frame_;
+  frames_++;
+  if (!skipping_) {
+    // A partial estimator block must not splice onto the audio after the gap.
+    fifo_mic_.clear();
+    fifo_r0_.clear();
+    fifo_r1_.clear();
+    skipping_ = true;
+  }
+}
+
 int AlignedMdf::delay_ms() const {
   if (delay_ms_ < 0) return -1;
   const int samples = delay_ms_ * rate_ / 1000;
@@ -139,6 +160,8 @@ int AlignedMdf::delay_ms() const {
 }
 
 void AlignedMdf::Process(const short *mic, const short *ref0, const short *ref1, short *out) {
+  skipping_ = false;
+  frames_++;
   for (int i = 0; i < frame_; i++) {
     ring0_[(pos_ + i) & (kRing - 1)] = ref0[i];
     ring1_[(pos_ + i) & (kRing - 1)] = ref1[i];

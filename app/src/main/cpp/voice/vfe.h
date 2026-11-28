@@ -24,7 +24,13 @@ enum {
     VFE_BEAM_CONFIDENCE,   // 0 = plain average, 1 = fully adaptive beam
     VFE_MIC_DB, VFE_REF_DB, VFE_OUT_DB,
     VFE_ERL_DB,
-    VFE_STATS = 16
+    VFE_ENR_DB,            // balanced: echo (linear estimate or coupled refs) vs the cabin noise floor, dB; NaN unknown
+    VFE_BELOW_NOISE,       // 1 while that echo stays below the noise floor (nothing worth cancelling)
+    VFE_LAST_DELAY_MS,     // last delay estimate, kept while the estimator idles; -1 before any
+    VFE_DELAY_AGE_MS,      // time since that estimate, -1 before any
+    VFE_CH_POWER,          // 4 floats: mean square of each raw input channel (mics, then refs)
+    VFE_ECHO_BYPASS = VFE_CH_POWER + 4,  // 1 while idle refs bypass the echo canceller
+    VFE_STATS = 24
 };
 
 /**

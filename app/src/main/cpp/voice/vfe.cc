@@ -29,6 +29,7 @@ constexpr float kRefActiveRms = 10.f;
 constexpr int kRefHoldFrames = 50;
 constexpr int kConvergeFrames = 300;
 constexpr int kResetIdleFrames = 500;
+constexpr int kBypassIdleFrames = kResetIdleFrames - 50;
 // Fixed latency from mic input to output: AEC3 blocking (~128), beam hop (160), NS overlap (64);
 // balanced mode: the MDF path has only the preprocess overlap.
 constexpr int kPipelineSamples = 352;
@@ -62,6 +63,22 @@ constexpr int kLinearLatency = 64;
 constexpr float kMeterBias = VFE_METER_BIAS;
 // Coherence that unprocessed speaker echo reaches (long cabin tails, speaker non-linearity) maps to 1.
 constexpr float kMeterFull = VFE_METER_SAT;
+// Echo vs cabin noise (balanced mode), in 100 ms blocks over the last 3 s of reference activity.
+constexpr int kNoiseBlockFrames = 10;
+constexpr int kNoiseBlocks = 30;
+constexpr int kNoiseMinBlocks = 20;
+constexpr int kNoiseRecentBlocks = 5;
+// Echo per unit reference before one is measured: about what the field car showed (-1 dB).
+constexpr float kDefaultCouplingDb = 0.f;
+constexpr float kCouplingErleDb = 15.f;
+// Below noise: the window's echo within this of the floor, no 0.5 s above the second margin, and
+// (to enter) a mic that sits near its floor rather than following music the refs do not carry.
+constexpr float kBelowNoiseDb = 3.f;
+constexpr float kBelowNoiseRecentDb = 6.f;
+constexpr float kNoiseSpreadDb = 3.f;
+// The flatness check uses 20 ms blocks: music moves 5-9 dB between them, cabin noise 1-1.5 dB.
+constexpr int kFlatFrames = 2;
+constexpr int kFlatBlocks = kNoiseBlocks * kNoiseBlockFrames / kFlatFrames;
 
 using cf = std::complex<float>;
 
@@ -117,9 +134,23 @@ class EchoMeter {
   /** Keeps the output history current on frames that are not scored. */
   void Hold(const float *out) { out_stft_.Keep(out); }
 
+  /** Refs idle (canceller bypassed): their smoothed spectra are cleared; the output keeps its history. */
+  void Pause() {
+    for (auto &a : srr_) std::fill(a.begin(), a.end(), 0.f);
+    for (auto &a : syr_) std::fill(a.begin(), a.end(), cf());
+    resume_ = true;
+  }
+
   /** Score of the newest output hop; delay_samples aligns refs to the output. */
   float Score(const float *out, int delay_samples) {
     out_stft_.Push(out, y_.data());
+    if (resume_) {
+      // As if the output had been tracked through the pause.
+      for (auto &a : syy_) {
+        for (int k = lo_; k <= hi_; k++) a[k] = std::norm(y_[k]);
+      }
+      resume_ = false;
+    }
     float best = 0;
     for (int a = 0; a < kAlign; a++) {
       const int d = std::max(0, delay_samples + (a - 1) * 128);
@@ -170,6 +201,7 @@ class EchoMeter {
   std::vector<float> syy_[kAlign], srr_[kAlign * kChannels];
   std::vector<cf> syr_[kAlign * kChannels];
   long pos_ = 0;
+  bool resume_ = false;
 };
 
 // Tuning constant; host builds (offline bench / eval harness) may override it from the environment.
@@ -253,6 +285,19 @@ struct Vfe {
   float linear_erle = 0, erl = 0, last_score = 0;
   float res_num[100] = {0}, res_den[100] = {0};
   double res_num_sum = 0, res_den_sum = 0;
+  // Refs idle >= 0.5 s (balanced): MDF, its delay estimator and the meter are skipped.
+  bool bypass_enabled = true, bypass = false, meter_idle = false;
+  float notch_mem[2] = {0, 0}, mem_d = 0, mem_e = 0;
+  // Echo vs noise (balanced): high-passed mic average, MDF's echo estimate, high-passed refs.
+  Biquad hm[2], hr[2][2];
+  double nb_mic = 0, nb_echo = 0, nb_ref = 0;
+  int nb_frames = 0, nb_count = 0, nb_slot = 0;
+  float blk_mic[kNoiseBlocks] = {}, blk_echo[kNoiseBlocks] = {};
+  float flat_mic[kFlatBlocks] = {};
+  double flat_acc = 0, band_mic_e = 0;
+  int flat_count = 0, flat_slot = 0, flat_frames_acc = 0;
+  float coupling_db = kDefaultCouplingDb, enr_db = NAN;
+  bool coupling_known = false, below_noise = false;
   ~Vfe() {
     if (pre_state) speex_preprocess_state_destroy(pre_state);
   }
@@ -290,6 +335,10 @@ extern "C" Vfe *vfe_create_mode(int rate, int frame, int mics, int refs, int ns_
     speex_preprocess_ctl(v->pre_state, SPEEX_PREPROCESS_SET_ECHO_STATE, v->mdf->state());
     v->hp[0].HighPass(kHighPassHz, kRate);
     v->hp[1].HighPass(kHighPassHz, kRate);
+    for (Biquad *b : {&v->hm[0], &v->hm[1], &v->hr[0][0], &v->hr[0][1], &v->hr[1][0], &v->hr[1][1]}) {
+      b->HighPass(kHighPassHz, kRate);
+    }
+    v->bypass_enabled = Knob("VFE_IDLE_BYPASS", 1) > 0.5f;
   } else {
 #if !defined(__ANDROID__) || defined(VFE_ALL_MODES)
     webrtc::EchoCanceller3Config cfg;
@@ -374,6 +423,97 @@ double ProcessAec3(Vfe *v, bool ref_active, float *const *cap, float *src[kChann
 #endif
 }
 
+/** MDF's output path with a zero echo estimate (speexdsp mdf.c, float build, 16 kHz notch radius). */
+void ReplicaFrame(Vfe *v, bool emit) {
+  const float r = 0.982f, preemph = 0.9f;
+  const float den2 = r * r + .7 * (1 - r) * (1 - r);
+  float *mem = v->notch_mem;
+  for (int i = 0; i < kFrame; i++) {
+    const float vin = v->mic_avg[i];
+    const float vout = mem[0] + vin;
+    mem[0] = mem[1] + 2 * (-vin + r * vout);
+    mem[1] = vin - den2 * vout;
+    const float input = r * vout;
+    const float pre = input - preemph * v->mem_d;
+    v->mem_d = input;
+    const float out = pre - 0.f + preemph * v->mem_e;
+    v->mem_e = out;
+    if (emit) v->mdf_out[i] = out < -32767.5f ? -32768 : out > 32766.5f ? 32767 : static_cast<int16_t>(std::floor(.5 + out));
+  }
+}
+
+/** Echo vs cabin noise: one 100 ms block of mic, linear echo estimate and coupled reference power. */
+void EchoNoiseBlock(Vfe *v, double pm, double pe, double pr) {
+  const bool converged = v->active_run >= kConvergeFrames;
+  // Echo per unit reference, learned only while MDF cancels well (its estimate is then the echo).
+  if (converged && v->erle_db >= kCouplingErleDb && pr > 1.0) {
+    const float c = std::min(6.f, std::max(-20.f, static_cast<float>(10 * std::log10((pe + 1e-3) / pr))));
+    v->coupling_db = v->coupling_known ? v->coupling_db + 0.05f * (c - v->coupling_db) : c;
+    v->coupling_known = true;
+  }
+  const double coupled = pr * std::pow(10.0, v->coupling_db / 10.0);
+  v->blk_mic[v->nb_slot] = static_cast<float>(pm);
+  v->blk_echo[v->nb_slot] = static_cast<float>(std::max(pe, coupled));
+  v->nb_slot = (v->nb_slot + 1) % kNoiseBlocks;
+  v->nb_count = std::min(kNoiseBlocks, v->nb_count + 1);
+  if (v->nb_count < kNoiseMinBlocks) {
+    v->enr_db = NAN;
+    v->below_noise = false;
+    return;
+  }
+  float sorted[kNoiseBlocks];
+  std::copy(v->blk_mic, v->blk_mic + v->nb_count, sorted);
+  std::sort(sorted, sorted + v->nb_count);
+  // Minimum statistics: the second-lowest block is the noise floor, speech and music sit above it.
+  const double floor = sorted[1] + 1e-3;
+  double mean = 0, recent = 0;
+  for (int i = 0; i < v->nb_count; i++) mean += v->blk_echo[i];
+  mean /= v->nb_count;
+  for (int i = 1; i <= kNoiseRecentBlocks; i++) {
+    recent = std::max(recent, static_cast<double>(v->blk_echo[(v->nb_slot - i + kNoiseBlocks) % kNoiseBlocks]));
+  }
+  v->enr_db = static_cast<float>(10 * std::log10((mean + 1e-3) / floor));
+  const bool quiet = v->enr_db <= kBelowNoiseDb && 10 * std::log10((recent + 1e-3) / floor) <= kBelowNoiseRecentDb;
+  bool flat = false;
+  if (!v->below_noise && v->flat_count >= kFlatBlocks / 2) {
+    float f[kFlatBlocks];
+    std::copy(v->flat_mic, v->flat_mic + v->flat_count, f);
+    std::sort(f, f + v->flat_count);
+    flat = 10 * std::log10((f[v->flat_count / 2] + 1e-3) / (f[1] + 1e-3)) <= kNoiseSpreadDb;
+  }
+  v->below_noise = converged && quiet && (v->below_noise || flat);
+}
+
+void NoteEchoNoise(Vfe *v) {
+  double pm = 0, pe = 0, pr = 0;
+  for (int i = 0; i < kFrame; i++) {
+    const double m = v->hm[1].Run(v->hm[0].Run(v->mic_avg[i]));
+    const double e = m - v->mdf_line[i];
+    const double r0 = v->hr[0][1].Run(v->hr[0][0].Run(v->refs[0][i]));
+    const double r1 = v->hr[1][1].Run(v->hr[1][0].Run(v->refs[1][i]));
+    pm += m * m;
+    pe += e * e;
+    pr += 0.5 * (r0 * r0 + r1 * r1);
+  }
+  v->band_mic_e = pm / kFrame;
+  v->flat_acc += pm;
+  if (++v->flat_frames_acc >= kFlatFrames) {
+    v->flat_mic[v->flat_slot] = static_cast<float>(v->flat_acc / (kFlatFrames * kFrame));
+    v->flat_slot = (v->flat_slot + 1) % kFlatBlocks;
+    v->flat_count = std::min(kFlatBlocks, v->flat_count + 1);
+    v->flat_acc = 0;
+    v->flat_frames_acc = 0;
+  }
+  v->nb_mic += pm;
+  v->nb_echo += pe;
+  v->nb_ref += pr;
+  if (++v->nb_frames < kNoiseBlockFrames) return;
+  const double n = static_cast<double>(kNoiseBlockFrames) * kFrame;
+  EchoNoiseBlock(v, v->nb_mic / n, v->nb_echo / n, v->nb_ref / n);
+  v->nb_mic = v->nb_echo = v->nb_ref = 0;
+  v->nb_frames = 0;
+}
+
 /**
  * Balanced: with the references playing, the mic average through the aligned MDF, high-passed and
  * Speex residual-echo + noise suppression (the shipped chain, now delay-robust); with them idle, the
@@ -386,7 +526,20 @@ double ProcessBalanced(Vfe *v, const int16_t *in, bool ref_active, float *const 
     v->refs[0][i] = in[i * ch + 2];
     v->refs[1][i] = in[i * ch + 3];
   }
-  v->mdf->Process(v->mic_avg, v->refs[0], v->refs[1], v->mdf_out);
+  // Refs idle for 0.5 s: nothing to cancel, so MDF (state kept, no re-convergence) is skipped and
+  // Speex suppresses noise only; the first active-ref frame resumes it.
+  // Refs idle for 5 s (the canceller counts as unconverged by then): MDF (state kept) and its delay
+  // estimator are skipped; a shorter skip changed MDF's state at resume and cost eval recall.
+  const bool bypass = v->bypass_enabled && !ref_active && v->ref_idle >= kBypassIdleFrames;
+  v->bypass = bypass;
+  // MDF's echo-free path, float op for op (DC notch, pre-emphasis, de-emphasis), run on every frame
+  // so its state equals MDF's whenever the refs are silent; bypassed frames take its output.
+  ReplicaFrame(v, bypass);
+  if (bypass) {
+    v->mdf->Skip(v->refs[0], v->refs[1]);
+  } else {
+    v->mdf->Process(v->mic_avg, v->refs[0], v->refs[1], v->mdf_out);
+  }
   // The MDF path stays undelayed so Speex's residual-echo estimate lines up with it; the beam path
   // (refs idle) runs one hop later, a one-off 10 ms step at the crossfade.
   float *line = v->mdf_line;
@@ -398,7 +551,9 @@ double ProcessBalanced(Vfe *v, const int16_t *in, bool ref_active, float *const 
   // Short reference dropouts keep the canceller path; the beam takes over once the music stopped.
   const float target = !v->idle_beam || ref_active || v->ref_idle < kPathIdleFrames ? 1.f : 0.f;
   const bool need_beam = v->beam_mix < 1.f || target < 1.f;
-  v->hpf->Process(v->capture.get(), false);
+  if (ref_active && !bypass) NoteEchoNoise(v);
+  // Only the beam reads the high-passed capture.
+  if (need_beam || v->idle_beam) v->hpf->Process(v->capture.get(), false);
   for (int c = 0; c < kChannels; c++) src[c] = cap[c];
   if (need_beam) v->beam->Process(cap[0], cap[1], nullptr, nullptr, 0.f, 0.f, v->beam_out);
   double e = 0;
@@ -447,16 +602,19 @@ extern "C" int vfe_process(Vfe *v, const int16_t *in, int16_t *out, float *stats
   const int ch = 2 * kChannels;
   float *const *cap = v->capture->channels();
   float *const *ren = v->render->channels();
-  double ref_e = 0, mic_e = 0;
+  double ref_e = 0, mic_e = 0, ch_e[2 * kChannels];
   for (int c = 0; c < kChannels; c++) {
-    double e = 0;
+    double e = 0, m = 0;
     for (int i = 0; i < kFrame; i++) {
       cap[c][i] = in[i * ch + c];
-      mic_e += cap[c][i] * cap[c][i];
+      m += cap[c][i] * cap[c][i];
       const float r = in[i * ch + kChannels + c];
       ren[c][i] = r;
       e += r * r;
     }
+    mic_e += m;
+    ch_e[c] = m / kFrame;
+    ch_e[kChannels + c] = e / kFrame;
     ref_e = std::max(ref_e, e / kFrame);
   }
   mic_e /= kChannels * kFrame;  // mean mic power before the canceller
@@ -473,7 +631,8 @@ extern "C" int vfe_process(Vfe *v, const int16_t *in, int16_t *out, float *stats
   if (ref_active) {
     v->ref_idle = 0;
     v->active_run++;
-    v->mic_sum += mic_e;
+    // Balanced: in the band the output keeps (high-passed mic average), so the high-pass alone never reads as cancelling.
+    v->mic_sum += v->mdf ? v->band_mic_e : mic_e;
     v->aec_sum += aec_e;
     if (++v->erle_frames == 100) {
       // One-second blocks; the best of the last three ignores blocks dominated by near-end speech.
@@ -485,6 +644,11 @@ extern "C" int vfe_process(Vfe *v, const int16_t *in, int16_t *out, float *stats
   } else if (++v->ref_idle >= kResetIdleFrames) {
     v->active_run = 0;
     v->erle_block[0] = v->erle_block[1] = v->erle_block[2] = v->erle_db = 0;
+    v->nb_count = v->nb_frames = v->flat_count = v->flat_frames_acc = 0;
+    v->flat_acc = 0;
+    v->nb_mic = v->nb_echo = v->nb_ref = 0;
+    v->below_noise = false;
+    v->enr_db = NAN;
   }
 
   double out_e = 0;
@@ -498,17 +662,22 @@ extern "C" int vfe_process(Vfe *v, const int16_t *in, int16_t *out, float *stats
   float score = NAN;
   static const bool no_meter = Knob("VFE_NO_METER", 0) > 0.5f;
   if (no_meter) {
+  } else if (!ref_active) {
+    // Refs idle 0.5 s: nothing to score; the meter only keeps the output history.
+    if (!v->meter_idle) v->meter->Pause();
+    v->meter_idle = true;
+    v->meter->Hold(v->out_f);
+    v->last_score = 0;
   } else if (v->frames % 2 == 1) {
+    v->meter_idle = false;
     // The meter is smoothed over ~120 ms: every other frame is enough, the odd one repeats.
     v->meter->Hold(v->out_f);
-    if (ref_active) score = v->last_score;
-  } else if (ref_active) {
+    score = v->last_score;
+  } else {
+    v->meter_idle = false;
     const int delay = (v->delay_ms > 0 ? v->delay_ms * kRate / 1000 : 0) + pipeline;
     score = v->meter->Score(v->out_f, delay);
     v->last_score = score;
-  } else {
-    v->meter->Score(v->out_f, pipeline);
-    v->last_score = 0;
   }
   const int slot = v->frames % 100;
   v->res_num_sum -= v->res_num[slot];
@@ -542,6 +711,12 @@ extern "C" int vfe_process(Vfe *v, const int16_t *in, int16_t *out, float *stats
     stats[VFE_REF_DB] = Db(ref_e);
     stats[VFE_OUT_DB] = Db(out_e);
     stats[VFE_ERL_DB] = v->erl;
+    stats[VFE_ENR_DB] = v->enr_db;
+    stats[VFE_BELOW_NOISE] = v->below_noise ? 1.f : 0.f;
+    stats[VFE_LAST_DELAY_MS] = static_cast<float>(v->mdf ? v->mdf->delay_ms() : v->delay_ms);
+    stats[VFE_DELAY_AGE_MS] = static_cast<float>(v->mdf ? v->mdf->delay_age_ms() : (v->delay_ms >= 0 ? 0 : -1));
+    for (int c = 0; c < 2 * kChannels; c++) stats[VFE_CH_POWER + c] = static_cast<float>(ch_e[c]);
+    stats[VFE_ECHO_BYPASS] = v->bypass ? 1.f : 0.f;
   }
   return 1;
 }

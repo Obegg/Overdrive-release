@@ -29,8 +29,12 @@ class AlignedMdf {
 
   /** mic: one mono frame; refs: two frames; out: the echo-cancelled frame. */
   void Process(const short *mic, const short *ref0, const short *ref1, short *out);
+  /** Refs idle: keeps the reference history and clock only; MDF and the delay estimator keep their state. */
+  void Skip(const short *ref0, const short *ref1);
   /** Echo delay (ms) the canceller works at: the estimate when inside MDF's window, else the window's start. -1 before any estimate. */
   int delay_ms() const;
+  /** Time since the delay estimator last produced an estimate, -1 before any. */
+  int delay_age_ms() const;
   SpeexEchoState *state() { return echo_; }
 
  private:
@@ -45,8 +49,8 @@ class AlignedMdf {
   std::vector<short> ring0_, ring1_, aligned_;
   long pos_ = 0;
   int align_ = 0, candidate_ = -1, candidate_blocks_ = 0, delay_ms_ = -1;
-  bool started_ = false;
-  long block_count_ = 0;
+  bool started_ = false, skipping_ = false;
+  long block_count_ = 0, frames_ = 0, estimated_frame_ = -1;
   double mic_sum_ = 0, out_sum_ = 0;
   int erle_frames_ = 0, erle_slot_ = 0;
   float erle_[3] = {0, 0, 0}, best_erle_db_ = 0;

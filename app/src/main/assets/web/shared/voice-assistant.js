@@ -751,7 +751,8 @@
             if (echoItem) echoItem.hidden = !echo;
             if (echo) {
                 this.setText('voiceEchoHealth', echo.state === 'healthy'
-                    ? (echo.erleDb != null ? t('echo_healthy_fmt', { erle: echo.erleDb }) : t('echo_healthy'))
+                    // Echo below the cabin noise floor: healthy, and its (low) ERLE says nothing.
+                    ? (echo.erleDb != null && !echo.belowNoise ? t('echo_healthy_fmt', { erle: echo.erleDb }) : t('echo_healthy'))
                     : t('echo_unhealthy'));
             }
 
