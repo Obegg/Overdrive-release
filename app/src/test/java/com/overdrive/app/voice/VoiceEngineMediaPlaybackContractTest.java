@@ -173,10 +173,10 @@ public class VoiceEngineMediaPlaybackContractTest {
         int submit = body.indexOf("worker.submit(StageWorker.KIND_WAKE");
         assertTrue(echo >= 0 && submit > echo);
         assertTrue(block(src, "    private static void verifyOnWorker(WakeCheck c) {")
-                .contains("if (!heard && n > 0 && c.sttAllowed && c.stt != null) {"));
+                .contains("if (!heard && !c.cancelled && n > 0 && c.sttAllowed && c.stt != null) {"));
         String verdict = block(src, "    private void onWakeVerdict(WakeCheck c) {");
         int reject = verdict.indexOf("rejectedWakes.incrementAndGet();");
-        int hold = verdict.indexOf("long hold = MediaWakeGate.refractoryAfterRejectMs(c.guarded, c.healthy);");
+        int hold = verdict.indexOf("long hold = \"preempt\".equals(by) ? 0 : MediaWakeGate.refractoryAfterRejectMs(c.guarded, c.healthy);");
         int apply = verdict.indexOf("if (hold > 0) refractoryUntil = SystemClock.elapsedRealtime() + hold;");
         assertTrue(reject >= 0 && hold > reject && apply > hold);
         assertTrue(verdict.contains("if (!running || c.turnAt != turn || phase != ARMED || wake == null) return;"));

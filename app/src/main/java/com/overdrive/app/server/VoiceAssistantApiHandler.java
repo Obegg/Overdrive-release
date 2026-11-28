@@ -645,11 +645,13 @@ public final class VoiceAssistantApiHandler {
         copyToken(turn, t, "eosBy", "[a-z_]{1,16}");
         copyClamped(turn, t, "eosMs", 0, 60_000);
         copyToken(turn, t, "eosCls", "[a-z]{1,12}");
+        copyToken(turn, t, "cloudFail", "[a-z_]{1,16}");
         if (Boolean.TRUE.equals(turn.opt("duplex"))) t.put("duplex", true);
         copyClamped(turn, t, "interrupts", 0, 100);
         copyClamped(turn, t, "inChars", 0, 10_000);
         copyClamped(turn, t, "tools", 0, 100);
         copyClamped(turn, t, "vqMs", 0, 60_000);
+        copyClamped(turn, t, "wakeMs", 0, 60_000);
         copyClamped(turn, t, "asrQMs", 0, 60_000);
         copyClamped(turn, t, "lagMs", 0, 600_000);
         return t;
@@ -711,11 +713,13 @@ public final class VoiceAssistantApiHandler {
         if (t.has("eosBy")) items.add("end " + t.optString("eosBy")
                 + (t.has("eosMs") ? " after " + t.optInt("eosMs") + " ms" : "")
                 + (t.has("eosCls") ? " (" + t.optString("eosCls") + ")" : ""));
+        if (t.has("cloudFail")) items.add("cloud " + t.optString("cloudFail") + ", ran the local match");
         if (t.has("duplex")) items.add("full duplex");
         if (t.has("interrupts")) items.add("barge-in " + t.optInt("interrupts"));
         if (t.has("inChars")) items.add("heard " + t.optInt("inChars") + " chars");
         if (t.has("tools")) items.add("tools " + t.optInt("tools"));
         if (t.has("vqMs")) items.add("verify queued " + t.optInt("vqMs") + " ms");
+        if (t.has("wakeMs")) items.add("trigger to wake " + t.optInt("wakeMs") + " ms");
         if (t.has("asrQMs")) items.add("stt queued " + t.optInt("asrQMs") + " ms");
         if (t.optInt("lagMs") > 0) items.add("lag " + t.optInt("lagMs") + " ms");
         return items.isEmpty() ? "" : " [" + String.join(", ", items) + "]";

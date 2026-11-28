@@ -141,7 +141,7 @@ public class VoiceEngineDispatchContractTest {
         assertTrue(resetDecodes > rebase);
         assertTrue(decode.indexOf("toMatch(", resetDecodes) > resetDecodes);
         String verify = block(src,
-                "    private int verifyWith(short[] pcm, int offset, int length, String keywords) {");
+                "    private int verifyWith(short[] pcm, int offset, int length, String keywords,");
         assertTrue(verify.contains("if (reset || times == null || times.length == 0) return WAKE_END_UNKNOWN;"));
         assertTrue(verify.contains("int end = Math.round(times[times.length - 1] * SAMPLE_RATE);"));
     }

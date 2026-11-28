@@ -24,6 +24,8 @@ final class VoicePrompts {
     static final String NOT_UNDERSTOOD = "status_not_understood";
     static final String OFFLINE = "status_offline";
     static final String BUSY = "status_busy";
+    /** The provider is overloaded or out of quota (a different case from our one session slot being taken). */
+    static final String SERVICE_BUSY = "status_service_busy";
 
     private static final String TAG = "VoicePrompts";
     private static final String DIR = "voice/prompts/";

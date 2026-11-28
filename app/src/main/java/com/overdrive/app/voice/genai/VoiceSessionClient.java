@@ -56,7 +56,7 @@ public final class VoiceSessionClient {
         void onTurnComplete();                        // model finished its response
         void onActionProposal(JSONObject proposal);
         void onContextRequest(JSONObject request);
-        void onEnded(String reason);                  // "done" | "busy" | "unavailable" | "failed" | "connect_failed" | "setup_failed" | "cancelled"
+        void onEnded(String reason);                  // "done" | "busy" | "unavailable" | "failed" | "connect_failed" | "setup_failed" | "cloud_busy" | "cloud_quota" | "cancelled"
 
         /** Trip Briefing sessions only: the model called trip_briefing_answer ("yes" | "no", app or null). */
         default void onBriefingAnswer(String answer, String app) {
@@ -68,6 +68,10 @@ public final class VoiceSessionClient {
 
         /** The provider's transcript of the user's turn so far; {@code done} once the turn is over. */
         default void onInputTranscript(String partial, boolean done) {
+        }
+
+        /** The live provider sent nothing for 6 s after the end of speech (overloaded, the 2026-11-28 field case). */
+        default void onProviderSilent() {
         }
     }
 
@@ -549,6 +553,9 @@ public final class VoiceSessionClient {
                 case "user_speech_end":
                     post(listener::onUserSpeechStopped);
                     break;
+                case "provider_silent":
+                    post(listener::onProviderSilent);
+                    break;
                 case "input_transcript": {
                     final String heard = m.optString("text", "");
                     final boolean done = m.optBoolean("done", false);
@@ -867,6 +874,9 @@ public final class VoiceSessionClient {
     }
 
     private String failureReasonLocked() {
+        // The provider refused for load or quota (setup or live): the engine says so instead of "offline".
+        if ("provider_busy".equals(failureCode)) return "cloud_busy";
+        if ("provider_quota".equals(failureCode)) return "cloud_quota";
         // A dial that never got a provider answer is a connect failure, not a dead session.
         if (!live && ("connect_timeout".equals(failureCode) || "connect_failed".equals(failureCode))) {
             return "connect_failed";

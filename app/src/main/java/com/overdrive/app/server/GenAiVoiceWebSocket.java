@@ -122,6 +122,31 @@ public final class GenAiVoiceWebSocket {
                 || r.contains("rate limit") || r.contains("too many requests");
     }
 
+    static final String CODE_PROVIDER_BUSY = "provider_busy";
+    static final String CODE_PROVIDER_QUOTA = "provider_quota";
+    // No provider event this long after audioStreamEnd: the client is told (the 8 s turn deadline follows).
+    static final long PROVIDER_SILENT_MS = 6_000L;
+
+    /** "quota" (quota, rate limit, HTTP 429), "busy" (overloaded, high demand, HTTP 503) or null. */
+    static String providerBusyKind(String reason) {
+        String r = reason == null ? "" : reason.toLowerCase(Locale.ROOT);
+        if (isQuotaRefusal(r) || r.contains("http 429") || r.contains("code 429")) return "quota";
+        return r.contains("high demand") || r.contains("overloaded") || r.contains("http 503")
+                || r.contains("code 503") || r.contains("service unavailable")
+                || r.contains("currently unavailable") || r.contains("try again later") ? "busy" : null;
+    }
+
+    /** A provider error text for the log or client: one line, URLs and key values cut, at most {@code max} chars. */
+    static String errorBodyForLog(String raw, int max) {
+        String v = raw == null ? "" : raw.replace('\r', ' ').replace('\n', ' ');
+        v = v.replaceAll("(?i)(?:https?|wss?)://\\S*", "<url>")
+                .replaceAll("(?i)(key|api_key|apikey|token|access_token)=[^&\\s\"]*", "$1=<redacted>")
+                .replaceAll("AIza[0-9A-Za-z_\\-]{10,}", "<redacted>")
+                .replaceAll("sk-[0-9A-Za-z_\\-]{10,}", "<redacted>")
+                .replaceAll(" +", " ").trim();
+        return v.length() > max ? v.substring(0, max) : v;
+    }
+
     static boolean googleSearchOffered(long now) {
         synchronized (SEARCH_LOCK) {
             return !googleSearchRejected && now >= googleSearchRetryAt;
@@ -630,6 +655,13 @@ public final class GenAiVoiceWebSocket {
         private volatile int uplinkRate = 16_000;
         // Earliest end-of-speech mark of the current user turn (client audioStreamEnd or provider VAD).
         private volatile long endOfSpeechAt;
+        // Provider silence after audioStreamEnd (overloaded provider): last event, last stream end, noted once.
+        private volatile long lastProviderEventAt;
+        private volatile long streamEndSentAt;
+        private boolean silenceNoted;
+        // The realtime model of the current attempt; the configured fallback replaces it for one retry.
+        private String modelThisAttempt = "";
+        private boolean triedFallbackModel;
         private volatile long firstReplyMs = -1;
         private volatile long lastTotalTokens = -1;
         // A user turn is open from its first speech signal until the model's turn completes.
@@ -801,6 +833,7 @@ public final class GenAiVoiceWebSocket {
             boolean openAi = GenAiConfig.PROVIDER_OPENAI.equals(
                     config.provider);
             provider = String.valueOf(config.provider);
+            modelThisAttempt = config.realtimeModel;
             int inputRate = openAi ? 24_000 : 16_000;
             uplinkRate = inputRate;
             sendJson(new JSONObject()
@@ -906,8 +939,23 @@ public final class GenAiVoiceWebSocket {
                         openProvider(openAi, instructions, "direct (fallback)".equals(route));
                         continue;
                     } else if (decision.startsWith("fail:")) {
-                        failAndClose(failure, 1011,
-                                providerFailureCode != null ? providerFailureCode : decision.substring(5));
+                        String busy = providerBusyKind(failure);
+                        String fallback = config.realtimeFallbackModel;
+                        if (busy != null && !triedFallbackModel && !fallback.isEmpty()
+                                && !fallback.equals(modelThisAttempt)) {
+                            // Once, and only to a fallback the user configured.
+                            triedFallbackModel = true;
+                            modelThisAttempt = fallback;
+                            logger.warn("Realtime provider " + busy + " at setup (" + failure
+                                    + "); retrying once with the fallback realtime model");
+                            openProvider(openAi, instructions, "direct (fallback)".equals(route));
+                            continue;
+                        }
+                        String code = "quota".equals(busy) ? CODE_PROVIDER_QUOTA
+                                : "busy".equals(busy) ? CODE_PROVIDER_BUSY
+                                : providerFailureCode != null ? providerFailureCode : decision.substring(5);
+                        if (busy != null) logger.warn("Realtime provider " + busy + " at setup: " + failure);
+                        failAndClose(failure, 1011, code);
                         return;
                     }
                 } else {
@@ -930,9 +978,19 @@ public final class GenAiVoiceWebSocket {
                             return;
                         }
                     } else if (failure != null) {
-                        failAndClose(failure, 1011,
-                                providerFailureCode != null ? providerFailureCode : "provider_failed");
+                        String busy = providerBusyKind(failure);
+                        failAndClose(failure, 1011, "quota".equals(busy) ? CODE_PROVIDER_QUOTA
+                                : "busy".equals(busy) ? CODE_PROVIDER_BUSY
+                                : providerFailureCode != null ? providerFailureCode : "provider_failed");
                         return;
+                    }
+                    long endAt = streamEndSentAt;
+                    if (endAt > 0 && !silenceNoted && lastProviderEventAt < endAt
+                            && now - endAt >= PROVIDER_SILENT_MS) {
+                        silenceNoted = true;
+                        logger.warn("Realtime provider silent " + (now - endAt)
+                                + " ms after audioStreamEnd (no server event; provider busy?)");
+                        sendJson(new JSONObject().put("type", "provider_silent").put("afterMs", now - endAt));
                     }
                     if (now - startedAt >= MAX_SESSION_MS) {
                         stopReason = "10 minute voice limit reached";
@@ -1585,7 +1643,7 @@ public final class GenAiVoiceWebSocket {
             connectTimeoutMs = CONNECT_TIMEOUT_MS;
             connectStartedAt = System.currentTimeMillis();
             try {
-                providerSocket = runtime.openRealtimeWebSocket(providerUrl(config),
+                providerSocket = runtime.openRealtimeWebSocket(providerUrl(config, modelThisAttempt),
                         new ProviderListener(openAi, instructions, attempt), direct);
                 logger.info("Realtime provider connecting: provider=" + provider + " mic="
                         + (farField ? "far" : "near") + " route=" + route + " attempt=" + attempt);
@@ -1658,6 +1716,8 @@ public final class GenAiVoiceWebSocket {
             if (provider == null || !provider.send(geminiAudioStreamEnd().toString())) return;
             streamEnds++;
             if (endOfSpeechAt == 0) endOfSpeechAt = System.currentTimeMillis();
+            streamEndSentAt = System.currentTimeMillis();
+            silenceNoted = false;
             logger.info("Realtime event: audioStreamEnd sent (client end of speech)");
         }
 
@@ -1747,7 +1807,7 @@ public final class GenAiVoiceWebSocket {
          */
         private void providerFailed(String message, String code) {
             if (providerFailure != null) return;
-            providerFailure = safeReason(message);
+            providerFailure = safeReason(errorBodyForLog(message, 240));
             providerFailureCode = code;
         }
 
@@ -1831,12 +1891,12 @@ public final class GenAiVoiceWebSocket {
                         + " ms (HTTP 101)");
                 try {
                     JSONObject setup = briefing != null
-                            ? briefingSetup(openAi, config.realtimeModel, instructions, briefing)
+                            ? briefingSetup(openAi, modelThisAttempt, instructions, briefing)
                             : openAi
                             ? openAiSetup(
-                                    config.realtimeModel, instructions, farField)
+                                    modelThisAttempt, instructions, farField)
                             : geminiSetup(
-                                    config.realtimeModel, instructions, farField,
+                                    modelThisAttempt, instructions, farField,
                                     searchThisAttempt, searchFunctionThisAttempt);
                     String handle = resumeWith;
                     JSONObject resumption = openAi ? null
@@ -1864,6 +1924,7 @@ public final class GenAiVoiceWebSocket {
                 if (attempt != providerAttempt) return;
                 // The provider keeps streaming until it answers our close; the client is gone.
                 if (stopRequested) return;
+                lastProviderEventAt = System.currentTimeMillis();
                 try {
                     JSONObject event = new JSONObject(text);
                     if (!live && setupEventsLogged < MAX_SETUP_EVENT_LOGS) {
@@ -1894,8 +1955,9 @@ public final class GenAiVoiceWebSocket {
                 if (attempt != providerAttempt) return;
                 boolean wasLive = live;
                 if (!stopRequested) {
+                    // A close reason is capped at 123 bytes by the WebSocket protocol, so Gemini's own text is cut.
                     logger.warn("Realtime provider closing: code=" + code + " reason="
-                            + safeReason(reason) + " phase=" + (wasLive ? "live" : "setup"));
+                            + errorBodyForLog(reason, 200) + " phase=" + (wasLive ? "live" : "setup"));
                 }
                 try {
                     webSocket.close(echoCloseCode(code), null);
@@ -1915,6 +1977,8 @@ public final class GenAiVoiceWebSocket {
                 releaseProvider(webSocket);
                 String code = providerOpenedAt == 0 ? "connect_failed" : (live ? "provider_failed" : "setup_failed");
                 String reason = providerHttpReason(response, error);
+                String body = providerErrorBody(response);
+                if (!stopRequested && body != null) logger.warn("Realtime provider error body: " + body);
                 if (!stopRequested) {
                     logger.warn(providerOpenedAt == 0
                             ? "Realtime provider connect failed after "
@@ -2218,7 +2282,7 @@ public final class GenAiVoiceWebSocket {
                     // Field record: an error during setup names the rejected field; the loop
                     // reports it to the client as setup_rejected within one poll.
                     logger.warn("Realtime provider error (mic=" + (farField ? "far" : "near")
-                            + ", phase=" + (live ? "live" : "setup") + "): " + safeReason(error));
+                            + ", phase=" + (live ? "live" : "setup") + "): " + errorBodyForLog(error, 200));
                     providerFailed(error, live ? "provider_failed" : "setup_rejected");
                     return;
                 }
@@ -2468,7 +2532,7 @@ public final class GenAiVoiceWebSocket {
         }
     }
 
-    private static String providerUrl(GenAiConfig config)
+    private static String providerUrl(GenAiConfig config, String realtimeModel)
             throws Exception {
         URI base = new URI(config.baseUrl);
         String scheme = "https".equalsIgnoreCase(base.getScheme())
@@ -2483,7 +2547,8 @@ public final class GenAiVoiceWebSocket {
             }
             return scheme + "://" + authority + path
                     + "?model=" + URLEncoder.encode(
-                            config.realtimeModel, "UTF-8");
+                            realtimeModel == null || realtimeModel.isEmpty()
+                                    ? config.realtimeModel : realtimeModel, "UTF-8");
         }
         return scheme + "://" + authority
                 + "/ws/google.ai.generativelanguage.v1beta."
@@ -2506,6 +2571,17 @@ public final class GenAiVoiceWebSocket {
         }
         return safeReason(error == null
                 ? null : error.getMessage());
+    }
+
+    /** The HTTP error body of a refused upgrade (sanitised, 200 chars), or null. */
+    private static String providerErrorBody(Response response) {
+        if (response == null) return null;
+        try {
+            String body = response.peekBody(2048).string();
+            return body == null || body.trim().isEmpty() ? null : errorBodyForLog(body, 200);
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     private static String safeReason(String reason) {
