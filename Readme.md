@@ -483,7 +483,7 @@ Developers can still send pull requests on the language files: `app/src/main/ass
 The latest release in full, then earlier highlights. APKs and per-release notes are on
 [GitHub Releases](https://github.com/yash-srivastava/Overdrive-release/releases).
 
-### v66.0: Rebuilt Voice Assistant, Dashcam View on the Timeline & 160+ Improvements
+### v66.0: Rebuilt Voice Assistant, Sealion 7 HDMI Projection, Dashcam View on the Timeline, Lower CPU Use & 160+ Improvements
 
 #### ✨ New
 
