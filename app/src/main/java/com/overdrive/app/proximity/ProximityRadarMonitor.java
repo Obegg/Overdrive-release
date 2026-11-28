@@ -206,20 +206,6 @@ public class ProximityRadarMonitor {
     }
     
     /**
-     * Check if currently listening.
-     */
-    public boolean isListening() {
-        return listening;
-    }
-    
-    /**
-     * Get current sensor states.
-     */
-    public int[] getSensorStates() {
-        return sensorStates.clone();
-    }
-    
-    /**
      * Check if currently triggered.
      */
     public boolean isTriggered() {

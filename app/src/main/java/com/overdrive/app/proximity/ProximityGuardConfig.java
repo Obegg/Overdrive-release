@@ -6,7 +6,7 @@ import com.overdrive.app.logging.DaemonLogger;
  * Proximity Guard Configuration POJO
  * 
  * Immutable configuration for Proximity Guard recording mode.
- * Uses Builder pattern for construction.
+ * Created from the unified proximity settings.
  */
 public class ProximityGuardConfig {
     private static final DaemonLogger logger = DaemonLogger.getInstance("ProximityGuardConfig");
@@ -20,7 +20,6 @@ public class ProximityGuardConfig {
     }
     
     // Configuration fields
-    private final boolean enabled;
     private final TriggerLevel triggerLevel;
     private final int preRecordSeconds;
     private final int postRecordSeconds;
@@ -59,24 +58,33 @@ public class ProximityGuardConfig {
     private static final int DEFAULT_MONITOR_BITRATE = 1_500_000;  // 1.5 Mbps idle
     private static final int DEFAULT_EVENT_BITRATE = 6_000_000;    // 6 Mbps on trigger
 
-    private ProximityGuardConfig(Builder builder) {
-        this.enabled = builder.enabled;
-        this.triggerLevel = builder.triggerLevel;
-        this.preRecordSeconds = validatePreRecordSeconds(builder.preRecordSeconds);
-        this.postRecordSeconds = validatePostRecordSeconds(builder.postRecordSeconds);
-        this.monitorFps = validateMonitorFps(builder.monitorFps);
-        this.monitorBitrate = validateBitrate(builder.monitorBitrate, DEFAULT_MONITOR_BITRATE);
-        this.eventBitrate = validateBitrate(builder.eventBitrate, DEFAULT_EVENT_BITRATE);
-        this.lowPowerMonitor = builder.lowPowerMonitor;
-        this.blindSpotTrigger = builder.blindSpotTrigger;
+    private ProximityGuardConfig(org.json.JSONObject config) {
+        triggerLevel = config.has("triggerLevel")
+                ? parseTriggerLevel(config.optString("triggerLevel", "RED"))
+                : TriggerLevel.YELLOW_RED;
+        preRecordSeconds = clamp("preRecordSeconds", config.optInt("preRecordSeconds", 5),
+                MIN_PRE_RECORD_SECONDS, MAX_PRE_RECORD_SECONDS);
+        postRecordSeconds = clamp("postRecordSeconds", config.optInt("postRecordSeconds", 10),
+                MIN_POST_RECORD_SECONDS, MAX_POST_RECORD_SECONDS);
+        monitorFps = clamp("monitorFps", config.optInt("monitorFps", DEFAULT_MONITOR_FPS),
+                MIN_MONITOR_FPS, MAX_MONITOR_FPS);
+        monitorBitrate = validateBitrate(config.optInt("monitorBitrate", DEFAULT_MONITOR_BITRATE),
+                DEFAULT_MONITOR_BITRATE);
+        eventBitrate = validateBitrate(config.optInt("eventBitrate", DEFAULT_EVENT_BITRATE),
+                DEFAULT_EVENT_BITRATE);
+        lowPowerMonitor = config.optBoolean("lowPowerMonitor", true);
+        blindSpotTrigger = config.optBoolean("blindSpotTrigger", false);
     }
-    
-    // ==================== GETTERS ====================
-    
-    public boolean isEnabled() {
-        return enabled;
+
+    private static TriggerLevel parseTriggerLevel(String value) {
+        try {
+            return TriggerLevel.valueOf(value.toUpperCase());
+        } catch (IllegalArgumentException e) {
+            logger.warn("Invalid trigger level: " + value + ", using default RED");
+            return TriggerLevel.RED;
+        }
     }
-    
+
     public TriggerLevel getTriggerLevel() {
         return triggerLevel;
     }
@@ -109,45 +117,19 @@ public class ProximityGuardConfig {
         return blindSpotTrigger;
     }
 
-    // ==================== VALIDATION ====================
-    
-    private int validatePreRecordSeconds(int seconds) {
-        if (seconds < MIN_PRE_RECORD_SECONDS) {
-            logger.warn("preRecordSeconds " + seconds + " < min " + MIN_PRE_RECORD_SECONDS + ", clamping");
-            return MIN_PRE_RECORD_SECONDS;
+    private static int clamp(String field, int value, int min, int max) {
+        if (value < min) {
+            logger.warn(field + " " + value + " < min " + min + ", clamping");
+            return min;
         }
-        if (seconds > MAX_PRE_RECORD_SECONDS) {
-            logger.warn("preRecordSeconds " + seconds + " > max " + MAX_PRE_RECORD_SECONDS + ", clamping");
-            return MAX_PRE_RECORD_SECONDS;
+        if (value > max) {
+            logger.warn(field + " " + value + " > max " + max + ", clamping");
+            return max;
         }
-        return seconds;
-    }
-    
-    private int validatePostRecordSeconds(int seconds) {
-        if (seconds < MIN_POST_RECORD_SECONDS) {
-            logger.warn("postRecordSeconds " + seconds + " < min " + MIN_POST_RECORD_SECONDS + ", clamping");
-            return MIN_POST_RECORD_SECONDS;
-        }
-        if (seconds > MAX_POST_RECORD_SECONDS) {
-            logger.warn("postRecordSeconds " + seconds + " > max " + MAX_POST_RECORD_SECONDS + ", clamping");
-            return MAX_POST_RECORD_SECONDS;
-        }
-        return seconds;
+        return value;
     }
 
-    private int validateMonitorFps(int fps) {
-        if (fps < MIN_MONITOR_FPS) {
-            logger.warn("monitorFps " + fps + " < min " + MIN_MONITOR_FPS + ", clamping");
-            return MIN_MONITOR_FPS;
-        }
-        if (fps > MAX_MONITOR_FPS) {
-            logger.warn("monitorFps " + fps + " > max " + MAX_MONITOR_FPS + ", clamping");
-            return MAX_MONITOR_FPS;
-        }
-        return fps;
-    }
-
-    private int validateBitrate(int bitrate, int fallback) {
+    private static int validateBitrate(int bitrate, int fallback) {
         if (bitrate < MIN_BITRATE) {
             logger.warn("bitrate " + bitrate + " < min " + MIN_BITRATE + ", using " + fallback);
             return fallback;
@@ -159,143 +141,20 @@ public class ProximityGuardConfig {
         return bitrate;
     }
 
-    // ==================== BUILDER ====================
-    
-    public static class Builder {
-        // DEPRECATED: enabled flag is now controlled by RecordingModeManager.mode
-        // Kept for backward compatibility but defaults to true
-        private boolean enabled = true;
-        // Default to YELLOW_RED for better sensitivity - triggers on medium-close objects
-        private TriggerLevel triggerLevel = TriggerLevel.YELLOW_RED;
-        private int preRecordSeconds = 5;
-        private int postRecordSeconds = 10;
-        private int monitorFps = DEFAULT_MONITOR_FPS;
-        private int monitorBitrate = DEFAULT_MONITOR_BITRATE;
-        private int eventBitrate = DEFAULT_EVENT_BITRATE;
-        private boolean lowPowerMonitor = true;  // idle profile on by default
-        private boolean blindSpotTrigger = false;
-
-        public Builder enabled(boolean enabled) {
-            this.enabled = enabled;
-            return this;
-        }
-        
-        public Builder triggerLevel(TriggerLevel triggerLevel) {
-            this.triggerLevel = triggerLevel;
-            return this;
-        }
-        
-        public Builder triggerLevel(String triggerLevelStr) {
-            try {
-                this.triggerLevel = TriggerLevel.valueOf(triggerLevelStr.toUpperCase());
-            } catch (IllegalArgumentException e) {
-                logger.warn("Invalid trigger level: " + triggerLevelStr + ", using default RED");
-                this.triggerLevel = TriggerLevel.RED;
-            }
-            return this;
-        }
-        
-        public Builder preRecordSeconds(int preRecordSeconds) {
-            this.preRecordSeconds = preRecordSeconds;
-            return this;
-        }
-        
-        public Builder postRecordSeconds(int postRecordSeconds) {
-            this.postRecordSeconds = postRecordSeconds;
-            return this;
-        }
-
-        public Builder monitorFps(int monitorFps) {
-            this.monitorFps = monitorFps;
-            return this;
-        }
-
-        public Builder monitorBitrate(int monitorBitrate) {
-            this.monitorBitrate = monitorBitrate;
-            return this;
-        }
-
-        public Builder eventBitrate(int eventBitrate) {
-            this.eventBitrate = eventBitrate;
-            return this;
-        }
-
-        public Builder lowPowerMonitor(boolean lowPowerMonitor) {
-            this.lowPowerMonitor = lowPowerMonitor;
-            return this;
-        }
-
-        public Builder blindSpotTrigger(boolean blindSpotTrigger) {
-            this.blindSpotTrigger = blindSpotTrigger;
-            return this;
-        }
-
-        public ProximityGuardConfig build() {
-            return new ProximityGuardConfig(this);
-        }
-    }
-    
-    // ==================== FACTORY METHODS ====================
-    
-    /**
-     * Create default configuration.
-     */
+    /** Create the default proximity configuration. */
     public static ProximityGuardConfig createDefault() {
-        return new Builder().build();
+        return fromConfig(new org.json.JSONObject());
     }
-    
-    /**
-     * Create configuration from UnifiedConfigManager.
-     */
+
+    /** Read settings from UnifiedConfigManager. */
     public static ProximityGuardConfig fromConfig(org.json.JSONObject config) {
-        Builder builder = new Builder();
-        
-        if (config.has("enabled")) {
-            builder.enabled(config.optBoolean("enabled", false));
-        }
-        
-        if (config.has("triggerLevel")) {
-            builder.triggerLevel(config.optString("triggerLevel", "RED"));
-        }
-        
-        if (config.has("preRecordSeconds")) {
-            builder.preRecordSeconds(config.optInt("preRecordSeconds", 5));
-        }
-        
-        if (config.has("postRecordSeconds")) {
-            builder.postRecordSeconds(config.optInt("postRecordSeconds", 10));
-        }
-
-        if (config.has("monitorFps")) {
-            builder.monitorFps(config.optInt("monitorFps", DEFAULT_MONITOR_FPS));
-        }
-
-        if (config.has("monitorBitrate")) {
-            builder.monitorBitrate(config.optInt("monitorBitrate", DEFAULT_MONITOR_BITRATE));
-        }
-
-        if (config.has("eventBitrate")) {
-            builder.eventBitrate(config.optInt("eventBitrate", DEFAULT_EVENT_BITRATE));
-        }
-
-        if (config.has("lowPowerMonitor")) {
-            builder.lowPowerMonitor(config.optBoolean("lowPowerMonitor", true));
-        }
-
-        if (config.has("blindSpotTrigger")) {
-            builder.blindSpotTrigger(config.optBoolean("blindSpotTrigger", false));
-        }
-
-        return builder.build();
+        return new ProximityGuardConfig(config);
     }
-
-    // ==================== UTILITY ====================
 
     @Override
     public String toString() {
         return "ProximityGuardConfig{" +
-                "enabled=" + enabled +
-                ", triggerLevel=" + triggerLevel +
+                "triggerLevel=" + triggerLevel +
                 ", preRecordSeconds=" + preRecordSeconds +
                 ", postRecordSeconds=" + postRecordSeconds +
                 ", lowPowerMonitor=" + lowPowerMonitor +
@@ -304,21 +163,6 @@ public class ProximityGuardConfig {
                 ", eventBitrate=" + (eventBitrate / 1_000_000.0) + "Mbps" +
                 ", blindSpotTrigger=" + blindSpotTrigger +
                 '}';
-    }
-    
-    /**
-     * Get validation bounds for UI.
-     */
-    public static int getMinPreRecordSeconds() {
-        return MIN_PRE_RECORD_SECONDS;
-    }
-    
-    public static int getMaxPreRecordSeconds() {
-        return MAX_PRE_RECORD_SECONDS;
-    }
-    
-    public static int getMinPostRecordSeconds() {
-        return MIN_POST_RECORD_SECONDS;
     }
     
     public static int getMaxPostRecordSeconds() {
