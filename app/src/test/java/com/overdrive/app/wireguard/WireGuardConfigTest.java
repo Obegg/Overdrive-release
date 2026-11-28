@@ -152,6 +152,18 @@ public class WireGuardConfigTest {
     }
 
     @Test
+    public void zeroPaddedMtuAndKeepaliveMatchWgproxy() {
+        String text = OPNSENSE.replace("Address =", "MTU = 000001420\nAddress =")
+                .replace("Endpoint =", "PersistentKeepalive = 000065535\nEndpoint =");
+        assertEquals(1, WireGuardConfig.parse(text).peerCount);
+        assertEquals(1, WireGuardConfig.parse(text.replace("000065535", "000000000")).peerCount);
+        assertRejected(text.replace("000001420", "000000575"), "MTU");
+        assertRejected(text.replace("000001420", "0000001420"), "MTU");
+        assertRejected(text.replace("000065535", "000065536"), "PersistentKeepalive");
+        assertRejected(text.replace("000065535", "0000000025"), "PersistentKeepalive");
+    }
+
+    @Test
     public void badValues() {
         assertRejected(OPNSENSE.replace("10.10.10.2/32", "10.10.10.300/32"), "Address");
         assertRejected(OPNSENSE.replace("10.10.10.2/32", "10.10.10.2/33"), "Address");

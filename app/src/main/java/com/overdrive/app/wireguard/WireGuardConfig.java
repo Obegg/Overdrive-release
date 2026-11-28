@@ -256,8 +256,9 @@ public final class WireGuardConfig {
         }
     }
 
+    // Match wgproxy atoiASCII: up to nine digits, including leading zeros.
     private static void checkMtu(String val) {
-        if (val.matches("[0-9]{1,5}")) {
+        if (val.matches("[0-9]{1,9}")) {
             int n = Integer.parseInt(val);
             if (n >= 576 && n <= 9000) return;
         }
@@ -266,7 +267,7 @@ public final class WireGuardConfig {
 
     private static void checkKeepalive(String val) {
         if (val.equalsIgnoreCase("off")) return;
-        if (val.matches("[0-9]{1,5}")) {
+        if (val.matches("[0-9]{1,9}")) {
             int n = Integer.parseInt(val);
             if (n <= 65535) return;
         }
