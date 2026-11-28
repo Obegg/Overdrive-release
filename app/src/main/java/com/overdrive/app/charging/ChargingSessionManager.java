@@ -218,10 +218,6 @@ public class ChargingSessionManager implements ChargingDetector.FusedStateListen
             cancelAnalyticsStateRetryLocked();
         }
         logger.info("Shutting down ChargingSessionManager");
-        // Persist any debounced tariff usage counters before we go: markUsed()
-        // coalesces writes (see TariffManager.MARK_USED_FLUSH_MS), so a pending
-        // bump would otherwise be lost on a clean daemon stop.
-        try { TariffManager.getInstance().flushPendingUsage(); } catch (Throwable ignored) {}
         try { ChargingDetector.getInstance().removeFusedStateListener(this); } catch (Exception ignored) {}
         try { ChargingDetector.getInstance().removeAuthoritativeStopListener(this); }
         catch (Exception ignored) {}

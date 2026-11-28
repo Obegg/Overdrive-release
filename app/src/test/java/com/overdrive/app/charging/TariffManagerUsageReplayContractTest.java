@@ -181,7 +181,7 @@ public class TariffManagerUsageReplayContractTest {
         assertTrue(replay.contains("return;"));
 
         String cleanup = source.substring(
-                source.indexOf("public synchronized boolean completePendingReprice("),
+                source.indexOf("synchronized boolean completePendingReprice(RepriceIntent intent)"),
                 start);
         assertOrdered(
                 cleanup,
