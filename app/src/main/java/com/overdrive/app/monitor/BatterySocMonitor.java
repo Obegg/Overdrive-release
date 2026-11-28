@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * Monitors the remaining battery power percentage via BYDAutoStatisticDevice.
  * Uses listener-based updates for real-time SOC changes.
  */
-public class BatterySocMonitor extends BaseDeviceMonitor<BatterySocData> {
+public class BatterySocMonitor extends BaseDeviceMonitor {
     
     private Object device;  // Real BYDAutoStatisticDevice from system
     private final AtomicReference<BatterySocData> cachedData = new AtomicReference<>();
@@ -190,17 +190,6 @@ public class BatterySocMonitor extends BaseDeviceMonitor<BatterySocData> {
         }
     }
     
-    @Override
-    public BatterySocData getCurrentValue() {
-        return cachedData.get();
-    }
-    
-    @Override
-    public long getLastUpdateTime() {
-        BatterySocData data = cachedData.get();
-        return data != null ? data.timestamp : 0;
-    }
-
     private void pollCarSvcSocOnce() {
         // Vehicle-SoC rule: status-0 rows only (no held value), and on DI5 below 1% is
         // "no reading", never an empty pack. Only fresh readings reach the cutoff.

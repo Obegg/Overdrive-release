@@ -10,10 +10,6 @@ import android.os.PowerManager;
 
 import com.overdrive.app.daemon.proxy.Safe;
 import com.overdrive.app.logging.DaemonLogger;
-import com.overdrive.app.monitor.BatteryPowerData;
-import com.overdrive.app.monitor.BatteryVoltageData;
-import com.overdrive.app.monitor.ChargingStateData;
-import com.overdrive.app.monitor.VehicleDataListener;
 import com.overdrive.app.monitor.VehicleDataMonitor;
 
 import org.json.JSONObject;
@@ -3510,8 +3506,8 @@ public class AccSentryDaemon {
         }
     }
 
-    // VehicleDataMonitor listener for voltage-based MCU control
-    private static VehicleDataListener vehicleDataListener = null;
+    // Whether the sentry daemon has initialized its fallback battery power monitor.
+    private static boolean vehicleDataMonitorInitialized;
     private static final Object monitorIoLock = new Object();
     private static final Object batteryVoltageScheduleLock = new Object();
     private static final java.util.concurrent.ScheduledExecutorService
@@ -7117,10 +7113,10 @@ public class AccSentryDaemon {
 
             boolean success = true;
             if (enabled) {
-                if (vehicleDataListener == null) {
+                if (!vehicleDataMonitorInitialized) {
                     success &= initVehicleDataMonitor();
                 }
-                if (vehicleDataListener != null) {
+                if (vehicleDataMonitorInitialized) {
                     vehicleDataMonitorOwnerGeneration = generation;
                 } else {
                     success = false;
@@ -7377,8 +7373,7 @@ public class AccSentryDaemon {
     // ==================== VEHICLE DATA MONITOR INTEGRATION ====================
 
     /**
-     * Initialize VehicleDataMonitor and register listener for voltage-based MCU control.
-     * Only initializes the 12V battery power monitor (not all monitors) for sentry mode.
+     * Initialize the fallback 12V battery power monitor for sentry mode.
      */
     private static boolean initVehicleDataMonitor() {
         if (appContext == null) {
@@ -7395,67 +7390,33 @@ public class AccSentryDaemon {
             Context permissiveContext = new PermissionBypassContext(appContext);
             monitor.initBatteryPowerOnly(permissiveContext);
 
-            // Create and register our listener for voltage-based MCU control
-            vehicleDataListener = new VehicleDataListener() {
-                @Override
-                public void onBatteryVoltageChanged(BatteryVoltageData data) {
-                    // Discrete level changes (0=LOW, 1=NORMAL) - handled by AccListener
-                }
-
-                @Override
-                public void onBatteryPowerChanged(BatteryPowerData data) {
-                    // BatteryVoltageMonitorV2 owns voltage hysteresis; SocCutoffMonitor
-                    // owns the HV battery cutoff. This listener only logs telemetry.
-                    if (data != null) {
-                        log("onBatteryPowerChanged " + String.format("%.2f", data.voltageVolts)
-                                + "V (handled by BatteryVoltageMonitorV2)");
-                    }
-                }
-
-                @Override
-                public void onChargingStateChanged(ChargingStateData data) {
-                    // Not used in sentry mode (battery power only)
-                }
-
-                @Override
-                public void onChargingPowerChanged(double powerKW) {
-                    // Not used in sentry mode (battery power only)
-                }
-
-                @Override
-                public void onDataUnavailable(String monitorName, String reason) {
-                    log("VehicleData unavailable: " + monitorName + " - " + reason);
-                }
-            };
-
-            monitor.addListener(vehicleDataListener);
             monitor.startBatteryPowerOnly();
+            vehicleDataMonitorInitialized = true;
 
             log("VehicleDataMonitor initialized (battery power only)");
             return true;
 
         } catch (Exception e) {
             log("VehicleDataMonitor init failed: " + e.getMessage());
-            vehicleDataListener = null;
+            vehicleDataMonitorInitialized = false;
             return false;
         }
     }
 
     /**
-     * Stop listening to VehicleDataMonitor (battery power only).
+     * Stop the fallback 12V battery power monitor.
      */
     private static boolean stopVehicleDataMonitor() {
         try {
-            log("Removing VehicleDataMonitor listener...");
+            log("Stopping VehicleDataMonitor (battery power only)...");
 
-            if (vehicleDataListener != null) {
+            if (vehicleDataMonitorInitialized) {
                 VehicleDataMonitor monitor = VehicleDataMonitor.getInstance();
-                monitor.removeListener(vehicleDataListener);
                 monitor.stopBatteryPowerOnly();
-                vehicleDataListener = null;
+                vehicleDataMonitorInitialized = false;
             }
 
-            log("VehicleDataMonitor listener removed");
+            log("VehicleDataMonitor stopped (battery power only)");
             return true;
 
         } catch (Exception e) {

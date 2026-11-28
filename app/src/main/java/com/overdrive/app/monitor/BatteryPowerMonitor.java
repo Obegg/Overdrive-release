@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * Uses reflection and PermissionBypassContext to access real BYD hardware API.
  * Uses polling since OTA device may not support listeners reliably.
  */
-public class BatteryPowerMonitor extends BaseDeviceMonitor<BatteryPowerData> {
+public class BatteryPowerMonitor extends BaseDeviceMonitor {
     
     private Object device;  // Real BYDAutoOtaDevice from system
     private final AtomicReference<BatteryPowerData> cachedData = new AtomicReference<>();
@@ -205,14 +205,7 @@ public class BatteryPowerMonitor extends BaseDeviceMonitor<BatteryPowerData> {
         log("Stopped successfully");
     }
     
-    @Override
     public BatteryPowerData getCurrentValue() {
         return cachedData.get();
-    }
-    
-    @Override
-    public long getLastUpdateTime() {
-        BatteryPowerData data = cachedData.get();
-        return data != null ? data.timestamp : 0;
     }
 }

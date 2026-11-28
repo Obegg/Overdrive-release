@@ -16,10 +16,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * - Availability tracking
  * - DaemonLogger integration
  * - Error handling
- * 
- * @param <T> The data type this monitor produces
  */
-public abstract class BaseDeviceMonitor<T> {
+public abstract class BaseDeviceMonitor {
     
     protected final DaemonLogger logger;
     protected final String monitorName;
@@ -67,40 +65,6 @@ public abstract class BaseDeviceMonitor<T> {
      * Subclasses should unregister BYD device listeners here.
      */
     public abstract void stop();
-    
-    // ==================== DATA ACCESS ====================
-    
-    /**
-     * Get the current cached value.
-     * 
-     * @return The current value, or null if unavailable
-     */
-    public abstract T getCurrentValue();
-    
-    /**
-     * Get the timestamp of the last update.
-     * 
-     * @return Timestamp in milliseconds, or 0 if never updated
-     */
-    public abstract long getLastUpdateTime();
-    
-    /**
-     * Check if this monitor is available.
-     * 
-     * @return true if the monitor is successfully connected to BYD API
-     */
-    public boolean isAvailable() {
-        return isAvailable.get();
-    }
-    
-    /**
-     * Check if this monitor is running.
-     * 
-     * @return true if start() has been called and monitor is active
-     */
-    public boolean isRunning() {
-        return isRunning.get();
-    }
     
     // ==================== RETRY MANAGEMENT ====================
     
