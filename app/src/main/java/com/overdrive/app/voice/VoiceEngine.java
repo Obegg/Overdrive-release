@@ -740,7 +740,7 @@ final class VoiceEngine implements PcmSink {
     }
 
     /** Consumer lag now and at most since the last report, ring drops per minute, worker load. */
-    private JSONObject engineStats() throws org.json.JSONException {
+    private synchronized JSONObject engineStats() throws org.json.JSONException {
         long now = SystemClock.elapsedRealtime();
         long drops = ring.droppedSamples();
         long events = ring.dropEvents();
@@ -769,6 +769,14 @@ final class VoiceEngine implements PcmSink {
         if (state == MediaTurnPolicy.ECHO_NONE) return null;
         EchoHealth h = echoLast;
         JSONObject e = new JSONObject().put("state", echoName(state));
+    /** Engine and echo-gate status only (the live report every 2 s); drains no check or turn logs. */
+    JSONObject liveStats() throws org.json.JSONException {
+        JSONObject out = new JSONObject().put("engine", engineStats());
+        JSONObject echo = echoStats();
+        if (echo != null) out.put("echo", echo);
+        return out;
+    }
+
         if (h != null) {
             if (!Float.isNaN(h.erleDb)) e.put("erleDb", Math.round(h.erleDb));
             e.put("delayMs", h.delayMs).put("refActive", h.refActive);
@@ -802,6 +810,8 @@ final class VoiceEngine implements PcmSink {
         LockSupport.unpark(thread);
         boolean onEngineThread = Thread.currentThread() == thread;
         if (!onEngineThread) {
+            if (h.delayAgeMs >= 0) e.put("delayAgeMs", h.delayAgeMs);
+            if (h.echoBelowNoise) e.put("belowNoise", true);
             try {
                 thread.join(800);
             } catch (InterruptedException e) {

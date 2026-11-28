@@ -378,6 +378,7 @@ public final class VoiceAssistantApiHandler {
             return error(400, "invalid_runtime", e.getMessage());
         }
         long now = System.currentTimeMillis();
+        if (input.optBoolean("live")) return saveLiveRuntime(clean, now);
         String previous;
         String summary = summarize(clean);
         synchronized (RUNTIME_LOCK) {
@@ -397,6 +398,23 @@ public final class VoiceAssistantApiHandler {
         response.put("success", true);
         response.put("updatedAt", now);
         return ok(response);
+    }
+
+    /** Live fields the app refreshes every 2 s while the engine runs. */
+    private static final String[] LIVE_KEYS = {"micSource", "arrayChannelsDb", "arrayEcho", "engine", "echo"};
+
+    /** A live report refreshes only its own fields, never changes the state and is never logged. */
+    private static Reply saveLiveRuntime(JSONObject clean, long now) throws JSONException {
+        synchronized (RUNTIME_LOCK) {
+            if (runtime != null && clean.getString("state").equals(runtime.optString("state"))) {
+                for (String key : LIVE_KEYS) {
+                    if (clean.has(key)) runtime.put(key, clean.get(key));
+                    else runtime.remove(key);
+                }
+                runtimeUpdatedAt = now;
+            }
+        }
+        return ok(new JSONObject().put("success", true).put("updatedAt", now));
     }
 
     static JSONObject sanitizeRuntime(JSONObject input) throws JSONException {
@@ -431,9 +449,13 @@ public final class VoiceAssistantApiHandler {
             e.put("ref", echo.optBoolean("ref"));
             e.put("erleDb", clamp(echo.optInt("erleDb"), -20, 80));
             e.put("delayMs", clamp(echo.optInt("delayMs", -1), -1, 2000));
+            copyClamped(echo, e, "delayAgeMs", 0, 86_400_000);
+            copyClamped(echo, e, "enrDb", -60, 60);
+            if (echo.optBoolean("belowNoise")) e.put("belowNoise", true);
             e.put("residualPct", clamp(echo.optInt("residualPct"), 0, 100));
             e.put("healthy", echo.optBoolean("healthy"));
             e.put("overruns", clamp(echo.optInt("overruns"), 0, 1_000_000));
+            copyClamped(echo, e, "ageMs", 0, 86_400_000);
             clean.put("arrayEcho", e);
         }
         Long lastWakeAt = optNonNegative(input, "lastWakeAt");
@@ -524,7 +546,9 @@ public final class VoiceAssistantApiHandler {
         if (echo != null && echo.optString("state", "").matches("[a-z]{1,10}")) {
             JSONObject e = new JSONObject().put("state", echo.optString("state"));
             copyClamped(echo, e, "erleDb", -30, 90);
-            copyClamped(echo, e, "delayMs", 0, 2000);
+            copyClamped(echo, e, "delayMs", -1, 2000);
+            copyClamped(echo, e, "delayAgeMs", 0, 86_400_000);
+            if (echo.optBoolean("belowNoise")) e.put("belowNoise", true);
             if (echo.opt("refActive") instanceof Boolean) e.put("refActive", echo.optBoolean("refActive"));
             clean.put("echo", e);
         }
@@ -806,8 +830,12 @@ public final class VoiceAssistantApiHandler {
                 line.append(", echo ");
                 if (echo.optBoolean("ref")) {
                     line.append("erle ").append(echo.optInt("erleDb")).append(" dB delay ")
-                            .append(echo.optInt("delayMs")).append(" ms res ").append(echo.optInt("residualPct"))
-                            .append('%').append(echo.optBoolean("healthy") ? "" : " unhealthy");
+                            .append(echo.optInt("delayMs")).append(" ms");
+                    if (echo.has("delayAgeMs")) line.append(" (").append(echo.optInt("delayAgeMs") / 1000).append(" s old)");
+                    line.append(" res ").append(echo.optInt("residualPct")).append('%');
+                    if (echo.has("enrDb")) line.append(" enr ").append(echo.optInt("enrDb")).append(" dB");
+                    if (echo.optBoolean("belowNoise")) line.append(" below noise");
+                    line.append(echo.optBoolean("healthy") ? "" : " unhealthy");
                 } else {
                     line.append("idle");
                 }
