@@ -165,21 +165,7 @@ public class ProximityRecordingHandler {
                 url = "/events.html?filter=proximity";
             }
 
-            com.overdrive.app.notifications.NotificationBus.get().publish(
-                    new com.overdrive.app.notifications.NotificationEvent(
-                            "surveillance.proximity",
-                            red
-                                    ? com.overdrive.app.notifications.NotificationEvent.Severity.CRITICAL
-                                    : com.overdrive.app.notifications.NotificationEvent.Severity.WARN,
-                            com.overdrive.app.server.Messages.get(red
-                                    ? "notifications.proximity_push_title_red"
-                                    : "notifications.proximity_push_title_yellow"),
-                            com.overdrive.app.server.Messages.get(red
-                                    ? "notifications.proximity_push_body_red"
-                                    : "notifications.proximity_push_body_yellow"),
-                            "proximity-" + triggerLevel,
-                            url,
-                            data));
+            publishPush(red, "proximity-" + triggerLevel, url, data);
         } catch (Throwable t) {
             logger.debug("publishProximityNotification failed: " + t.getMessage());
         }
@@ -266,27 +252,31 @@ public class ProximityRecordingHandler {
             String enc = java.net.URLEncoder.encode(videoFile, "UTF-8");
             String url = "/events.html?filter=proximity&file=" + enc;
 
-            com.overdrive.app.notifications.NotificationBus.get().publish(
-                    new com.overdrive.app.notifications.NotificationEvent(
-                            "surveillance.proximity",
-                            red
-                                    ? com.overdrive.app.notifications.NotificationEvent.Severity.CRITICAL
-                                    : com.overdrive.app.notifications.NotificationEvent.Severity.WARN,
-                            com.overdrive.app.server.Messages.get(red
-                                    ? "notifications.proximity_push_title_red"
-                                    : "notifications.proximity_push_title_yellow"),
-                            com.overdrive.app.server.Messages.get(red
-                                    ? "notifications.proximity_push_body_red"
-                                    : "notifications.proximity_push_body_yellow"),
-                            activeNotificationTag != null
-                                    ? activeNotificationTag : "proximity-" + triggerLevel,
-                            url,
-                            data));
+            publishPush(red, activeNotificationTag != null
+                    ? activeNotificationTag : "proximity-" + triggerLevel, url, data);
         } catch (Throwable t) {
             logger.debug("publishProximityFinal failed: " + t.getMessage());
         }
     }
     
+    private void publishPush(boolean red, String tag, String url, org.json.JSONObject data) {
+        com.overdrive.app.notifications.NotificationBus.get().publish(
+                new com.overdrive.app.notifications.NotificationEvent(
+                        "surveillance.proximity",
+                        red
+                                ? com.overdrive.app.notifications.NotificationEvent.Severity.CRITICAL
+                                : com.overdrive.app.notifications.NotificationEvent.Severity.WARN,
+                        com.overdrive.app.server.Messages.get(red
+                                ? "notifications.proximity_push_title_red"
+                                : "notifications.proximity_push_title_yellow"),
+                        com.overdrive.app.server.Messages.get(red
+                                ? "notifications.proximity_push_body_red"
+                                : "notifications.proximity_push_body_yellow"),
+                        tag,
+                        url,
+                        data));
+    }
+
     /**
      * Extend current recording (new trigger while already recording).
      * Does not create a new file - just logs the extension.
@@ -329,13 +319,6 @@ public class ProximityRecordingHandler {
      */
     public boolean isRecording() {
         return isRecording;
-    }
-    
-    /**
-     * Get current trigger level.
-     */
-    public String getCurrentTriggerLevel() {
-        return currentTriggerLevel;
     }
     
     // ==================== PRIVATE METHODS ====================

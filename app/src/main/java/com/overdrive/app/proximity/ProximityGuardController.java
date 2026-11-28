@@ -43,7 +43,6 @@ public class ProximityGuardController implements ProximityRadarMonitor.TriggerCa
         POST_RECORD    // Countdown after radar safe
     }
     
-    private final Context context;
     private final GpuSurveillancePipeline pipeline;
     private final ProximityRadarMonitor radarMonitor;
     private final ProximityRecordingHandler recordingHandler;
@@ -74,7 +73,6 @@ public class ProximityGuardController implements ProximityRadarMonitor.TriggerCa
     private volatile boolean redEscalatedThisSession = false;
     
     public ProximityGuardController(Context context, GpuSurveillancePipeline pipeline) {
-        this.context = context;
         this.pipeline = pipeline;
         
         // Load config
@@ -102,7 +100,6 @@ public class ProximityGuardController implements ProximityRadarMonitor.TriggerCa
      * Transitions from IDLE to MONITORING.
      * 
      * Note: The "enabled" state is controlled by RecordingModeManager's mode selection.
-     * When mode is PROXIMITY_GUARD, this controller should start regardless of config.enabled.
      */
     public synchronized void start() {
         if (closed) {
@@ -116,10 +113,6 @@ public class ProximityGuardController implements ProximityRadarMonitor.TriggerCa
 
         // Reload config in case it changed (for trigger level, pre/post record settings)
         config = loadConfig();
-
-        // SOTA: Don't check config.isEnabled() here - the mode selection in RecordingModeManager
-        // is the source of truth for whether proximity guard should be active.
-        // The config.enabled flag is deprecated/redundant.
 
         // Push the proximity tab's pre-record duration into the encoder.
         // Without this, the encoder's pre-record window stays at whatever
@@ -168,13 +161,6 @@ public class ProximityGuardController implements ProximityRadarMonitor.TriggerCa
         }
 
         transitionTo(State.IDLE);
-    }
-    
-    /**
-     * Get current state.
-     */
-    public State getCurrentState() {
-        return currentState;
     }
     
     /**
