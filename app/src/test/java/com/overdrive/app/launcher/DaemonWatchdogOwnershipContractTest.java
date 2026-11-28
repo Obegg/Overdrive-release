@@ -47,7 +47,10 @@ public class DaemonWatchdogOwnershipContractTest {
             Path pidFile = root.resolve("cam_watchdog.pid");
             Path lockDir = root.resolve("cam_watchdog.lock");
             Path owners = root.resolve("owners.txt");
-            Path release = root.resolve("release");
+            // Each contender records its mkdir attempt here; the owner holds the lock until
+            // both have tried, so no timing assumption decides the outcome.
+            Path attempts = Files.createDirectory(root.resolve("attempts"));
+            Path trace = root.resolve("trace.txt");
 
             String generated = join(DaemonLauncher.Companion
                     .buildCamDaemonWatchdogScript(
@@ -60,8 +63,8 @@ public class DaemonWatchdogOwnershipContractTest {
                     + "fi";
             int end = generated.indexOf(acquisitionEnd);
             assertTrue(end >= 0);
-            String protocol = generated.substring(
-                    0, end + acquisitionEnd.length())
+            String protocol = "echo \"$$ start $(date +%s)\" >> \"" + trace + "\"\n"
+                    + generated.substring(0, end + acquisitionEnd.length())
                     .replace("/data/local/tmp/start_cam_daemon.sh",
                             scriptPath.toString())
                     .replace("/data/local/tmp/cam_watchdog.pid",
@@ -69,20 +72,28 @@ public class DaemonWatchdogOwnershipContractTest {
                     .replace("/data/local/tmp/cam_watchdog.lock",
                             lockDir.toString())
                     // Make both contenders reach the atomic directory
-                    // acquisition together.
+                    // acquisition together, and record each attempt.
                     .replace(
                             "if mkdir \"$WATCHDOG_LOCK_DIR\" 2>/dev/null; then",
                             "sleep 1\n"
-                                    + "  if mkdir \"$WATCHDOG_LOCK_DIR\" "
-                                    + "2>/dev/null; then")
+                                    + "  mkdir \"$WATCHDOG_LOCK_DIR\" 2>/dev/null\n"
+                                    + "  WD_MKDIR=$?\n"
+                                    + "  echo \"$$ mkdir=$WD_MKDIR $(date +%s)\" >> \"" + trace + "\"\n"
+                                    + "  : > \"" + attempts + "/$$\"\n"
+                                    + "  if [ \"$WD_MKDIR\" -eq 0 ]; then")
                     + "\necho $$ >> \"" + owners + "\"\n"
-                    // Hold the lock until the other contender has tried and exited, so a
-                    // late start on a loaded machine cannot take a lock already released.
+                    // Hold the lock until the other contender has attempted mkdir.
+                    + "attempts_seen() {\n"
+                    + "  n=0\n"
+                    + "  for f in \"" + attempts + "\"/*; do [ -e \"$f\" ] && n=$((n + 1)); done\n"
+                    + "  echo $n\n"
+                    + "}\n"
                     + "i=0\n"
-                    + "while [ ! -e \"" + release + "\" ] && [ $i -lt 30 ]; do\n"
+                    + "while [ \"$(attempts_seen)\" -lt 2 ] && [ $i -lt 120 ]; do\n"
                     + "  sleep 1\n"
                     + "  i=$((i + 1))\n"
-                    + "done\n";
+                    + "done\n"
+                    + "echo \"$$ release attempts=$(attempts_seen) $(date +%s)\" >> \"" + trace + "\"\n";
             // Another test's scratch-root override would leave the real paths in place.
             for (Path expected : new Path[] {scriptPath, pidFile, lockDir}) {
                 assertTrue("protocol does not use " + expected + ":\n" + protocol,
@@ -99,24 +110,26 @@ public class DaemonWatchdogOwnershipContractTest {
                     shell.toString(), scriptPath.toString())
                     .redirectErrorStream(true)
                     .start();
-            // The contender that loses the lock exits first; only then may the owner finish.
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
-            while (first.isAlive() && second.isAlive() && System.nanoTime() < deadline) {
-                Thread.sleep(50);
-            }
-            Files.createFile(release);
+            boolean firstDone = first.waitFor(150, TimeUnit.SECONDS);
+            boolean secondDone = second.waitFor(150, TimeUnit.SECONDS);
+            if (!firstDone) first.destroyForcibly();
+            if (!secondDone) second.destroyForcibly();
             byte[] firstOutput = first.getInputStream().readAllBytes();
             byte[] secondOutput = second.getInputStream().readAllBytes();
+            String traced = Files.exists(trace)
+                    ? new String(Files.readAllBytes(trace), StandardCharsets.UTF_8) : "";
+            assertTrue("contenders did not finish; trace=\n" + traced, firstDone && secondDone);
             assertEquals(new String(firstOutput, StandardCharsets.UTF_8),
-                    0, first.waitFor());
+                    0, first.exitValue());
             assertEquals(new String(secondOutput, StandardCharsets.UTF_8),
-                    0, second.waitFor());
+                    0, second.exitValue());
 
             List<String> ownerLines = Files.exists(owners)
                     ? Files.readAllLines(owners) : java.util.Collections.emptyList();
             assertEquals("owners=" + ownerLines
                             + " first=[" + new String(firstOutput, StandardCharsets.UTF_8)
-                            + "] second=[" + new String(secondOutput, StandardCharsets.UTF_8) + "]",
+                            + "] second=[" + new String(secondOutput, StandardCharsets.UTF_8) + "]"
+                            + " trace=\n" + traced,
                     1, ownerLines.size());
             assertFalse(Files.exists(pidFile));
             assertFalse(Files.exists(lockDir));
