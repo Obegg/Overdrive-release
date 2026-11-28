@@ -19,20 +19,20 @@ public final class VoiceMatch {
     // ── Parameters (eval-tuned; tools/voice/eval/voicematch.py mirrors every one) ──
     /** Frontend frames averaged into one matching frame (2 = 20 ms). */
     public static final int DECIMATE = 2;
-    /** Frame distance: cosine (spectral shape; Euclidean lost half the recall at the same false wakes). */
-    public static final boolean COSINE = true;
-    /** Each matching frame's mean over the 40 channels removed first (fewer negatives near a voice's takes). */
-    public static final boolean FRAME_MEAN = true;
+    /** Matching frame: cepstra c1..NCEP of the 40 channels and their deltas, CMVN over the segment, unit length. */
+    public static final int NCEP = 13;
+    public static final float STD_FLOOR = 0.1f;
     /** DTW step: a template frame moves 0, 1 .. MAX_STEP test frames (never two 0s in a row). */
     public static final int MAX_STEP = 2;
-    /** Gate: the trigger's stage-1 peak in reference units (0.45 = the model's cutoff) and the speech level. */
-    public static final float GATE_P_REF = 0.45f;
+    /** Gate: every stage-1 fire, second chance included (0.15 model = 0.3375 reference units), with speech. */
+    public static final float GATE_P_REF = 0.3375f;
     public static final float MIN_LEVEL_DBFS = -55f;
-    /** Threshold: the worst leave-one-out take x (1 + MARGIN), in [FLOOR, CAP], under AMBIENT x the cabin's best. */
-    public static final float MARGIN = 0.25f;
-    public static final float FLOOR = 0.35f;
-    public static final float CAP = 0.45f;
-    public static final float AMBIENT = 0.80f;
+    /** A voice's distance: the mean of its two nearest templates (one template: that one). */
+    public static final int FUSE = 2;
+    /** Threshold: the worst leave-one-out take x (1 + MARGIN), in [FLOOR, CAP] (impostors pile up just above 0.5). */
+    public static final float MARGIN = 0.50f;
+    public static final float FLOOR = 0.46f;
+    public static final float CAP = 0.50f;
     /** Template: frames above the take's floor + TRIM_REL x its range, padded by TRIM_PAD. */
     public static final float TRIM_REL = 0.20f;
     public static final int TRIM_PAD = 2;
@@ -42,16 +42,26 @@ public final class VoiceMatch {
     public static final int WINDOW_FRAMES = 220;
     /** A check reports distances up to this multiple of the threshold (above: abandoned early, logged as 9.99). */
     static final float REPORT_UP_TO = 2f;
-    /** Ambient: frames ending this long before a take's onset. */
-    static final int AMBIENT_GUARD_FRAMES = 15;
     public static final int MAX_TAKES = 8;
 
     public static final int KIND_QUIET = 0;
     public static final int KIND_MUSIC = 1;
     static final int CHANNELS = MicroFrontend.NUM_CHANNELS;
+    static final int DIM = 2 * NCEP;
     private static final int MAGIC = 0x4F44564D;  // "ODVM"
     private static final int VERSION = 1;
     private static final float INF = 1e9f;
+    private static final float[] DCT = new float[NCEP * CHANNELS];
+
+    static {
+        // Orthonormal DCT-II rows 1..NCEP over the channels (c0, the level, is dropped).
+        for (int k = 1; k <= NCEP; k++) {
+            for (int c = 0; c < CHANNELS; c++) {
+                DCT[(k - 1) * CHANNELS + c] = (float) (Math.sqrt(2.0 / CHANNELS)
+                        * Math.cos(Math.PI * k * (2 * c + 1) / (2.0 * CHANNELS)));
+            }
+        }
+    }
 
     /** One stored take: its frames (around the word, 10 ms, unsigned 16-bit), the word's span and kind. */
     public static final class Take {
@@ -59,23 +69,21 @@ public final class VoiceMatch {
         public final int count;
         public final int start;
         public final int end;
-        public final int onset;
         public final int kind;
 
-        public Take(short[] frames, int count, int start, int end, int onset, int kind) {
+        public Take(short[] frames, int count, int start, int end, int kind) {
             this.frames = frames;
             this.count = count;
             this.start = start;
             this.end = end;
-            this.onset = onset;
             this.kind = kind;
         }
 
-        /** A take from its window of frames ({@code onset}: frame where speech started), or null when no word fits. */
-        public static Take of(short[] frames, int count, int onset, int kind) {
+        /** A take from its window of frames (lead, word, tail), or null when no word fits. */
+        public static Take of(short[] frames, int count, int kind) {
             int[] span = trim(frames, count);
             if (span == null) return null;
-            return new Take(Arrays.copyOf(frames, count * CHANNELS), count, span[0], span[1], onset, kind);
+            return new Take(Arrays.copyOf(frames, count * CHANNELS), count, span[0], span[1], kind);
         }
     }
 
@@ -140,12 +148,8 @@ public final class VoiceMatch {
         Verdict best = null;
         float[][] work = new float[4][n];
         for (Voice v : voices) {
-            float d = INF;
-            for (int i = 0; i < v.templates.length; i++) {
-                if (cancel != null && cancel.getAsBoolean()) return best;
-                d = Math.min(d, distance(v.templates[i], v.lengths[i], test, n,
-                        Math.min(d, REPORT_UP_TO * v.threshold), work));
-            }
+            if (cancel != null && cancel.getAsBoolean()) return best;
+            float d = fused(v.templates, v.lengths, -1, test, n, REPORT_UP_TO * v.threshold, work);
             if (best == null || d / v.threshold < best.distance / best.threshold) {
                 best = new Verdict(v.id, d, v.threshold);
             }
@@ -153,48 +157,90 @@ public final class VoiceMatch {
         return best;
     }
 
-    /** Matching frames of [{@code from}, {@code to}): pairs averaged, scaled to ~1 per channel, unit length for cosine. */
+    /**
+     * A voice's distance to a test: the mean of its FUSE nearest templates (all of them when fewer), leaving out
+     * template {@code skip}; INF when above {@code report} (each template then stops early).
+     */
+    static float fused(float[][] templates, int[] lengths, int skip, float[] test, int n, float report, float[][] work) {
+        float[] best = new float[FUSE];
+        java.util.Arrays.fill(best, INF);
+        int usable = 0;
+        for (int i = 0; i < templates.length; i++) {
+            if (i == skip) continue;
+            usable++;
+            float d = distance(templates[i], lengths[i], test, n, Math.min(best[FUSE - 1], FUSE * report), work);
+            for (int k = 0; k < FUSE; k++) {
+                if (d < best[k]) {
+                    System.arraycopy(best, k, best, k + 1, FUSE - 1 - k);
+                    best[k] = d;
+                    break;
+                }
+            }
+        }
+        int m = Math.min(FUSE, usable);
+        if (m == 0) return INF;
+        float sum = 0f;
+        for (int k = 0; k < m; k++) {
+            if (best[k] >= INF) return INF;
+            sum += best[k];
+        }
+        float d = sum / m;
+        return d > report ? INF : d;
+    }
+
+    /** Matching frames of [{@code from}, {@code to}): pairs averaged /256, cepstra + deltas, CMVN, unit length (DIM each). */
     static float[] prepare(short[] frames, int from, int to) {
-        int n = (to - from) / DECIMATE;
-        float[] out = new float[n * CHANNELS];
+        int n = Math.max(0, (to - from) / DECIMATE);
+        float[] x = new float[CHANNELS];
+        float[] cep = new float[n * NCEP];
         for (int f = 0; f < n; f++) {
-            for (int k = 0; k < DECIMATE; k++) {
-                int src = (from + f * DECIMATE + k) * CHANNELS;
-                for (int c = 0; c < CHANNELS; c++) out[f * CHANNELS + c] += (frames[src + c] & 0xFFFF);
-            }
-            float mean = 0f;
             for (int c = 0; c < CHANNELS; c++) {
-                out[f * CHANNELS + c] /= 256f * DECIMATE;
-                mean += out[f * CHANNELS + c];
+                int sum = 0;
+                for (int k = 0; k < DECIMATE; k++) sum += frames[(from + f * DECIMATE + k) * CHANNELS + c] & 0xFFFF;
+                x[c] = sum / (256f * DECIMATE);
             }
-            mean = FRAME_MEAN ? mean / CHANNELS : 0f;
+            for (int k = 0; k < NCEP; k++) {
+                float acc = 0f;
+                for (int c = 0; c < CHANNELS; c++) acc += DCT[k * CHANNELS + c] * x[c];
+                cep[f * NCEP + k] = acc;
+            }
+        }
+        float[] out = new float[n * DIM];
+        for (int f = 0; f < n; f++) {
+            int m1 = Math.max(0, f - 1), m2 = Math.max(0, f - 2), p1 = Math.min(n - 1, f + 1), p2 = Math.min(n - 1, f + 2);
+            for (int k = 0; k < NCEP; k++) {
+                out[f * DIM + k] = cep[f * NCEP + k];
+                out[f * DIM + NCEP + k] = (cep[p1 * NCEP + k] - cep[m1 * NCEP + k]
+                        + 2f * (cep[p2 * NCEP + k] - cep[m2 * NCEP + k])) / 10f;
+            }
+        }
+        for (int d = 0; d < DIM; d++) {
+            double sum = 0;
+            double sq = 0;
+            for (int f = 0; f < n; f++) sum += out[f * DIM + d];
+            double mean = sum / Math.max(1, n);
+            for (int f = 0; f < n; f++) {
+                double v = out[f * DIM + d] - mean;
+                sq += v * v;
+            }
+            float inv = (float) (1.0 / (Math.sqrt(sq / Math.max(1, n)) + STD_FLOOR));
+            for (int f = 0; f < n; f++) out[f * DIM + d] = (float) ((out[f * DIM + d] - mean) * inv);
+        }
+        for (int f = 0; f < n; f++) {
             float norm = 0f;
-            for (int c = 0; c < CHANNELS; c++) {
-                float x = out[f * CHANNELS + c] - mean;
-                out[f * CHANNELS + c] = x;
-                norm += x * x;
-            }
-            if (COSINE) {
-                float inv = 1f / ((float) Math.sqrt(norm) + 1e-3f);
-                for (int c = 0; c < CHANNELS; c++) out[f * CHANNELS + c] *= inv;
-            }
+            for (int d = 0; d < DIM; d++) norm += out[f * DIM + d] * out[f * DIM + d];
+            float inv = 1f / ((float) Math.sqrt(norm) + 1e-3f);
+            for (int d = 0; d < DIM; d++) out[f * DIM + d] *= inv;
         }
         return out;
     }
 
     private static float cost(float[] a, int i, float[] b, int j) {
-        int ai = i * CHANNELS;
-        int bj = j * CHANNELS;
+        int ai = i * DIM;
+        int bj = j * DIM;
         float s = 0f;
-        if (COSINE) {
-            for (int c = 0; c < CHANNELS; c++) s += a[ai + c] * b[bj + c];
-            return 1f - s;
-        }
-        for (int c = 0; c < CHANNELS; c++) {
-            float d = a[ai + c] - b[bj + c];
-            s += d * d;
-        }
-        return (float) Math.sqrt(s);
+        for (int d = 0; d < DIM; d++) s += a[ai + d] * b[bj + d];
+        return 1f - s;
     }
 
     /**
@@ -276,39 +322,20 @@ public final class VoiceMatch {
     }
 
     /**
-     * A voice's threshold from its takes: each take's nearest other template (leave one out), the worst of them
-     * plus the margin, within [FLOOR, CAP] and under AMBIENT x the nearest any template came to the cabin sound
-     * before a take. NaN when fewer than two takes, or the cabin sound matches as well as the word.
+     * A voice's threshold: each take's distance to the other templates (leave one out, the same two-nearest rule),
+     * the worst x (1 + MARGIN) within [FLOOR, CAP]; NaN with under two takes.
      */
     public static float calibrate(List<Take> takes) {
         if (takes.size() < 2) return Float.NaN;
         Voice all = new Voice("", takes, INF);
         float worst = 0f;
-        float ambient = INF;
         for (int i = 0; i < takes.size(); i++) {
             Take t = takes.get(i);
-            float[] window = prepare(t.frames, 0, t.count);
             int n = t.count / DECIMATE;
             float[][] work = new float[4][Math.max(1, n)];
-            float nearest = INF;
-            for (int j = 0; j < takes.size(); j++) {
-                if (j != i) nearest = Math.min(nearest, distance(all.templates[j], all.lengths[j], window, n, INF, work));
-            }
-            worst = Math.max(worst, nearest);
-            int quiet = t.onset - AMBIENT_GUARD_FRAMES;
-            if (quiet >= MIN_TEMPLATE_FRAMES) {
-                float[] cabin = prepare(t.frames, 0, quiet);
-                int m = quiet / DECIMATE;
-                float[][] w2 = new float[4][m];
-                for (int j = 0; j < takes.size(); j++) {
-                    ambient = Math.min(ambient, distance(all.templates[j], all.lengths[j], cabin, m, INF, w2));
-                }
-            }
+            worst = Math.max(worst, fused(all.templates, all.lengths, i, prepare(t.frames, 0, t.count), n, INF, work));
         }
-        if (worst >= INF) return Float.NaN;
-        float thr = Math.max(FLOOR, Math.min(CAP, worst * (1f + MARGIN)));
-        if (ambient < INF) thr = Math.min(thr, AMBIENT * ambient);
-        return thr >= FLOOR - 1e-6f ? thr : Float.NaN;
+        return worst >= INF ? Float.NaN : Math.max(FLOOR, Math.min(CAP, worst * (1f + MARGIN)));
     }
 
     /** The newest {@link #MAX_TAKES}: this training's takes first, then the voice's earlier takes of the other kind. */
@@ -350,7 +377,6 @@ public final class VoiceMatch {
                 out.writeShort(t.count);
                 out.writeShort(t.start);
                 out.writeShort(t.end);
-                out.writeShort(t.onset);
                 for (int i = 0; i < t.count * CHANNELS; i++) out.writeShort(t.frames[i]);
             }
             out.flush();
@@ -373,14 +399,13 @@ public final class VoiceMatch {
                     int count = d.readShort();
                     int start = d.readShort();
                     int end = d.readShort();
-                    int onset = d.readShort();
                     if (count <= 0 || count > WakeWordDetector.FEATURE_RING_FRAMES || start < 0 || end > count
                             || end - start < MIN_TEMPLATE_FRAMES) {
                         return null;
                     }
                     short[] frames = new short[count * CHANNELS];
                     for (int i = 0; i < frames.length; i++) frames[i] = d.readShort();
-                    takes.add(new Take(frames, count, start, end, onset, kind));
+                    takes.add(new Take(frames, count, start, end, kind));
                 }
                 return new Saved(id, when, threshold, takes);
             } catch (IOException | RuntimeException e) {

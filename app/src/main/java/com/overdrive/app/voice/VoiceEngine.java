@@ -4187,7 +4187,7 @@ final class VoiceEngine implements PcmSink {
 
     /**
      * The take's stage-1 frames: the detector heard every enrollment chunk, so the take's {@code enrollLen}
-     * samples are its newest frames (less the ones after {@code end}); speech began near {@code enrollOnset}.
+     * samples are its newest frames, less the ones after {@code end}.
      */
     private VoiceMatch.Take enrollMatchTake(int end) {
         if (wake == null) return null;
@@ -4196,9 +4196,7 @@ final class VoiceEngine implements PcmSink {
         short[] f = new short[frames * com.overdrive.app.voice.wake.MicroFrontend.NUM_CHANNELS];
         int got = wake.copyFeatures(f, frames);
         int keep = got - (enrollLen - end) / step;
-        int onset = (enrollOnset - (enrollLen - got * step - 2 * step)) / step;
-        return keep <= 0 ? null : VoiceMatch.Take.of(f, keep, Math.max(0, onset),
-                enrollMusic ? VoiceMatch.KIND_MUSIC : VoiceMatch.KIND_QUIET);
+        return keep <= 0 ? null : VoiceMatch.Take.of(f, keep, enrollMusic ? VoiceMatch.KIND_MUSIC : VoiceMatch.KIND_QUIET);
     }
 
     /**
