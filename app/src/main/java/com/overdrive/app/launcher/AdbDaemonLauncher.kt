@@ -364,15 +364,6 @@ class AdbDaemonLauncher(private val context: Context) {
         serviceLauncher.ensureWifiEnabled(callback.toServiceCallback())
     }
     
-    // ==================== SENTRY DAEMON ====================
-    
-    /**
-     * Stop the Sentry Daemon.
-     */
-    fun stopSentryDaemon(callback: LaunchCallback) {
-        daemonLauncher.killDaemon("sentry_daemon", callback.toDaemonCallback())
-    }
-    
     // ==================== SENTRY PROXY ====================
     
     /**
