@@ -483,38 +483,46 @@ Developers can still send pull requests on the language files: `app/src/main/ass
 The latest release in full, then earlier highlights. APKs and per-release notes are on
 [GitHub Releases](https://github.com/yash-srivastava/Overdrive-release/releases).
 
-### v65.5: Continuous Playback, Smoother DiLink 5 Layouts & 120+ Improvements
+### v66.0: Rebuilt Voice Assistant, Dashcam View on the Timeline & 160+ Improvements
 
 #### ✨ New
 
-- **Back-to-back playback** — Events → List can play recordings one after another, newer or older first, and remembers your direction and skip choices.
-- **Live trip cost on glass widgets** — Trip cost now updates while you drive, as it already did on Custom Layouts.
-- **Map notice** — Maps say when tiles can't load instead of staying blank.
-- **Keyboard and screen reader support** — Date pickers, the map's Follow button, collapsible cards and dialogs now work with a keyboard and are read out properly.
-- **Hebrew** — The Hebrew translation is complete again.
+- **Rebuilt voice assistant** — The wake word was retrained and no longer fires on song lyrics, and the assistant keeps up with the microphone instead of dropping audio. Voice match learns how each enrolled driver says the wake word. Gemini answers reliably while music plays, and a new Response patience setting controls how long it waits after you stop talking.
+- **Dashcam view on the Timeline** — Recordings play back in the dashcam layout in the browser and the app, and "Save as one video" can export that view.
+- **New Projection screen** — Apps appear as tiles with a long-press menu, settings shared by every app move to a side panel, and Back, Home and Volume buttons sit under the mirror.
+- **Full HDMI projection on the Sealion 7** — Optional: project an app across the whole navigation area of the cluster (on the tested firmware).
+- **Sealion 7 power readout** — Live power and regeneration now show on the Sealion 7, and Sentry stays on during remote heater wakes.
+- **DiLink 100** — An optional drive-mode window keeps OverDrive usable out of Park, OverDrive gives way to the car's own camera view, and formatting the SD card works there.
+- **Custom Layouts** — The car's Trip A, Trip B and odometer on every layout, a bigger battery gauge and more readings in the builder.
+- **Automations** — Set target SOC accepts variables and live signals.
+- **Parked Bluetooth** — Turns off in a safe zone when locking is restricted there.
+- **Events** — A separate skip option for powered-on DVR clips in back-to-back playback, and fully played short clips count as watched.
+- **Translations** — French is complete, and Traditional Chinese is 93% done.
 
 #### ⚡ Optimizations
 
-- **Smoother Custom Layouts on DiLink 5** — Speed, gear and turn signals reach the cluster in about 25–50 ms instead of freezing for about 0.4 s every 2 s (measured on a Sealion 7).
-- **Lighter guarding and recording** — The parked motion detector, the CPU dashcam compositor and preview de-warping do less work per frame.
-- **Faster Timeline and Trips** — The timeline strip, playlist planning and video buffers are reused instead of rebuilt, and trip maps draw fewer layers.
-- **Leaner streaming** — Voice and AI chat send far fewer tiny network packets, and the browser's live view keeps its decode backlog bounded.
-- **Cleaner code** — Around 100 changes merge duplicated code and remove dead code, with no change in behaviour.
+- **Lighter dashcam recording** — The CPU dashcam compositor does 10–60% less work per frame in benchmarks, with identical output, and the factory dashcam follows the recording frame rate.
+- **Faster motion detection** — Parked motion analysis checks candidates in parallel and reuses its buffers.
+- **Less memory and storage wear** — The AI detector is freed while you drive, and the history databases save at clear points instead of writing 20 times a second.
+- **Lighter head-unit screens** — Fewer frames and timers when a screen isn't visible, DiLink 3/4 vehicle readings shared between features, and RoadSense overlays served from memory.
+- **Faster recordings library** — Thumbnails and timeline stills are made at their final size, and SD card libraries need fewer lookups to stay in sync.
+- **Cleaner code** — Around 70 changes remove dead code, with no change in behaviour.
 
 #### 🛠️ Fixes
 
-- **DiLink 100 (Atto 2 DM-i)** — OverDrive no longer fights the car's own 360°/reverse view after the car restarts.
-- **SD card errors** — When the card starts failing writes, OverDrive can remount it again. This was blocked on every car.
-- **Custom Layouts** — No more bars on 8.8" DiLink 3 clusters, and a running layout moves to the full panel as soon as it's ready.
-- **Telegram proximity messages** — 🔒 and 🔓 appear only when the car confirmed the lock or unlock, and ⚠️ otherwise. Unlock confirmations now say "unlock" instead of "lock state".
-- **Auto-start** — Delayed resets of the BYD auto-start restriction are fixed, and settings show its last verified state.
-- **Timeline sharing** — A successful share no longer also copies a link or downloads the clip, and fallbacks use the clip you tapped.
-- **No more stuck pages** — The Notification Log shows load errors with a retry instead of an empty list. Parking history, Community Automations, the SoC history chart, hotspot status, search and SafeKeep badges no longer get stuck on old or failed answers. Backups no longer report success when the download failed.
-- **Security** — The MQTT settings pages can no longer be used to run other daemon commands.
-- **And more** — The dashboard's recording chip stays in sync with the camera, Recent activity follows the app's language, and fixes to the language picker, themes in embedded pages, duplicate Community Widgets and the layout of the parked-audio setting.
+- **Recordings index** — A lost index entry is repaired instead of slowing down every delete.
+- **Dates and sizes** — Recording dates no longer depend on the language setting, "Yesterday" stays right across daylight-saving changes, and file sizes follow your number format.
+- **Trips** — Exports skip invalid GPS fixes, invalid electricity and fuel prices are refused before they're saved, and odd readings no longer cut a trip record short.
+- **Navigation map** — Invalid coordinates from search, saved places and routes are rejected instead of ending up at 0,0. Offline search accepts padded Plus Codes, and distances follow your number format.
+- **Automations** — Action-group backups survive a damaged settings file.
+- **Battery hold** — Works on firmware that can't report its current state.
+- **Dashboard** — Wi-Fi status refreshes before a network switch, and truncated network names are ignored.
+- **SafeKeep** — Trip CSV exports use the final trip energy and handle line breaks in text fields.
+- **And more** — The phone layout of nested automation steps and the sidebar fuel card, parked motion history, and daily briefing places.
 
 ### Earlier releases
 
+- **v65.5** — Continuous Playback, Smoother DiLink 5 Layouts & 120+ Improvements
 - **v65.4** — Calls Stay on Your Phone, Richer Custom Layouts & 80+ Fixes
 - **v65.2** — Lighter Surveillance, Smoother Live View & 60+ Fixes
 - **v65.0** — Take Control of Your Full Driver Cluster + Face ID Lock
