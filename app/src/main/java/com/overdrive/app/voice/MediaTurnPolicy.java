@@ -67,6 +67,32 @@ final class MediaTurnPolicy {
         return Boolean.TRUE.equals(available) && !(pauseEnabled && !resumeEnabled);
     }
 
+    /** Echo states for {@link #cabinDuck(Boolean, boolean, boolean, boolean, int)}. */
+    static final int ECHO_NONE = 0;
+    static final int ECHO_HEALTHY = 1;
+    static final int ECHO_UNHEALTHY = 2;
+
+    /**
+     * As above, with the car array's measured echo health. Media playing at turn start that the
+     * echo canceller is not (measurably) removing would stream to the provider through a duck and
+     * keep its turn open, so it is paused instead, whatever resume-after says (resume still
+     * follows it). Healthy, or no car array ({@code ECHO_NONE}): today's rule.
+     */
+    static boolean cabinDuck(Boolean available, boolean pauseEnabled, boolean resumeEnabled,
+                             boolean mediaPlaying, int echo) {
+        if (echo == ECHO_UNHEALTHY && mediaPlaying && pauseEnabled) return false;
+        return cabinDuck(available, pauseEnabled, resumeEnabled);
+    }
+
+    /** Why the turn's media hold was chosen, for the turn log. */
+    static String holdReason(boolean mediaPlaying, boolean pauseEnabled, boolean cabinDuck, int echo) {
+        if (!mediaPlaying) return "no_media";
+        if (!pauseEnabled) return "setting";
+        if (echo == ECHO_UNHEALTHY) return "echo_unhealthy";
+        if (cabinDuck) return echo == ECHO_HEALTHY ? "echo_healthy" : "cabin_duck";
+        return "pause";
+    }
+
     /**
      * OverDrive's own sound while the cabin duck silences the media stream (channel values as in
      * VoiceAssistantConfig): media output moves to the voice stream, or to navigation when the voice

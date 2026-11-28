@@ -26,6 +26,13 @@ import java.util.List;
 public final class PhoneDecoder implements AutoCloseable {
 
     private static final String TAG = "PhoneDecoder";
+    /**
+     * A wake check hears "OverDrive" when its decode is within this share of edits of a core wake line
+     * (2 of 7), or of 3 of 7 after a strong stage-1 trigger (eval-tuned: no added false wake in 15 h).
+     */
+    public static final float WAKE_MAX_DISTANCE = 0.30f;
+    public static final float WAKE_MAX_DISTANCE_STRONG = 0.45f;
+    private static final List<String[]> WAKE_PHONES = wakePhoneLines();
     private static final int SAMPLE_RATE = 16_000;
 
     private final OnlineRecognizer recognizer;
@@ -99,6 +106,54 @@ public final class PhoneDecoder implements AutoCloseable {
                 }
             }
         }
+    }
+
+    /**
+     * Least edit distance (stress ignored, over the line's length) between any built-in wake line and
+     * a stretch of {@code decoded}; 1 when nothing was decoded.
+     */
+    public static float wakeDistance(List<String> decoded) {
+        if (decoded == null || decoded.isEmpty()) return 1f;
+        String[] b = new String[decoded.size()];
+        for (int i = 0; i < b.length; i++) b[i] = unstressed(decoded.get(i));
+        float best = 1f;
+        for (String[] a : WAKE_PHONES) {
+            // Semi-global: the line may start and end anywhere in the decode.
+            int[] prev = new int[b.length + 1];
+            int[] cur = new int[b.length + 1];
+            for (int i = 1; i <= a.length; i++) {
+                cur[0] = i;
+                for (int j = 1; j <= b.length; j++) {
+                    int sub = prev[j - 1] + (a[i - 1].equals(b[j - 1]) ? 0 : 1);
+                    cur[j] = Math.min(sub, Math.min(prev[j] + 1, cur[j - 1] + 1));
+                }
+                int[] t = prev;
+                prev = cur;
+                cur = t;
+            }
+            int min = Integer.MAX_VALUE;
+            for (int v : prev) min = Math.min(min, v);
+            best = Math.min(best, min / (float) a.length);
+        }
+        return best;
+    }
+
+    /** The core built-in wake lines (threshold #0.10); the looser accent lines admit too much talk. */
+    private static List<String[]> wakePhoneLines() {
+        List<String[]> out = new ArrayList<>();
+        for (String line : LocalCommandSpotter.WAKE_KEYWORDS.split("/")) {
+            if (!line.contains("#0.10")) continue;
+            List<String> tokens = new ArrayList<>();
+            for (String t : line.trim().split("\\s+")) {
+                if (!t.isEmpty() && !t.startsWith(":") && !t.startsWith("#") && !t.startsWith("@")) tokens.add(unstressed(t));
+            }
+            if (!tokens.isEmpty()) out.add(tokens.toArray(new String[0]));
+        }
+        return out;
+    }
+
+    private static String unstressed(String token) {
+        return token.replaceAll("[0-9]", "");
     }
 
     @Override

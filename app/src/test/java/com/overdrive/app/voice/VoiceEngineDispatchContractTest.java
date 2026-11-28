@@ -59,8 +59,11 @@ public class VoiceEngineDispatchContractTest {
         String close = block(src, "    private void closeLocalWindow() {");
         assertTrue(close.contains("held.isEmpty()"));
         assertTrue(close.contains("validateHeld("));
-        String validate = block(src, "    private void validateHeld(boolean hybrid) {");
-        assertTrue(validate.contains("understandLocally()"));
+        // The transcript runs on the worker; its result finishes the validation.
+        assertTrue(block(src, "    private void validateHeld() {").contains("requestTurnAsr(ASR_VALIDATE);"));
+        assertTrue(block(src, "    private void onTurnAsr(int forTurn, int purpose, CommandTranscriber.Understood u, String text,")
+                .contains("finishValidateHeld(extraWords >= 0);"));
+        String validate = block(src, "    private void finishValidateHeld(boolean transcribed) {");
         assertTrue(validate.contains("VoicePrompts.NOT_UNDERSTOOD"));
         assertTrue(validate.contains("noteTurn(\"held_unverified\")"));
         assertTrue(validate.contains("startCloud(true)"));
@@ -85,7 +88,7 @@ public class VoiceEngineDispatchContractTest {
     @Test
     public void unverifiedHeldHitsNeverSpeakAnErrorOverAnExecutedCommand() throws Exception {
         String validate = block(readProjectFile(ENGINE),
-                "    private void validateHeld(boolean hybrid) {");
+                "    private void finishValidateHeld(boolean transcribed) {");
         int notTranscribed = validate.indexOf("if (!transcribed) {");
         int executedEmpty = validate.indexOf("if (executed.isEmpty()) {");
         int error = validate.indexOf("noteTurn(\"held_unverified\")");
@@ -116,9 +119,10 @@ public class VoiceEngineDispatchContractTest {
 
     @Test
     public void sttWakesCarryTheirTranscriptInTheCheckLog() throws Exception {
-        String body = block(readProjectFile(ENGINE), "    private void checkWake() {");
-        assertTrue(body.contains("!\"stt\".equals(by) ? null : CommandTranscriber.logSafe(text, 40)"));
-        assertEquals(2, count(body, "englishSpeech()"));
+        String src = readProjectFile(ENGINE);
+        String body = block(src, "    private void onWakeVerdict(WakeCheck c) {");
+        assertTrue(body.contains("!\"stt\".equals(by) ? null : CommandTranscriber.logSafe(c.text, 40)"));
+        assertEquals(2, count(block(src, "    private void checkWake() {"), "englishSpeech()"));
     }
 
     @Test
@@ -137,7 +141,7 @@ public class VoiceEngineDispatchContractTest {
         assertTrue(resetDecodes > rebase);
         assertTrue(decode.indexOf("toMatch(", resetDecodes) > resetDecodes);
         String verify = block(src,
-                "    private int verifyWith(short[] pcm, int offset, int length, String keywords) {");
+                "    private int verifyWith(short[] pcm, int offset, int length, String keywords,");
         assertTrue(verify.contains("if (reset || times == null || times.length == 0) return WAKE_END_UNKNOWN;"));
         assertTrue(verify.contains("int end = Math.round(times[times.length - 1] * SAMPLE_RATE);"));
     }

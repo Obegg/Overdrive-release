@@ -55,6 +55,11 @@ public class GenAiVoiceWebSocketConnectTest {
         assertEquals("connect_timeout", GenAiVoiceWebSocket.setupDecision(null, 0, 1, -1, t0 + 5_001, t0, false, false));
         assertEquals("retry", GenAiVoiceWebSocket.setupDecision(null, 0, 1, -1, t0 + 5_001, t0, true, false));
         assertEquals("connect_timeout", GenAiVoiceWebSocket.setupDecision(null, 0, 2, -1, t0 + 5_001, t0, true, true));
+        // Far-field: a timeout with no socket open re-dials the same route once, on a shorter limit.
+        assertEquals("retry_same", GenAiVoiceWebSocket.setupDecision(null, 0, 1, -1, t0 + 5_001, t0, 5_000, true, true, false));
+        assertEquals("retry", GenAiVoiceWebSocket.setupDecision(null, 0, 2, -1, t0 + 3_001, t0, 3_000, false, true, false));
+        assertEquals("connect_timeout", GenAiVoiceWebSocket.setupDecision(null, 0, 2, -1, t0 + 3_001, t0, 3_000, false, false, false));
+        assertEquals("fail:connect_failed", GenAiVoiceWebSocket.setupDecision("boom", 0, 1, -1, t0 + 100, t0, 5_000, true, false, false));
         // Open but silent: setup_timeout only after 6000 ms from the open (below the app's 8 s
         // live window, so the daemon names the phase before the app gives up).
         long opened = t0 + 300;

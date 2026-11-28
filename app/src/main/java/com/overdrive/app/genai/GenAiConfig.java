@@ -49,6 +49,8 @@ public final class GenAiConfig {
     public final String baseUrl;
     public final String model;
     public final String realtimeModel;
+    /** Optional realtime model for one setup retry when the main one is busy or out of quota; "" = none. */
+    public final String realtimeFallbackModel;
     public final String apiKey;
     public final int maxOutputTokens;
     public final String insightSchedule;
@@ -86,11 +88,24 @@ public final class GenAiConfig {
                 int insightDay, String insightMode,
                 boolean insightDashboard, boolean insightNotifications,
                 boolean routineLearningEnabled) {
+        this(enabled, provider, baseUrl, model, realtimeModel, apiKey,
+                maxOutputTokens, insightSchedule, insightHour, insightMinute,
+                insightDay, insightMode, insightDashboard,
+                insightNotifications, routineLearningEnabled, "");
+    }
+
+    GenAiConfig(boolean enabled, String provider, String baseUrl, String model,
+                String realtimeModel, String apiKey, int maxOutputTokens,
+                String insightSchedule, int insightHour, int insightMinute,
+                int insightDay, String insightMode,
+                boolean insightDashboard, boolean insightNotifications,
+                boolean routineLearningEnabled, String realtimeFallbackModel) {
         this.enabled = enabled;
         this.provider = normalizeProvider(provider);
         this.baseUrl = normalizeBaseUrlOrDefault(baseUrl, this.provider);
         this.model = cleanModel(model);
         this.realtimeModel = cleanModel(realtimeModel);
+        this.realtimeFallbackModel = cleanModel(realtimeFallbackModel);
         this.apiKey = apiKey == null ? "" : apiKey;
         this.maxOutputTokens = clampTokens(maxOutputTokens);
         this.insightSchedule = normalizeInsightSchedule(insightSchedule);
@@ -136,7 +151,8 @@ public final class GenAiConfig {
                 section.optString("insightMode", DEFAULT_INSIGHT_MODE),
                 section.optBoolean("insightDashboard", false),
                 section.optBoolean("insightNotifications", false),
-                section.optBoolean("routineLearningEnabled", false)
+                section.optBoolean("routineLearningEnabled", false),
+                section.optString("realtimeFallbackModel", "")
         );
     }
 
@@ -186,6 +202,9 @@ public final class GenAiConfig {
             String realtimeModel = input.has("realtimeModel")
                     ? cleanModel(input.optString("realtimeModel", ""))
                     : cleanModel(existing.optString("realtimeModel", ""));
+            String realtimeFallbackModel = input.has("realtimeFallbackModel")
+                    ? cleanModel(input.optString("realtimeFallbackModel", ""))
+                    : cleanModel(existing.optString("realtimeFallbackModel", ""));
             int maxOutputTokens = input.has("maxOutputTokens")
                     ? clampTokens(input.optInt(
                             "maxOutputTokens", DEFAULT_MAX_OUTPUT_TOKENS))
@@ -264,7 +283,7 @@ public final class GenAiConfig {
                     plainKey, maxOutputTokens, insightSchedule,
                     insightHour, insightMinute, insightDay, insightMode,
                     insightDashboard, insightNotifications,
-                    routineLearningEnabled);
+                    routineLearningEnabled, realtimeFallbackModel);
             String validationError = candidate.validationError();
             if (validationError != null) return SaveResult.error(validationError);
 
@@ -274,6 +293,9 @@ public final class GenAiConfig {
             section.put("baseUrl", candidate.baseUrl);
             section.put("model", candidate.model);
             section.put("realtimeModel", candidate.realtimeModel);
+            if (!candidate.realtimeFallbackModel.isEmpty()) {
+                section.put("realtimeFallbackModel", candidate.realtimeFallbackModel);
+            }
             section.put("apiKey", storedKey);
             section.put("maxOutputTokens", candidate.maxOutputTokens);
             section.put("insightSchedule", candidate.insightSchedule);
@@ -327,6 +349,7 @@ public final class GenAiConfig {
             json.put("baseUrl", baseUrl);
             json.put("model", model);
             json.put("realtimeModel", realtimeModel);
+            json.put("realtimeFallbackModel", realtimeFallbackModel);
             json.put("maxOutputTokens", maxOutputTokens);
             json.put("apiKeyConfigured", !apiKey.isEmpty());
             json.put("configured", isConfigured());

@@ -24,12 +24,20 @@ final class VoicePrompts {
     static final String NOT_UNDERSTOOD = "status_not_understood";
     static final String OFFLINE = "status_offline";
     static final String BUSY = "status_busy";
+    /** The provider is overloaded or out of quota (a different case from our one session slot being taken). */
+    static final String SERVICE_BUSY = "status_service_busy";
 
     private static final String TAG = "VoicePrompts";
     private static final String DIR = "voice/prompts/";
 
     private final Context app;
     private MediaPlayer player;
+    /** Dry engine (debug harness): clips keep their durations but are never started. */
+    private boolean silent;
+
+    void silence() {
+        silent = true;
+    }
 
     VoicePrompts(Context context) {
         app = context.getApplicationContext();
@@ -72,6 +80,10 @@ final class VoicePrompts {
             mp.setDataSource(fd.getFileDescriptor(), fd.getStartOffset(), fd.getLength());
             mp.prepare();
             int duration = mp.getDuration();
+            if (silent) {
+                mp.release();
+                return Math.max(0, duration);
+            }
             mp.start();
             player = mp;
             return Math.max(0, duration);

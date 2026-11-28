@@ -27,7 +27,7 @@ public class VoiceEngineCloudTurnCompletionContractTest {
     public void aTurnWhoseReplyPlayedEndsAsAnsweredWhenTheWaitRunsOut() throws Exception {
         String tick = block(readProjectFile(ENGINE), "    private void tickCloud(long now) {");
         int timedOut = tick.indexOf("if (deadline.timedOut(now)) {");
-        int replied = tick.indexOf("if (turnReplyHeard) {");
+        int replied = tick.indexOf("if (turnReplyHeard || turnAnswered) {");
         int answered = tick.indexOf("closeSession(\"cloud\");", replied);
         int failure = tick.indexOf("failures.incrementAndGet();");
         int noResponse = tick.indexOf("noteTurn(\"cloud_no_response\")");

@@ -15,6 +15,11 @@ public final class VoiceAssistantConfig {
     public static final String SENSITIVITY_NORMAL = "normal";
     public static final String SENSITIVITY_HIGH = "high";
 
+    /** How long a cloud turn waits in silence before the end of speech: 0.8 / 1 / 2 s. */
+    public static final String PATIENCE_QUICK = "quick";
+    public static final String PATIENCE_NORMAL = "normal";
+    public static final String PATIENCE_RELAXED = "relaxed";
+
     public static final int FOLLOW_UP_MIN_S = 0;
     public static final int FOLLOW_UP_MAX_S = 15;
     public static final int FOLLOW_UP_DEFAULT_S = 6;
@@ -47,8 +52,9 @@ public final class VoiceAssistantConfig {
 
     /**
      * Stage-1 wake cutoff while media genuinely plays (a measurement knob set through POST
-     * /api/voice/config, not shown in the UI). The normal cutoff stays the wake model's own
-     * (0.45 in overdrive.json); {@link #WAKE_CUTOFF_UNDER_MEDIA_MAX} means no change under media.
+     * /api/voice/config, not shown in the UI). The normal cutoff stays the wake model's own.
+     * Every stored cutoff is in reference units where 0.45 is the model's own cutoff
+     * (WakeWordDetector.REFERENCE_CUTOFF, rescaled to the loaded model); the MAX means no change under media.
      */
     public static final double WAKE_CUTOFF_UNDER_MEDIA_MIN = 0.20;
     public static final double WAKE_CUTOFF_UNDER_MEDIA_MAX = 0.45;
@@ -89,6 +95,19 @@ public final class VoiceAssistantConfig {
     public final boolean shareLocationWithAi;
     /** Stage-1 wake cutoff while media plays, {@code WAKE_CUTOFF_UNDER_MEDIA_MIN..MAX}. */
     public final double wakeCutoffUnderMedia;
+    /** The lowest Train-with-music cutoff of any voice, NaN for none (kept even when echo is healthy). */
+    public final double personalMediaCutoff;
+    /** Stage 1 hears GTCRN-denoised audio (default off until the EVAL numbers say it helps). */
+    public final boolean wakeInputDenoised;
+    /** GTCRN-denoised audio for the cloud uplink and speech-to-text when the model is present. */
+    public final boolean denoiseSpeech;
+    /** Barge-in (full duplex) while the car array's echo canceller is measurably healthy. */
+    public final boolean fullDuplex;
+    /** {@link #PATIENCE_QUICK}, {@code _NORMAL} or {@code _RELAXED} (Assistant settings page). */
+    public final String endOfSpeechPatience;
+    public final double echoRejectLikeness;
+    /** Measured ERLE (references playing) a turn needs before barge-in opens, so our reply can't interrupt itself. */
+    public final double bargeInMinErleDb;
     /**
      * Wake-word enrollment ({@code personalWake.voices}, written only by the daemon from the app's
      * result): one entry per trained person. The engine sees their union: every voice's keyword
@@ -114,7 +133,21 @@ public final class VoiceAssistantConfig {
     public static final int VOICE_NAME_MAX_CHARS = 24;
     /** Per voice. */
     public static final int PERSONAL_WAKE_MAX_LINES = 6;
+    /** Voice-match templates kept per voice: a normal and a with-music training of 4 takes each. */
+    public static final int VOICE_MATCH_MAX_TAKES = com.overdrive.app.voice.wake.VoiceMatch.MAX_TAKES;
     public static final int PERSONAL_WAKE_MAX_LINE_CHARS = 160;
+    /*
+     * Hidden tuning knobs (POST /api/voice/config only, not in the UI); docs/VOICE_ASSISTANT.md.
+     * Defaults are starting points for the EVAL harness and the car.
+     */
+    /** Echo-likeness of a trigger window (under media) at or above which it is rejected unchecked. */
+    public static final double ECHO_REJECT_MIN = 0.50;
+    public static final double ECHO_REJECT_MAX = 1.00;
+    /** Barge-in ERLE floor; the echo canceller's own healthy threshold is 10 dB. */
+    public static final double BARGE_IN_MIN_ERLE_DB_MIN = 10.0;
+    public static final double BARGE_IN_MIN_ERLE_DB_MAX = 40.0;
+    public static final double BARGE_IN_MIN_ERLE_DB_DEFAULT = 20.0;
+
     public static final double PERSONAL_WAKE_CUTOFF_MIN = 0.20;
     public static final double PERSONAL_WAKE_CUTOFF_MAX = 0.45;
 
@@ -128,7 +161,10 @@ public final class VoiceAssistantConfig {
                                  long personalWakeTrainedAt, String enrollRequestId,
                                  long enrollRequestedAt, boolean enrollRequestMusic,
                                  java.util.List<PersonalVoice> personalVoices, String enrollRequestVoice,
-                                 String enrollRequestName) {
+                                 String enrollRequestName, double personalMediaCutoff,
+                                 boolean wakeInputDenoised, boolean denoiseSpeech, boolean fullDuplex,
+                                 String endOfSpeechPatience,
+                                 double echoRejectLikeness, double bargeInMinErleDb) {
         this.enabled = enabled;
         this.mode = mode;
         this.sensitivity = sensitivity;
@@ -152,6 +188,13 @@ public final class VoiceAssistantConfig {
         this.personalVoices = personalVoices;
         this.enrollRequestVoice = enrollRequestVoice;
         this.enrollRequestName = enrollRequestName;
+        this.personalMediaCutoff = personalMediaCutoff;
+        this.wakeInputDenoised = wakeInputDenoised;
+        this.denoiseSpeech = denoiseSpeech;
+        this.fullDuplex = fullDuplex;
+        this.endOfSpeechPatience = endOfSpeechPatience;
+        this.echoRejectLikeness = echoRejectLikeness;
+        this.bargeInMinErleDb = bargeInMinErleDb;
     }
 
     /** Cheapest possible enabled check for the poll tick: no allocation beyond the lookup. */
@@ -198,7 +241,16 @@ public final class VoiceAssistantConfig {
                 voices,
                 request != null && isVoiceId(request.optString("voice", ""))
                         ? request.optString("voice", "") : MAIN_VOICE,
-                request == null ? "" : voiceName(request.optString("name", "")));
+                request == null ? "" : voiceName(request.optString("name", "")),
+                mediaCutoff,
+                section.optBoolean("wakeInputDenoised", false),
+                section.optBoolean("denoiseSpeech", true),
+                section.optBoolean("fullDuplex", true),
+                normalizePatience(section.optString("endOfSpeechPatience", PATIENCE_NORMAL)),
+                clampDouble(section.optDouble("echoRejectLikeness", MediaWakeGate.ECHO_REJECT_DEFAULT),
+                        ECHO_REJECT_MIN, ECHO_REJECT_MAX, MediaWakeGate.ECHO_REJECT_DEFAULT),
+                clampDouble(section.optDouble("bargeInMinErleDb", BARGE_IN_MIN_ERLE_DB_DEFAULT),
+                        BARGE_IN_MIN_ERLE_DB_MIN, BARGE_IN_MIN_ERLE_DB_MAX, BARGE_IN_MIN_ERLE_DB_DEFAULT));
     }
 
     /** One trained person: their lines, cutoffs and when they trained. */
@@ -212,15 +264,29 @@ public final class VoiceAssistantConfig {
         /** Stage-1 cutoff under media from their Train with music, or NaN. */
         public final double mediaCutoff;
         public final long trainedAt;
+        /** Wake model (manifest {@code model_id}) the cutoffs were measured on; "" before ids existed. */
+        public final String model;
+        /** Voice-match templates: the app-private file of this training time ({@code match.at}), 0 for none. */
+        public final long matchAt;
+        public final int matchTakes;
 
         public PersonalVoice(String id, String name, java.util.List<String> lines, double cutoff,
-                             double mediaCutoff, long trainedAt) {
+                             double mediaCutoff, long trainedAt, String model) {
+            this(id, name, lines, cutoff, mediaCutoff, trainedAt, model, 0L, 0);
+        }
+
+        public PersonalVoice(String id, String name, java.util.List<String> lines, double cutoff,
+                             double mediaCutoff, long trainedAt, String model, long matchAt, int matchTakes) {
             this.id = id;
             this.name = name;
             this.lines = lines;
             this.cutoff = cutoff;
             this.mediaCutoff = mediaCutoff;
             this.trainedAt = trainedAt;
+            this.model = isModelId(model) ? model : "";
+            boolean match = matchAt > 0 && matchTakes > 0;
+            this.matchAt = match ? matchAt : 0L;
+            this.matchTakes = match ? Math.min(matchTakes, VOICE_MATCH_MAX_TAKES) : 0;
         }
 
         /** The persisted form inside {@code personalWake.voices}. */
@@ -231,10 +297,31 @@ public final class VoiceAssistantConfig {
                 if (!Double.isNaN(cutoff)) out.put("cutoff", cutoff);
                 if (!Double.isNaN(mediaCutoff)) out.put("mediaCutoff", mediaCutoff);
                 if (trainedAt > 0) out.put("trainedAt", trainedAt);
+                if (!model.isEmpty()) out.put("model", model);
+                if (matchAt > 0) out.put("match", new JSONObject().put("at", matchAt).put("takes", matchTakes));
             } catch (Exception ignored) {
             }
             return out;
         }
+    }
+
+    /** {@code match} of a stored voice or an enrollment report: {@code {at, takes}}, or null. */
+    public static long[] matchRef(JSONObject holder) {
+        JSONObject m = holder == null ? null : holder.optJSONObject("match");
+        if (m == null) return null;
+        long at = m.optLong("at", 0L);
+        int takes = m.optInt("takes", 0);
+        if (at <= 0 || takes < 1 || takes > VOICE_MATCH_MAX_TAKES) return null;
+        return new long[] {at, takes};
+    }
+
+    /** The voices' template references ({@code id@at}), so a new training re-applies the config. */
+    static String matchKey(java.util.List<PersonalVoice> voices) {
+        StringBuilder out = new StringBuilder();
+        for (PersonalVoice v : voices) {
+            if (v.matchAt > 0) out.append(v.id).append('@').append(v.matchAt).append(';');
+        }
+        return out.toString();
     }
 
     /** {@code personalWake.voices}, or the single unnamed voice stored before voices had names. */
@@ -270,7 +357,9 @@ public final class VoiceAssistantConfig {
         long trainedAt = Math.max(0L, v.optLong("trainedAt", 0L));
         // A training that needed nothing learned still names the voice on the settings page.
         if (lines.isEmpty() && Double.isNaN(cutoff) && Double.isNaN(media) && trainedAt == 0L) return null;
-        return new PersonalVoice(id, name, lines, cutoff, media, trainedAt);
+        long[] match = matchRef(v);
+        return new PersonalVoice(id, name, lines, cutoff, media, trainedAt, v.optString("model", ""),
+                match == null ? 0L : match[0], match == null ? 0 : (int) match[1]);
     }
 
     public static PersonalVoice findVoice(java.util.List<PersonalVoice> voices, String id) {
@@ -298,6 +387,22 @@ public final class VoiceAssistantConfig {
             if (!Double.isNaN(c) && (Double.isNaN(out) || c < out)) out = c;
         }
         return out;
+    }
+
+    /**
+     * As {@link #lowestCutoff(java.util.List, boolean)} over the voices measured on {@code modelId}:
+     * cutoffs from another wake model's scores do not transfer (the voice keeps its lines).
+     */
+    public static double lowestCutoff(java.util.List<PersonalVoice> voices, boolean media, String modelId) {
+        java.util.List<PersonalVoice> same = new java.util.ArrayList<>();
+        for (PersonalVoice v : voices) {
+            if (v.model.equals(modelId == null ? "" : modelId)) same.add(v);
+        }
+        return lowestCutoff(same, media);
+    }
+
+    public static boolean isModelId(String id) {
+        return id != null && id.matches("[A-Za-z0-9._-]{0,40}");
     }
 
     private static long latestTraining(java.util.List<PersonalVoice> voices) {
@@ -390,6 +495,12 @@ public final class VoiceAssistantConfig {
             json.put("resumeMediaAfterListening", resumeMediaAfterListening);
             json.put("shareLocationWithAi", shareLocationWithAi);
             json.put("wakeCutoffUnderMedia", wakeCutoffUnderMedia);
+            json.put("wakeInputDenoised", wakeInputDenoised);
+            json.put("denoiseSpeech", denoiseSpeech);
+            json.put("fullDuplex", fullDuplex);
+            json.put("endOfSpeechPatience", endOfSpeechPatience);
+            json.put("echoRejectLikeness", echoRejectLikeness);
+            json.put("bargeInMinErleDb", bargeInMinErleDb);
             JSONObject personal = new JSONObject()
                     .put("trained", !personalVoices.isEmpty())
                     .put("lines", personalWakeLines.size())
@@ -398,7 +509,8 @@ public final class VoiceAssistantConfig {
             org.json.JSONArray voices = new org.json.JSONArray();
             for (PersonalVoice v : personalVoices) {
                 JSONObject item = new JSONObject().put("id", v.id).put("name", v.name)
-                        .put("lines", v.lines.size()).put("music", !Double.isNaN(v.mediaCutoff));
+                        .put("lines", v.lines.size()).put("music", !Double.isNaN(v.mediaCutoff))
+                        .put("match", v.matchAt > 0);
                 if (v.trainedAt > 0) item.put("trainedAt", v.trainedAt);
                 voices.put(item);
             }
@@ -495,6 +607,24 @@ public final class VoiceAssistantConfig {
                 }
                 out.put("wakeCutoffUnderMedia", normalizeWakeCutoffUnderMedia(cutoff));
             }
+            for (String key : new String[] {"wakeInputDenoised", "denoiseSpeech", "fullDuplex"}) {
+                if (patch.has(key)) out.put(key, requireBoolean(patch, key));
+            }
+            if (patch.has("endOfSpeechPatience")) {
+                String p = patch.optString("endOfSpeechPatience", "");
+                if (!p.equals(normalizePatience(p))) {
+                    throw new IllegalArgumentException("Unknown endOfSpeechPatience: " + p);
+                }
+                out.put("endOfSpeechPatience", p);
+            }
+            if (patch.has("echoRejectLikeness")) {
+                out.put("echoRejectLikeness", requireRange(patch, "echoRejectLikeness",
+                        ECHO_REJECT_MIN, ECHO_REJECT_MAX));
+            }
+            if (patch.has("bargeInMinErleDb")) {
+                out.put("bargeInMinErleDb", requireRange(patch, "bargeInMinErleDb",
+                        BARGE_IN_MIN_ERLE_DB_MIN, BARGE_IN_MIN_ERLE_DB_MAX));
+            }
         } catch (IllegalArgumentException e) {
             throw e;
         } catch (Exception e) {
@@ -527,7 +657,8 @@ public final class VoiceAssistantConfig {
                 && sensitivity.equals(other.sensitivity)
                 && commandLanguage.equals(other.commandLanguage)
                 && personalWakeLines.equals(other.personalWakeLines)
-                && sameDouble(personalWakeCutoff, other.personalWakeCutoff);
+                && sameDouble(personalWakeCutoff, other.personalWakeCutoff)
+                && matchKey(personalVoices).equals(matchKey(other.personalVoices));
     }
 
     private static boolean sameDouble(double a, double b) {
@@ -567,6 +698,20 @@ public final class VoiceAssistantConfig {
         return (Boolean) v;
     }
 
+    private static double requireRange(JSONObject patch, String key, double min, double max) throws Exception {
+        Object v = patch.get(key);
+        double d = v instanceof Number ? ((Number) v).doubleValue() : Double.NaN;
+        if (!(d >= min - 1e-9 && d <= max + 1e-9)) {
+            throw new IllegalArgumentException(key + " must be a number from " + min + " to " + max);
+        }
+        return Math.round(d * 100.0) / 100.0;
+    }
+
+    private static double clampDouble(double v, double min, double max, double fallback) {
+        if (Double.isNaN(v) || Double.isInfinite(v)) return fallback;
+        return Math.max(min, Math.min(max, v));
+    }
+
     private static boolean isMode(String mode) {
         return MODE_LOCAL.equals(mode) || MODE_HYBRID.equals(mode) || MODE_GENAI.equals(mode);
     }
@@ -577,6 +722,29 @@ public final class VoiceAssistantConfig {
 
     private static String normalizeMode(String mode) {
         return isMode(mode) ? mode : MODE_HYBRID;
+    }
+
+    /** Silence before the end of speech for a patience setting (in-car eval: 0.5 % early cuts at 1 s). */
+    public static int patienceMs(String patience) {
+        if (PATIENCE_QUICK.equals(patience)) return 800;
+        if (PATIENCE_RELAXED.equals(patience)) return 2000;
+        return 1000;
+    }
+
+    /** Longest silence when the transcript so far ends unfinished: base + min(1.5 x base, 1.5 s). */
+    public static int adaptiveCapMs(String patience) {
+        int base = patienceMs(patience);
+        return base + Math.min(base * 3 / 2, 1500);
+    }
+
+    /** Gemini's own VAD silence: just past the engine's longest wait, so it only covers a missing end. */
+    public static int serverSilenceMs(String patience) {
+        return adaptiveCapMs(patience) + 200;
+    }
+
+    private static String normalizePatience(String p) {
+        if (PATIENCE_QUICK.equals(p) || PATIENCE_RELAXED.equals(p)) return p;
+        return PATIENCE_NORMAL;
     }
 
     private static String normalizeSensitivity(String s) {

@@ -1,0 +1,9 @@
+Minimal subset of webrtc-audio-processing v2.1 (freedesktop/PulseAudio fork, BSD-3, see COPYING and
+webrtc/LICENSE, webrtc/PATENTS): AEC3, NS, high-pass filter and the common_audio / rtc_base /
+system_wrappers / pffft pieces they link against, plus the abseil-cpp 20240722.0 headers they include
+(Apache-2.0, absl/LICENSE). Unmodified files; everything else (AGC1/2, AECM, VAD, transient suppressor,
+AudioProcessing impl, examples, tests) is left out.
+  webrtc-audio-processing-v2.1.tar.gz sha256 2358883a8551711f3b6169f6799c003dc1a6efd37bdb24a135a015cc9e3d7713
+    (gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing tag v2.1, 846fe90a289f58b7c9303a635142aa2c7caa93e5)
+  abseil-cpp-20240722.0.tar.gz sha256 f50e5ac311a81382da7fa75b97310e4b9006474f9560ac46f54a9967f07d4ae3
+Built by app/src/main/cpp/CMakeLists.txt (voice_frontend); the source list lives there.

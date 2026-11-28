@@ -316,6 +316,11 @@ public class AppAudioCaptureController {
         return failed != -1 && failed == requestedAudioSource;
     }
 
+    /** The calling thread onto the fastest CPU cluster or back (the front-end library); the mask or -1. */
+    public static int pinCallingThreadToFastCores(boolean on) {
+        return VoiceFrontend.pinCallingThreadToFastCores(on);
+    }
+
     /** Echo-canceller probe of the newest capture: null until a VOICE_COMMUNICATION capture asked. */
     public static Boolean echoCancelerAvailable() {
         return aecAvailable;
@@ -390,6 +395,36 @@ public class AppAudioCaptureController {
     public static int[] carArrayChannelsDb() {
         CarArrayCapture array = arrayCapture;
         return array == null ? null : array.channelsDb();
+    }
+
+    /** Echo canceller health of the car's input; null unless the active source is the running car array. Lock-free. */
+    public static EchoHealth echoHealth() {
+        CarArrayCapture array = arrayCapture;
+        return array == null || !array.isRunning() ? null : CarArrayCapture.echoHealth();
+    }
+
+    /**
+     * Samples delivered to the wake sink by the car array since it started: the clock of
+     * {@link CarArrayCapture#echoLikeness}. -1 unless the active source is the running car array.
+     */
+    public static long sampleClock() {
+        CarArrayCapture array = arrayCapture;
+        return array == null || !array.isRunning() ? -1 : array.sampleClock();
+    }
+
+    /**
+     * {@link CarArrayCapture#echoLikeness} over wake-sink samples [startSample, endSample) of the
+     * {@link #sampleClock} clock; NaN unless the active source is the running car array.
+     */
+    public static float echoLikeness(long startSample, long endSample) {
+        CarArrayCapture array = arrayCapture;
+        return array == null || !array.isRunning() ? Float.NaN : CarArrayCapture.echoLikeness(startSample, endSample);
+    }
+
+    /** Overruns plus short reads of the car's input since it started, or -1 when it isn't running. */
+    public static int carArrayOverruns() {
+        CarArrayCapture array = arrayCapture;
+        return array == null || !array.isRunning() ? -1 : array.overruns();
     }
 
     /**

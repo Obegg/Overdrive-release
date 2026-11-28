@@ -15,6 +15,10 @@
         state_push_to_talk: 'Push-to-talk only (wake model not installed)',
         state_unavailable: 'Unavailable',
         status_load_failed: 'Could not load the voice assistant status.',
+        engine_health_fmt: 'Lag {lag} ms · {drops} drops/min',
+        echo_healthy_fmt: 'Working ({erle} dB)',
+        echo_healthy: 'Working',
+        echo_unhealthy: 'Not converged (music is paused for commands)',
         installed: 'Installed',
         not_installed: 'Not installed',
         never: 'Never',
@@ -65,6 +69,7 @@
         enroll_voice_main: 'Main voice',
         enroll_voice_trained: '{name}: trained {when}',
         enroll_voice_music: '{name}: trained {when}, tuned for music',
+        enroll_voice_rematch: 'train again to add voice match',
         enroll_voice_forget: 'Forget',
         enroll_voices_count: '{count} of {max} voices trained.',
         enroll_full: 'Four voices are trained. Forget one first.',
@@ -208,6 +213,9 @@
             });
             this.bindSelect('voiceFollowUp', function (value) {
                 return { followUpSeconds: parseInt(value, 10) || 0 };
+            });
+            this.bindSelect('voicePatience', function (value) {
+                return { endOfSpeechPatience: value };
             });
             this.bindSelect('voiceAudioChannel', function (value) {
                 return { audioChannel: value };
@@ -450,7 +458,7 @@
                 label.textContent = t(voice.music ? 'enroll_voice_music' : 'enroll_voice_trained', {
                     name: voice.name || t('enroll_voice_main'),
                     when: voice.trainedAt ? formatWakeTime(voice.trainedAt) : ''
-                });
+                }) + (voice.match === false ? ' · ' + t('enroll_voice_rematch') : '');
                 var forget = document.createElement('button');
                 forget.type = 'button';
                 forget.className = 'btn btn-secondary';
@@ -662,6 +670,7 @@
 
             this.setValue('voiceSensitivity', config ? config.sensitivity : 'normal', locked);
             this.setValue('voiceFollowUp', config ? String(config.followUpSeconds) : '6', locked);
+            this.setValue('voicePatience', config ? (config.endOfSpeechPatience || 'normal') : 'normal', locked);
             this.setValue('voiceAudioChannel', config ? config.audioChannel : 'media', locked);
             this.setValue('voiceCommandLanguage', config ? (config.commandLanguage || '') : '', locked);
             this.setValue('voiceMicSource', config ? (config.micSource || 'mic') : 'mic', locked);
@@ -727,6 +736,26 @@
                 cloud: counters.cloudTurns || 0,
                 failures: counters.failures || 0
             }) : '—');
+
+            // Real-time audio consumer and the car array's measured echo canceller (when reported).
+            var engine = runtime.engine;
+            var engineItem = $('voiceEngineItem');
+            if (engineItem) engineItem.hidden = !engine;
+            if (engine) {
+                this.setText('voiceEngineHealth', t('engine_health_fmt', {
+                    lag: engine.maxLagMs != null ? engine.maxLagMs : (engine.lagMs || 0),
+                    drops: engine.dropsPerMin || 0
+                }));
+            }
+            var echo = runtime.echo;
+            var echoItem = $('voiceEchoItem');
+            if (echoItem) echoItem.hidden = !echo;
+            if (echo) {
+                this.setText('voiceEchoHealth', echo.state === 'healthy'
+                    // Echo below the cabin noise floor: healthy, and its (low) ERLE says nothing.
+                    ? (echo.erleDb != null && !echo.belowNoise ? t('echo_healthy_fmt', { erle: echo.erleDb }) : t('echo_healthy'))
+                    : t('echo_unhealthy'));
+            }
 
             var note = $('voiceRuntimeNote');
             if (note) {

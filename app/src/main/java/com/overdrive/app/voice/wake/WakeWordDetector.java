@@ -17,8 +17,7 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 
 /**
- * Streaming microWakeWord detector: {@link MicroFrontend} features feed the wake model and, when
- * {@code vad.tflite} + {@code vad.json} sit next to it, a VAD model that must agree. Feed 16 kHz
+ * Streaming microWakeWord detector: {@link MicroFrontend} features feed the wake model. Feed 16 kHz
  * mono PCM from one thread; the setters and getters may be called from any thread.
  */
 public final class WakeWordDetector implements AutoCloseable {
@@ -26,27 +25,37 @@ public final class WakeWordDetector implements AutoCloseable {
     public static final String DEFAULT_ASSET_BASE = "voice/wake/overdrive";
 
     private static final String TAG = "VoiceWake";
-    private static final String VAD_NAME = "vad";
     private static final int REFRACTORY_MS = 1500;
     private static final int SECOND_CHANCE_MS = 3000;
+    /**
+     * The model cutoff the constants below (and every configured or enrolled cutoff) are expressed
+     * against: the first model's 0.45. They are scaled by manifest cutoff / this for the model in use.
+     */
+    public static final float REFERENCE_CUTOFF = 0.45f;
     private static final float LOW_DELTA = 0.02f;
     public static final float HIGH_DELTA = 0.07f;
-    // Below the manifest's 0.45 so High is more sensitive than Normal.
+    // Below the model's own so High is more sensitive than Normal.
     // An enrolled cutoff may go as low as the media floor; the model's own mapping never gets there.
     private static final float MIN_CUTOFF = 0.20f;
     private static final float MAX_CUTOFF = 0.99f;
-    /** Floor of the media cutoff (VoiceAssistantConfig accepts 0.20-0.45). */
+    /** Floor of the media cutoff (VoiceAssistantConfig accepts 0.20-0.45), reference units. */
     static final float MIN_MEDIA_CUTOFF = 0.20f;
     private static final int MAX_MODEL_BYTES = 4 << 20;
     private static final int MAX_MANIFEST_BYTES = 64 << 10;
+    /** Frontend frames kept for voice match: 5.12 s, an enrollment take with its lead. */
+    public static final int FEATURE_RING_FRAMES = 512;
 
     private final String wakeWord;
+    private final String modelId;
     private final float manifestCutoff;
+    /** manifestCutoff / REFERENCE_CUTOFF (1 for the first model): reference units to model units. */
+    private final float scale;
+    private final float lowDelta;
+    private final float highDelta;
+    private final float minCutoff;
+    private final float minMediaCutoff;
     private final MicroFrontend frontend;
     private final Feed wake;
-    private final Feed vad;
-    private final WakeDecider.Window vadWindow;
-    private final int vadCutoffU8;
     private final WakeDecider decider;
     private final Object cutoffLock = new Object();
 
@@ -60,17 +69,27 @@ public final class WakeWordDetector implements AutoCloseable {
     private volatile boolean candidateMode;
     private volatile float candidatePeak;
     private boolean closed;
+    private final short[] featureRing = new short[FEATURE_RING_FRAMES * MicroFrontend.NUM_CHANNELS];
+    private int featurePos;
+    private int featureFrames;
 
     WakeWordDetector(String wakeWord, float manifestCutoff, int windowSize, int stepMs,
-                     StreamingModel wakeModel, StreamingModel vadModel, float vadCutoff,
-                     int vadWindowSize) {
+                     StreamingModel wakeModel) {
+        this(wakeWord, "", manifestCutoff, windowSize, stepMs, wakeModel);
+    }
+
+    WakeWordDetector(String wakeWord, String modelId, float manifestCutoff, int windowSize, int stepMs,
+                     StreamingModel wakeModel) {
         this.wakeWord = wakeWord;
+        this.modelId = modelId == null ? "" : modelId;
         this.manifestCutoff = manifestCutoff;
+        scale = manifestCutoff / REFERENCE_CUTOFF;
+        lowDelta = LOW_DELTA * scale;
+        highDelta = HIGH_DELTA * scale;
+        minCutoff = MIN_CUTOFF * scale;
+        minMediaCutoff = MIN_MEDIA_CUTOFF * scale;
         frontend = new MicroFrontend(stepMs);
         wake = new Feed(wakeModel);
-        vad = vadModel == null ? null : new Feed(vadModel);
-        vadWindow = vadModel == null ? null : new WakeDecider.Window(vadWindowSize);
-        vadCutoffU8 = (int) (vadCutoff * 255.0);
         cutoff = manifestCutoff;
         decider = new WakeDecider(windowSize, Math.round(REFRACTORY_MS / (float) stepMs),
                 Math.round(SECOND_CHANCE_MS / (float) stepMs), manifestCutoff);
@@ -97,45 +116,46 @@ public final class WakeWordDetector implements AutoCloseable {
         }
     }
 
-    /** Loads {@code <base>.tflite} + {@code <base>.json}, plus the sibling VAD pair when present. */
+    /** Loads {@code <base>.tflite} + {@code <base>.json}. */
     public static WakeWordDetector load(Context ctx, String assetBase) throws IOException {
         AssetManager assets = ctx.getAssets();
         Manifest wakeManifest = Manifest.read(assets, assetBase);
-        String vadBase = assetBase.substring(0, assetBase.lastIndexOf('/') + 1) + VAD_NAME;
-        Manifest vadManifest = !vadBase.equals(assetBase) && isModelPresent(ctx, vadBase)
-                ? Manifest.read(assets, vadBase) : null;
-        if (vadManifest != null && vadManifest.stepMs != wakeManifest.stepMs) {
-            throw new IOException("VAD feature step " + vadManifest.stepMs + " ms differs from "
-                    + wakeManifest.stepMs + " ms");
-        }
         try {
             System.loadLibrary("tensorflowlite_jni");
         } catch (Throwable ignored) {
         }
         StreamingModel wakeModel = null;
-        StreamingModel vadModel = null;
         try {
             wakeModel = TfliteStreamingModel.open(readModel(assets, assetBase + ".tflite"));
-            if (vadManifest != null) {
-                vadModel = TfliteStreamingModel.open(readModel(assets, vadBase + ".tflite"));
-            }
-            WakeWordDetector detector = new WakeWordDetector(wakeManifest.wakeWord,
-                    wakeManifest.cutoff, wakeManifest.windowSize, wakeManifest.stepMs, wakeModel,
-                    vadModel, vadManifest == null ? 0f : vadManifest.cutoff,
-                    vadManifest == null ? 1 : vadManifest.windowSize);
+            WakeWordDetector detector = new WakeWordDetector(wakeManifest.wakeWord, wakeManifest.modelId,
+                    wakeManifest.cutoff, wakeManifest.windowSize, wakeManifest.stepMs, wakeModel);
             Log.i(TAG, "Wake model '" + wakeManifest.wakeWord + "' stride " + wakeModel.stride()
                     + " cutoff " + wakeManifest.cutoff + " window " + wakeManifest.windowSize
-                    + (vadModel != null ? " with VAD gate" : ""));
+                    + " id '" + wakeManifest.modelId + "'");
             return detector;
         } catch (Throwable t) {
             if (wakeModel != null) wakeModel.close();
-            if (vadModel != null) vadModel.close();
             throw t;
         }
     }
 
     public String wakeWord() {
         return wakeWord;
+    }
+
+    /** The manifest's {@code model_id}, "" for models shipped before it existed. */
+    public String modelId() {
+        return modelId;
+    }
+
+    /** A cutoff in reference units (see {@link #REFERENCE_CUTOFF}) on this model's score scale. */
+    public float toModel(float reference) {
+        return reference * scale;
+    }
+
+    /** A score of this model in reference units (enrollment stores cutoffs that way). */
+    public float toReference(float score) {
+        return score / scale;
     }
 
     /** {@link VoiceAssistantConfig#SENSITIVITY_LOW}, {@code _NORMAL} or {@code _HIGH}; shifts the manifest cutoff. */
@@ -146,10 +166,13 @@ public final class WakeWordDetector implements AutoCloseable {
         }
     }
 
-    /** Per-user (enrolled) cutoff in place of the model's, shifted by the sensitivity, clamped to [0.20, 0.99]; NaN clears it. */
+    /**
+     * Per-user (enrolled) cutoff in reference units in place of the model's, shifted by the
+     * sensitivity, clamped to [0.20, 0.99] x scale; NaN clears it.
+     */
     public void setCutoffOverride(float cutoff) {
         synchronized (cutoffLock) {
-            cutoffOverride = cutoff;
+            cutoffOverride = toModel(cutoff);
             this.cutoff = resolveCutoff();
         }
     }
@@ -158,10 +181,11 @@ public final class WakeWordDetector implements AutoCloseable {
      * A lower cutoff applied on top of the sensitivity/override cutoff while media plays through
      * the cabin speakers (the voice engine sets it only then); NaN restores the normal cutoff. It
      * can only lower the cutoff in force, never raise it, and never below {@link #MIN_MEDIA_CUTOFF}.
+     * Reference units, like every configured cutoff.
      */
     public void setMediaCutoff(float cutoff) {
         synchronized (cutoffLock) {
-            mediaCutoff = cutoff;
+            mediaCutoff = toModel(cutoff);
             this.cutoff = resolveCutoff();
         }
     }
@@ -183,15 +207,15 @@ public final class WakeWordDetector implements AutoCloseable {
     /** The model's own cutoff for the sensitivity, ignoring an enrolled or media cutoff. */
     private float ownCutoff() {
         String s = sensitivity;
-        if (VoiceAssistantConfig.SENSITIVITY_LOW.equals(s)) return Math.min(MAX_CUTOFF, manifestCutoff + LOW_DELTA);
-        if (VoiceAssistantConfig.SENSITIVITY_HIGH.equals(s)) return Math.max(MIN_CUTOFF, manifestCutoff - HIGH_DELTA);
+        if (VoiceAssistantConfig.SENSITIVITY_LOW.equals(s)) return Math.min(MAX_CUTOFF, manifestCutoff + lowDelta);
+        if (VoiceAssistantConfig.SENSITIVITY_HIGH.equals(s)) return Math.max(minCutoff, manifestCutoff - highDelta);
         return manifestCutoff;
     }
 
-    /** The normal cutoff, or the media cutoff when one is set and lower (pure; JVM-tested). */
-    static float withMediaCutoff(float normal, float media) {
+    /** The normal cutoff, or the media cutoff when one is set and lower, never under {@code floor} (pure; JVM-tested). */
+    static float withMediaCutoff(float normal, float media, float floor) {
         if (Float.isNaN(media)) return normal;
-        return Math.min(normal, Math.max(MIN_MEDIA_CUTOFF, media));
+        return Math.min(normal, Math.max(floor, media));
     }
 
     /**
@@ -273,10 +297,6 @@ public final class WakeWordDetector implements AutoCloseable {
             try {
                 frontend.reset();
                 wake.reset();
-                if (vad != null) {
-                    vad.reset();
-                    vadWindow.clear();
-                }
                 decider.reset();
             } catch (RuntimeException e) {
                 release();
@@ -284,6 +304,22 @@ public final class WakeWordDetector implements AutoCloseable {
             }
             lastProbability = 0f;
             peakProbability = 0f;
+            featureFrames = 0;
+        }
+    }
+
+    /**
+     * The last {@code maxFrames} frontend frames since the last reset, oldest first, as
+     * {@link MicroFrontend#NUM_CHANNELS} values each (unsigned 16-bit); returns how many were copied.
+     */
+    public int copyFeatures(short[] dst, int maxFrames) {
+        synchronized (this) {
+            int n = Math.min(Math.min(maxFrames, featureFrames), dst.length / MicroFrontend.NUM_CHANNELS);
+            for (int i = 0; i < n; i++) {
+                int src = Math.floorMod(featurePos - n + i, FEATURE_RING_FRAMES) * MicroFrontend.NUM_CHANNELS;
+                System.arraycopy(featureRing, src, dst, i * MicroFrontend.NUM_CHANNELS, MicroFrontend.NUM_CHANNELS);
+            }
+            return n;
         }
     }
 
@@ -295,16 +331,18 @@ public final class WakeWordDetector implements AutoCloseable {
     }
 
     private boolean onSlice(int[] features) {
+        int base = featurePos * MicroFrontend.NUM_CHANNELS;
+        for (int i = 0; i < MicroFrontend.NUM_CHANNELS; i++) featureRing[base + i] = (short) features[i];
+        featurePos = (featurePos + 1) % FEATURE_RING_FRAMES;
+        if (featureFrames < FEATURE_RING_FRAMES) featureFrames++;
         boolean fresh = wake.push(features);
-        if (vad != null && vad.push(features)) vadWindow.add(vad.last);
-        boolean vadOpen = vad == null || vadWindow.above(vadCutoffU8);
-        if (!decider.onSlice(fresh, wake.last, vadOpen)) return false;
+        if (!decider.onSlice(fresh, wake.last, true)) return false;
         if (!decider.candidateMode()) wake.reset();
         return true;
     }
 
     private float resolveCutoff() {
-        return withMediaCutoff(normalCutoff(), mediaCutoff);
+        return withMediaCutoff(normalCutoff(), mediaCutoff, minMediaCutoff);
     }
 
     private float normalCutoff() {
@@ -312,15 +350,15 @@ public final class WakeWordDetector implements AutoCloseable {
         String s = sensitivity;
         if (!Float.isNaN(override)) {
             // An enrolled cutoff still moves with the sensitivity setting.
-            if (VoiceAssistantConfig.SENSITIVITY_LOW.equals(s)) override += LOW_DELTA;
-            if (VoiceAssistantConfig.SENSITIVITY_HIGH.equals(s)) override -= HIGH_DELTA;
-            return Math.max(MIN_CUTOFF, Math.min(MAX_CUTOFF, override));
+            if (VoiceAssistantConfig.SENSITIVITY_LOW.equals(s)) override += lowDelta;
+            if (VoiceAssistantConfig.SENSITIVITY_HIGH.equals(s)) override -= highDelta;
+            return Math.max(minCutoff, Math.min(MAX_CUTOFF, override));
         }
         if (VoiceAssistantConfig.SENSITIVITY_LOW.equals(s)) {
-            return Math.min(MAX_CUTOFF, manifestCutoff + LOW_DELTA);
+            return Math.min(MAX_CUTOFF, manifestCutoff + lowDelta);
         }
         if (VoiceAssistantConfig.SENSITIVITY_HIGH.equals(s)) {
-            return Math.max(MIN_CUTOFF, manifestCutoff - HIGH_DELTA);
+            return Math.max(minCutoff, manifestCutoff - highDelta);
         }
         return manifestCutoff;
     }
@@ -328,7 +366,6 @@ public final class WakeWordDetector implements AutoCloseable {
     private void release() {
         closed = true;
         wake.model.close();
-        if (vad != null) vad.model.close();
     }
 
     private static ByteBuffer readModel(AssetManager assets, String path) throws IOException {
@@ -397,12 +434,14 @@ public final class WakeWordDetector implements AutoCloseable {
     /** microWakeWord manifest: v2 keys, with the v1 window key and 20 ms step as fallbacks. */
     private static final class Manifest {
         final String wakeWord;
+        final String modelId;
         final float cutoff;
         final int windowSize;
         final int stepMs;
 
-        private Manifest(String wakeWord, float cutoff, int windowSize, int stepMs) {
+        private Manifest(String wakeWord, String modelId, float cutoff, int windowSize, int stepMs) {
             this.wakeWord = wakeWord;
+            this.modelId = modelId;
             this.cutoff = cutoff;
             this.windowSize = windowSize;
             this.stepMs = stepMs;
@@ -426,7 +465,9 @@ public final class WakeWordDetector implements AutoCloseable {
                 if (step < 1 || step > MicroFrontend.WINDOW_MS) throw new IOException(path + ": feature_step_size " + step);
                 String name = root.optString("wake_word", "").trim();
                 if (name.isEmpty()) name = base.substring(base.lastIndexOf('/') + 1);
-                return new Manifest(name, (float) cutoff, window, step);
+                String id = root.optString("model_id", "").trim();
+                if (!id.matches("[A-Za-z0-9._-]{0,40}")) id = "";
+                return new Manifest(name, id, (float) cutoff, window, step);
             } catch (JSONException e) {
                 throw new IOException(path + ": " + e.getMessage(), e);
             }

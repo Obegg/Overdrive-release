@@ -45,11 +45,11 @@ public class UplinkPumpTest {
     }
 
     @Test
-    public void frameSamplesDefaultsToLegacyAndResolvesPerRate() {
-        assertEquals(2048, UplinkPump.LEGACY_FRAME_SAMPLES);
-        assertEquals(2048, UplinkPump.frameSamples(16000, 0));
-        assertEquals(2048, UplinkPump.frameSamples(24000, 0));
-        assertEquals(2048, UplinkPump.frameSamples(24000, -5));
+    public void frameSamplesDefaultsToFortyMillisecondsAndResolvesPerRate() {
+        assertEquals(40, UplinkPump.DEFAULT_FRAME_MS);
+        assertEquals(640, UplinkPump.frameSamples(16000, 0));
+        assertEquals(960, UplinkPump.frameSamples(24000, 0));
+        assertEquals(960, UplinkPump.frameSamples(24000, -5));
         assertEquals(640, UplinkPump.frameSamples(16000, 40));
         assertEquals(960, UplinkPump.frameSamples(24000, 40));
         assertEquals(320, UplinkPump.frameSamples(16000, 20));
@@ -57,8 +57,8 @@ public class UplinkPumpTest {
     }
 
     @Test
-    public void legacyFramesAre2048SamplesAt24kHz() throws Exception {
-        assertPrerollFrames(0, 2048 * 2);
+    public void defaultFramesAre960SamplesAt24kHz() throws Exception {
+        assertPrerollFrames(0, 960 * 2);
     }
 
     @Test
@@ -130,17 +130,17 @@ public class UplinkPumpTest {
     }
 
     @Test
-    public void legacyConstructorKeepsTheLegacyFrame() throws Exception {
+    public void defaultConstructorUsesTheDefaultFrame() throws Exception {
         RecordingSink sink = new RecordingSink();
         UplinkPump pump = new UplinkPump(sink);
-        short[] pcm = new short[2048 * 2];
+        short[] pcm = new short[640 * 2];
         pump.write(pcm, 0, pcm.length);
         pump.setLive(16000);
         assertTrue(sink.preroll.await(5, TimeUnit.SECONDS));
         List<byte[]> frames = sink.snapshot();
         assertEquals(2, frames.size());
-        assertEquals(2048 * 2, frames.get(0).length);
-        assertEquals(2048 * 2, frames.get(1).length);
+        assertEquals(640 * 2, frames.get(0).length);
+        assertEquals(640 * 2, frames.get(1).length);
         pump.close();
         assertPumpThreadEnds();
     }

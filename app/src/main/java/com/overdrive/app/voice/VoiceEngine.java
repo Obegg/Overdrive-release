@@ -7,6 +7,7 @@ import android.util.Log;
 
 import com.overdrive.app.R;
 import com.overdrive.app.audio.AppAudioCaptureController;
+import com.overdrive.app.audio.EchoHealth;
 import com.overdrive.app.util.DaemonHttpClient;
 import com.overdrive.app.voice.audio.PcmSink;
 import com.overdrive.app.voice.audio.Resampler;
@@ -16,9 +17,11 @@ import com.overdrive.app.voice.local.CommandTranscriber;
 import com.overdrive.app.voice.local.CommandVad;
 import com.overdrive.app.voice.local.LocalCommandSpotter;
 import com.overdrive.app.voice.local.PhoneDecoder;
+import com.overdrive.app.voice.local.SpeechDenoiser;
 import com.overdrive.app.voice.local.WakeEnrollment;
 import com.overdrive.app.voice.ui.VoiceOrbView;
 import com.overdrive.app.voice.ui.VoiceOverlay;
+import com.overdrive.app.voice.wake.VoiceMatch;
 import com.overdrive.app.voice.wake.WakeWordDetector;
 
 import org.json.JSONArray;
@@ -40,8 +43,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
 
 /**
- * One ACC session of the voice assistant: wake detection, the command turn and its
- * feedback. Turn state is owned by the engine thread; other threads only post events.
+ * One ACC session of the voice assistant: wake detection, the command turn and its feedback.
+ * Turn state is owned by the engine thread, a real-time consumer that only runs stage 1, Silero
+ * endpointing, the uplink and window bookkeeping; stage-2 checks and speech-to-text run
+ * on {@link StageWorker} over copied buffers and post back by turn. Other threads only post events.
  */
 final class VoiceEngine implements PcmSink {
 
@@ -49,6 +54,22 @@ final class VoiceEngine implements PcmSink {
         void onStatus(String state, String message);
 
         void onActivity();
+
+        /** Test hook for the debug harness: non-null runs the engine dry. The app's own host keeps null. */
+        default DryRun dryRun() {
+            return null;
+        }
+    }
+
+    /**
+     * A dry engine actuates nothing: no intent reaches the daemon, no media is held, ducked or paused,
+     * no cue or prompt sounds, the mic is never attached and no enrollment is saved; each is recorded.
+     */
+    interface DryRun {
+        /** Cloud sessions may open; their tool calls then run in the daemon for real. Otherwise turns stay local. */
+        boolean allowCloud();
+
+        void wouldDo(String action);
     }
 
     private static final String TAG = "VoiceEngine";
@@ -99,10 +120,13 @@ final class VoiceEngine implements PcmSink {
     private final VoiceOverlay overlay;
     private final Earcons earcons = new Earcons();
     private final VoicePrompts prompts;
+    /** Debug harness only (see {@link DryRun}); null in the app. */
+    private final DryRun dry;
     private final java.util.ArrayDeque<String> promptQueue = new java.util.ArrayDeque<>();
     // Room for a slow stage-2 check on a loaded head unit without dropping post-wake audio.
     private final PcmRing ring = new PcmRing(RATE * 8);
     private final ConcurrentLinkedQueue<Runnable> events = new ConcurrentLinkedQueue<>();
+    private final StageWorker worker = new StageWorker();
     private final ExecutorService io;
     private final Thread thread;
     private final AudioManager audioManager;
@@ -144,6 +168,10 @@ final class VoiceEngine implements PcmSink {
     private float stage1Peak;
     /** Stage-1 probability of the trigger awaiting (or given) its check; engine thread only. */
     private float triggerPeak;
+    /** Wall clock of the stage-1 trigger now waiting for its check (time to wake). */
+    private long triggerAtMs;
+    /** The wake check the worker is running, if any (a much stronger trigger cancels it). */
+    private volatile WakeCheck runningCheck;
     private float stage1Cutoff;
     private boolean stage1Media;
 
@@ -154,6 +182,8 @@ final class VoiceEngine implements PcmSink {
 
     private WakeWordDetector wake;
     private LocalCommandSpotter spotter;
+    /** Free phone decoding for wake checks (wake word only; the worker is its only user). */
+    private PhoneDecoder wakePhones;
     private boolean spotterTried;
     // Command-window endpointing only; null means RMS endpointing (model absent or failed).
     private CommandVad vad;
@@ -229,8 +259,15 @@ final class VoiceEngine implements PcmSink {
     // verdict depends on where its audio starts (offline: +3 points recall, no added false wakes).
     private static final int VERIFY_SHORT_SAMPLES = RATE * 18 / 10;
     // Stage 2 waits for the rest of the word: a permissive stage 1 can fire before "…drive" ends.
-    private static final int VERIFY_DELAY_SAMPLES = RATE * 4 / 10;
+    // The 2026-11 model fires ~100 ms earlier; +250 ms was best of 0/80/150/250 on the eval harness.
+    private static final int VERIFY_DELAY_SAMPLES = RATE * 65 / 100;
     private static final int CANDIDATE_VERIFY_DELAY_SAMPLES = RATE / 10;
+    // A stage-1 trigger peaking this high (model units; a candidate's peak) gets the looser phone match.
+    static final float STRONG_TRIGGER_PEAK = 0.50f;
+    // A new trigger this much stronger than the one being checked cancels that check.
+    private static final float PREEMPT_PEAK_MARGIN = 0.10f;
+    // The second look runs only while the check can still end within about a second.
+    private static final int SECOND_LOOK_DEADLINE_MS = 1000;
     // A weak candidate (below the model's own cutoff) quieter than this is cabin residue, not a voice.
     private static final float WEAK_CANDIDATE_MIN_LEVEL = 58f;
     // Command audio starts this far before the verifier's wake-word end (its timing is ≤ 70 ms late).
@@ -246,12 +283,14 @@ final class VoiceEngine implements PcmSink {
     private static final float MIN_GAIN = 0.316f;
     private static final float MAX_GAIN = 31.6f;
     private static final int LEVEL_FRAME = 512;
-    private final short[] history = new short[RATE * 3];
-    private final short[] verifyBuf = new short[VERIFY_SAMPLES];
-    private final short[] verifyShortBuf = new short[VERIFY_SHORT_SAMPLES];
-    private final float[] frameLevels = new float[VERIFY_SAMPLES / LEVEL_FRAME + 1];
+    // 8 s: the 2.2 s check window plus everything heard while the worker verified it (replayed on a wake).
+    private final short[] history = new short[RATE * 8];
     private int historyPos;
     private boolean historyFull;
+    /** Samples ever written to the history: the clock wake checks and their replay are placed on. */
+    private long historyWritten;
+    // The trigger window the echo-likeness check reads (the word, not the whole check window).
+    private static final int ECHO_WINDOW_SAMPLES = RATE * 3 / 2;
     private long streamPos;
     private long verifyDueAt = -1;
     // Verification CPU budget: a permissive stage 1 plus a talkative cabin must stay cheap.
@@ -303,6 +342,12 @@ final class VoiceEngine implements PcmSink {
     private long loudSamples;
     /** per-turn: reason of a hybrid pre-warm that died before the cloud turn started; consumed by startCloud (G5). */
     private String preWarmFailed;
+    // Per turn: the provider went silent after the end of speech; what the hybrid window matched
+    // (run locally if the cloud cannot answer); the cloud failure that made it run; the transcript.
+    private boolean cloudSilent;
+    private List<LocalCommandSpotter.Match> cloudFallback;
+    private String turnCloudFail;
+    private String understoodText;
 
     private final short[] utterance = new short[RATE * 10];
     private int utteranceLen;
@@ -347,7 +392,7 @@ final class VoiceEngine implements PcmSink {
     private boolean negationHeard;
     /** Held only because music masked what came before them: they run unless the transcript says otherwise. */
     private final List<LocalCommandSpotter.Match> musicHeld = new ArrayList<>();
-    /** The last transcript understandLocally() heard, or null. */
+    /** The last transcript applyUnderstood() heard, or null. */
     private String lastTranscript;
     // Spotted phrases held back for utterance validation at window close instead of running now.
     private final List<LocalCommandSpotter.Match> held = new ArrayList<>();
@@ -373,6 +418,11 @@ final class VoiceEngine implements PcmSink {
     private final short[] enrollBuf = new short[ENROLL_LEAD_SAMPLES + ENROLL_MAX_SPEECH_SAMPLES + ENROLL_TAIL_SAMPLES];
     private final List<short[]> enrollTakes = new ArrayList<>();
     private final List<Float> enrollPeaks = new ArrayList<>();
+    /** Each take's stage-1 frames for voice match (no audio). */
+    private final List<VoiceMatch.Take> enrollMatchTakes = new ArrayList<>();
+    /** The enrolled voices' templates (immutable; the worker reads it through WakeCheck) and their config key. */
+    private VoiceMatch voiceMatch;
+    private String voiceMatchKey = "";
     private String enrollId;
     private String enrollSeenId = "";
     private int enrollLen;
@@ -389,6 +439,10 @@ final class VoiceEngine implements PcmSink {
     private boolean enrollMusic;
     /** The retrained voice's current lines, offered back to the learner. */
     private List<String> enrollPrevious = java.util.Collections.emptyList();
+    /** The trained voice's current templates (merged with this training's), 0 for none. */
+    private long enrollMatchAt;
+    private String enrollVoice = VoiceAssistantConfig.MAIN_VOICE;
+    private double enrollPriorCutoff = Double.NaN;
     private DecoderLoad enrollDecoderLoad;
 
     /** The phone decoder loads while the takes are recorded; whoever finishes last closes it. */
@@ -423,6 +477,84 @@ final class VoiceEngine implements PcmSink {
     private long cloudStartedAt;
     private long lastCloudActivityAt;
     private final CloudDeadline deadline = new CloudDeadline();
+    /** Provider the daemon named for the session ("gemini" | "openai"), "" until then. */
+    private String sessionProvider = "";
+
+    // Hybrid end of speech (Gemini): the patience's Silero silence, longer after an unfinished transcript.
+    /** A pause this long ends a speech segment for the continuous-speech ceiling. */
+    private static final long SEGMENT_GAP_SAMPLES = 300L * RATE / 1000;
+    /** Lead sent ahead of speech that resumes after an end of speech (the provider's prefix padding). */
+    private static final int REOPEN_LEAD_SAMPLES = RATE / 2;
+    /** Uplinked turn audio (denoised when the model is present), for the reopen lead. */
+    private final short[] cloudPcm = new short[RATE * 2];
+    private int cloudPcmPos;
+    private boolean cloudPcmFull;
+    /** The end of speech went to the provider for the current user turn. */
+    private boolean endpointSent;
+    /** After it, the uplink waits for the next speech (Silero) instead of streaming music or noise. */
+    private boolean uplinkGated;
+    private long gatedAtSample;
+    /** Wall clock the current user segment's speech began, for the continuous-speech ceiling. */
+    private long segmentStartedAt;
+    private boolean fullDuplexTurn;
+
+    // Models the worker or the consumer use; loaded off the consumer, absent ones change nothing.
+    /** Consumer-side streaming denoiser (cloud uplink, optional wake input); worker-side one for ASR. */
+    private LiveDenoise liveDenoiser;
+    private SpeechDenoiser asrDenoiser;
+    private short[] denoised = new short[0];
+    private boolean liveDenoiseForWake;
+
+    // Measured echo health of the car array, refreshed twice a second by the consumer.
+    private static final long ECHO_POLL_MS = 500;
+    /** A health report older than this is not a measurement. */
+    private static final long ECHO_STALE_MS = 3000;
+    private int echoState = MediaTurnPolicy.ECHO_NONE;
+    private EchoHealth echoLast;
+    private long echoPolledAt;
+    /** Capture sample clock minus ring samples written (producer), to map ring positions to the FE clock. */
+    private volatile long clockOffset;
+    private volatile boolean clockValid;
+
+    // Async speech-to-text for the command window (worker); the window stays closed meanwhile.
+    private static final int ASR_UNDERSTAND = 1;
+    private static final int ASR_VALIDATE = 2;
+    private static final int ASR_NEGATION = 3;
+    private static final long ASR_TIMEOUT_MS = 6000;
+    private int asrPending;
+    private long asrDeadline;
+    private List<LocalCommandSpotter.Match> heldExecuted;
+    private List<LocalCommandSpotter.Match> heldLate;
+
+    // Consumer health: ring lag (max since the last report) and drops, for the status.
+    private volatile long lagMaxSamples;
+    private long lagReportedDrops;
+    private long lagReportedEvents;
+    private long lagReportedAt;
+
+    // Per-turn diagnostics added for the field record.
+    private int turnEcho;
+    private float turnErleDb = Float.NaN;
+    private String turnHoldWhy;
+    private int turnVerifyQueueMs = -1;
+    /** Stage-1 trigger to wake accept, wall clock (ms); -1 for a button turn. */
+    private int turnWakeMs = -1;
+    private long turnMaxLagSamples;
+    private String eosBy;
+    private int eosMs = -1;
+    /** Class of the transcript's ending at the end of speech (EndOfSpeechHint), never its text. */
+    private String eosCls;
+    /** The provider's latest transcript of the user's turn, its language, and the pause it was judged for. */
+    private String inputTranscript;
+    private int eosLang = EndOfSpeechHint.LANG_NONE;
+    private long hintForSample = -1;
+    private String hintTranscript;
+    private String hintCls;
+    private int turnInterrupts;
+    private int turnInputChars;
+    private int turnToolCalls;
+    private boolean turnAnswered;
+    private int asrQueueMs = -1;
 
     // Trip Briefing turn (askBriefing): engine thread only.
     private static final int BRIEF = 4;
@@ -503,6 +635,14 @@ final class VoiceEngine implements PcmSink {
     private boolean briefAiConfirms;
     private boolean briefAnswerSpoke;
     private long briefAnsweredAt;
+    /** One id per reply (resetBriefReply); a worker transcript is kept only for the reply it heard. */
+    private int briefReplyId;
+    private int briefTextReply = -1;
+    private int briefTextLen;
+    private String briefText;
+    /** The answer window closed and waits for its transcript from the worker. */
+    private boolean briefAsrPending;
+    private long briefAsrDeadline;
 
     /** Where a briefing answer goes; called once on the engine thread (not after cancelBriefing). */
     interface BriefSink {
@@ -511,10 +651,15 @@ final class VoiceEngine implements PcmSink {
 
     VoiceEngine(Context context, VoiceAssistantConfig config, Host host) {
         this.app = context.getApplicationContext();
-        this.config = config;
         this.host = host;
+        this.dry = host.dryRun();
+        this.config = dryConfig(config);
         this.overlay = new VoiceOverlay(app);
         this.prompts = new VoicePrompts(app);
+        if (dry != null) {
+            prompts.silence();
+            earcons.silence();
+        }
         this.audioManager = (AudioManager) app.getSystemService(Context.AUDIO_SERVICE);
         this.io = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "VoiceIO");
@@ -528,10 +673,22 @@ final class VoiceEngine implements PcmSink {
     }
 
     void start() {
+        worker.start();
         thread.start();
     }
 
-    void updateConfig(VoiceAssistantConfig cfg) {
+    /** A dry engine without cloud runs every turn locally. */
+    private VoiceAssistantConfig dryConfig(VoiceAssistantConfig cfg) {
+        if (dry == null || dry.allowCloud() || VoiceAssistantConfig.MODE_LOCAL.equals(cfg.mode)) return cfg;
+        try {
+            return VoiceAssistantConfig.from(cfg.toJson().put("mode", VoiceAssistantConfig.MODE_LOCAL));
+        } catch (org.json.JSONException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    void updateConfig(VoiceAssistantConfig next) {
+        VoiceAssistantConfig cfg = dryConfig(next);
         VoiceAssistantConfig old = config;
         config = cfg;
         if (!cfg.sameRuntimeShape(old)) post(() -> applyConfig(cfg));
@@ -592,6 +749,9 @@ final class VoiceEngine implements PcmSink {
             counters.put("rewakes", rewakes.get());
             out.put("counters", counters);
             if (lastWakeAtMs > 0) out.put("lastWakeAt", lastWakeAtMs);
+            out.put("engine", engineStats());
+            JSONObject echo = echoStats();
+            if (echo != null) out.put("echo", echo);
             synchronized (diagLock) {
                 if (lastCheck != null) out.put("lastVerify", lastCheck);
                 if (lastTurnInfo != null) out.put("lastTurn", lastTurnInfo);
@@ -639,6 +799,58 @@ final class VoiceEngine implements PcmSink {
         return out;
     }
 
+    /** Engine and echo-gate status only (the live report every 2 s); drains no check or turn logs. */
+    JSONObject liveStats() throws org.json.JSONException {
+        JSONObject out = new JSONObject().put("engine", engineStats());
+        JSONObject echo = echoStats();
+        if (echo != null) out.put("echo", echo);
+        return out;
+    }
+
+    /** Consumer lag now and at most since the last report, ring drops per minute, worker load. */
+    private synchronized JSONObject engineStats() throws org.json.JSONException {
+        long now = SystemClock.elapsedRealtime();
+        long drops = ring.droppedSamples();
+        long events = ring.dropEvents();
+        long span = lagReportedAt == 0 ? 0 : Math.max(1000L, now - lagReportedAt);
+        long[] w = worker.takeStats();
+        JSONObject e = new JSONObject()
+                .put("lagMs", ring.lag() * 1000 / RATE)
+                .put("maxLagMs", lagMaxSamples * 1000 / RATE);
+        if (span > 0) {
+            e.put("dropsPerMin", (events - lagReportedEvents) * 60_000 / span)
+                    .put("droppedMsPerMin", (drops - lagReportedDrops) * 1000 / RATE * 60_000 / span)
+                    .put("workerPct", Math.min(100L, w[1] * 100 / span));
+        }
+        if (w[2] > 0) e.put("workerQueueMs", w[2]);
+        if (w[0] > 0) e.put("workerDropped", w[0]);
+        lagMaxSamples = 0;
+        lagReportedDrops = drops;
+        lagReportedEvents = events;
+        lagReportedAt = now;
+        return e;
+    }
+
+    /** The car array's measured echo health, null when no array runs. */
+    private JSONObject echoStats() throws org.json.JSONException {
+        int state = echoState;
+        if (state == MediaTurnPolicy.ECHO_NONE) return null;
+        EchoHealth h = echoLast;
+        JSONObject e = new JSONObject().put("state", echoName(state));
+        if (h != null) {
+            if (!Float.isNaN(h.erleDb)) e.put("erleDb", Math.round(h.erleDb));
+            e.put("delayMs", h.delayMs).put("refActive", h.refActive);
+            if (h.delayAgeMs >= 0) e.put("delayAgeMs", h.delayAgeMs);
+            if (h.echoBelowNoise) e.put("belowNoise", true);
+        }
+        return e;
+    }
+
+    private static String echoName(int state) {
+        if (state == MediaTurnPolicy.ECHO_HEALTHY) return "healthy";
+        return state == MediaTurnPolicy.ECHO_UNHEALTHY ? "unhealthy" : "none";
+    }
+
     void close() {
         shutdown("close");
     }
@@ -666,6 +878,8 @@ final class VoiceEngine implements PcmSink {
                 Thread.currentThread().interrupt();
             }
         }
+        // The worker may be mid-check on a model: stop it (bounded) before anything closes them.
+        worker.close(800);
         // Model/session/UI release belongs to the engine thread, which owns the native handles.
         // From another thread, release only once that thread has exited; if it did not exit in
         // time it releases on its own way out.
@@ -681,9 +895,10 @@ final class VoiceEngine implements PcmSink {
         if (capShorts.length < n) capShorts = new short[n];
         Resampler.bytesToShorts(pcm, length, capShorts);
         if (sampleRate == RATE) {
-            ring.write(capShorts, 0, n);
+            write16k(capShorts, n);
             return;
         }
+        clockValid = false;
         if (resampler == null || resamplerSrc != sampleRate) {
             resampler = new Resampler(sampleRate, RATE);
             resamplerSrc = sampleRate;
@@ -694,8 +909,29 @@ final class VoiceEngine implements PcmSink {
         ring.write(capOut, 0, m);
     }
 
+    /** The car array's samples, without the byte round trip. */
+    @Override
+    public void onPcm16(short[] pcm, int samples, int sampleRate) {
+        if (!running) return;
+        if (sampleRate == RATE) {
+            write16k(pcm, samples);
+            return;
+        }
+        PcmSink.super.onPcm16(pcm, samples, sampleRate);
+    }
+
+    private void write16k(short[] pcm, int n) {
+        ring.write(pcm, 0, n);
+        // The car array delivers 16 kHz: ring positions map to its sample clock (echo likeness).
+        long clock = AppAudioCaptureController.sampleClock();
+        clockValid = clock > 0;
+        if (clock > 0) clockOffset = clock - ring.writtenSamples();
+    }
+
     private boolean captureOn() {
         synchronized (captureLock) {
+            // A dry engine hears only what its harness feeds it.
+            if (dry != null) return running;
             return running && AppAudioCaptureController.setWakeSink(this);
         }
     }
@@ -713,6 +949,10 @@ final class VoiceEngine implements PcmSink {
 
     private void run() {
         try {
+            try {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
+            } catch (Throwable ignored) {
+            }
             loadModels();
             if (wake != null && spotter == null) {
                 // The first stage alone wakes on ordinary speech; never run it unverified.
@@ -734,7 +974,12 @@ final class VoiceEngine implements PcmSink {
                 if (!running) break;
                 int n = ring.read(chunk, 0, chunk.length);
                 long now = SystemClock.elapsedRealtime();
-                if (n > 0) onAudio(chunk, n, now);
+                if (n > 0) {
+                    long lag = ring.lag();
+                    if (lag > lagMaxSamples) lagMaxSamples = lag;
+                    if (lag > turnMaxLagSamples) turnMaxLagSamples = lag;
+                    onAudio(chunk, n, now);
+                }
                 tick(now);
                 if (n == 0) ring.awaitData(20_000_000L);
             }
@@ -752,6 +997,7 @@ final class VoiceEngine implements PcmSink {
             try {
                 wake = WakeWordDetector.load(app, WakeWordDetector.DEFAULT_ASSET_BASE);
                 wake.setSensitivity(c.sensitivity);
+                nearMiss.setFloor(wake.toModel(WakeNearMiss.FLOOR));
                 wakeLoaded = true;
             } catch (Throwable t) {
                 Log.w(TAG, "Wake model failed to load: " + t.getMessage());
@@ -762,6 +1008,48 @@ final class VoiceEngine implements PcmSink {
         if (spotter != null) startTranscriberLoad();
         applyPersonalWake(c);
         loadVad();
+        startSpeechModelsLoad();
+    }
+
+    private final java.util.concurrent.atomic.AtomicReference<AutoCloseable[]> loadedSpeech =
+            new java.util.concurrent.atomic.AtomicReference<>();
+
+    private static void closeAll(AutoCloseable[] models) {
+        if (models == null) return;
+        for (AutoCloseable m : models) {
+            if (m == null) continue;
+            try { m.close(); } catch (Throwable ignored) {}
+        }
+    }
+
+    /** The two denoisers load on the io executor; absent ones keep today's paths. */
+    private void startSpeechModelsLoad() {
+        try {
+            io.execute(() -> {
+                SpeechDenoiser live = null;
+                SpeechDenoiser asr = null;
+                try {
+                    live = SpeechDenoiser.load(app);
+                    asr = live == null ? null : SpeechDenoiser.load(app);
+                } catch (Throwable t) {
+                    Log.w(TAG, "Speech models failed to load: " + t.getMessage());
+                }
+                // Handed over through a reference so releaseAll() closes them even if never adopted.
+                loadedSpeech.set(new AutoCloseable[] {live, asr});
+                if (!running) {
+                    closeAll(loadedSpeech.getAndSet(null));
+                    return;
+                }
+                post(() -> {
+                    AutoCloseable[] m = loadedSpeech.getAndSet(null);
+                    if (m == null) return;
+                    liveDenoiser = m[0] == null ? null : new LiveDenoise((SpeechDenoiser) m[0]);
+                    asrDenoiser = (SpeechDenoiser) m[1];
+                    Log.i(TAG, "Denoiser " + (liveDenoiser != null ? "on" : "absent"));
+                });
+            });
+        } catch (java.util.concurrent.RejectedExecutionException ignored) {
+        }
     }
 
     /** Command-window endpointing; the wake path never sees it. Absent model: RMS as before. */
@@ -818,6 +1106,13 @@ final class VoiceEngine implements PcmSink {
             Log.w(TAG, "Local command engine failed to load: " + t.getMessage());
             spotter = null;
         }
+        if (spotter != null && wake != null && wakePhones == null) {
+            try {
+                wakePhones = PhoneDecoder.load(app);
+            } catch (Throwable t) {
+                Log.w(TAG, "Wake phone decoder failed to load: " + t.getMessage());
+            }
+        }
     }
 
     private void applyConfig(VoiceAssistantConfig cfg) {
@@ -844,23 +1139,96 @@ final class VoiceEngine implements PcmSink {
             spotter.setPersonalWake(String.join("/", usable));
         }
         if (wake != null) {
-            wake.setCutoffOverride(Double.isNaN(cfg.personalWakeCutoff) ? Float.NaN : (float) cfg.personalWakeCutoff);
+            double personal = personalCutoff(cfg, false);
+            wake.setCutoffOverride(Double.isNaN(personal) ? Float.NaN : (float) personal);
         }
+        applyVoiceMatch(cfg);
+    }
+
+    /** Loads the voices' templates on the io executor when their references change, and drops orphaned files. */
+    private void applyVoiceMatch(VoiceAssistantConfig cfg) {
+        final String key = VoiceAssistantConfig.matchKey(cfg.personalVoices);
+        if (key.equals(voiceMatchKey) || wake == null) return;
+        voiceMatchKey = key;
+        final List<VoiceAssistantConfig.PersonalVoice> voices = cfg.personalVoices;
+        submitMedia(() -> {
+            List<VoiceMatch.Saved> saved = new ArrayList<>();
+            for (VoiceAssistantConfig.PersonalVoice v : voices) {
+                VoiceMatch.Saved s = v.matchAt > 0 ? readMatch(v.id, v.matchAt) : null;
+                if (s != null) saved.add(s);
+            }
+            if (dry == null) pruneMatch(voices);
+            final VoiceMatch m = VoiceMatch.of(saved);
+            post(() -> {
+                if (key.equals(voiceMatchKey)) voiceMatch = m;
+            });
+        });
+    }
+
+    private File matchDir() {
+        return new File(app.getFilesDir(), "voice_match");
+    }
+
+    /** A voice's templates of one training, or null when missing or not that training. Any thread. */
+    private VoiceMatch.Saved readMatch(String voice, long at) {
+        File f = new File(matchDir(), voice + "-" + at + ".bin");
+        if (!f.isFile() || f.length() > 4L << 20) return null;
+        try (InputStream in = new java.io.BufferedInputStream(new java.io.FileInputStream(f))) {
+            return VoiceMatch.Saved.decode(in, voice, at);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Deletes template files no voice references, sparing ones younger than 10 min (a save still in flight). */
+    private void pruneMatch(List<VoiceAssistantConfig.PersonalVoice> voices) {
+        File[] files = matchDir().listFiles();
+        if (files == null) return;
+        java.util.Set<String> kept = new java.util.HashSet<>();
+        for (VoiceAssistantConfig.PersonalVoice v : voices) {
+            if (v.matchAt > 0) kept.add(v.id + "-" + v.matchAt + ".bin");
+        }
+        long now = System.currentTimeMillis();
+        for (File f : files) {
+            if (!kept.contains(f.getName()) && now - f.lastModified() > 10 * 60_000L && !f.delete()) {
+                Log.w(TAG, "could not delete " + f.getName());
+            }
+        }
+    }
+
+    /** The lowest enrolled cutoff (reference units) of the voices measured on the loaded wake model, or NaN. */
+    private double personalCutoff(VoiceAssistantConfig cfg, boolean media) {
+        WakeWordDetector w = wake;
+        return w == null ? Double.NaN : VoiceAssistantConfig.lowestCutoff(cfg.personalVoices, media, w.modelId());
     }
 
     // ── Audio + timers ────────────────────────────────────────────────────
 
     private void onAudio(short[] chunk, int n, long now) {
-        boolean muted = now < mutedUntil || replySpeaking || briefReplySpeaking;
+        // Full duplex (healthy echo canceller): our own reply is removed from the mic, so it does
+        // not mute a cloud turn's uplink; everything else keeps the half-duplex mute.
+        boolean replyMutes = replySpeaking && !(phase == CLOUD && fullDuplexTurn);
+        boolean muted = now < mutedUntil || replyMutes || briefReplySpeaking;
+        if (phase == ARMED && config.wakeInputDenoised && liveDenoiser != null) {
+            if (!liveDenoiseForWake) {
+                liveDenoiser.reset();
+                liveDenoiseForWake = true;
+            }
+            int m = denoiseLive(chunk, 0, n);
+            if (m <= 0) return;
+            chunk = denoised;
+            n = m;
+        }
         float rms = rms(chunk, 0, n);
         if (!muted) trackNoiseFloor(rms, n);
         noteMic(rms);
         streamPos += n;
         lastAudioAt = now;
         // Candidates wherever a lowered cutoff would fire mid-word, and for every enrollment take;
-        // plain-mic media keeps fire-and-reset.
+        // plain-mic media keeps fire-and-reset (the car array keeps candidates whatever its health).
         if (wake != null) {
-            wake.setCandidateMode(phase == ENROLL || (wake.cutoffLowered() && (!mediaActive || echoFree())));
+            wake.setCandidateMode(phase == ENROLL
+                    || (wake.cutoffLowered() && (!mediaActive || echoState != MediaTurnPolicy.ECHO_NONE)));
         }
         if (phase == ARMED) {
             remember(chunk, n);
@@ -877,6 +1245,7 @@ final class VoiceEngine implements PcmSink {
                 triggers.incrementAndGet();
                 boolean candidate = wake.candidateMode();
                 triggerPeak = candidate ? wake.lastCandidatePeak() : wake.lastChunkPeak();
+                triggerAtMs = now;
                 // A candidate is reported after its score peaked: the word is already complete.
                 verifyDueAt = streamPos + (candidate ? CANDIDATE_VERIFY_DELAY_SAMPLES : VERIFY_DELAY_SAMPLES);
             } else if (verifyDueAt >= 0 && streamPos >= verifyDueAt) {
@@ -914,6 +1283,18 @@ final class VoiceEngine implements PcmSink {
 
     /** Command-stage audio, already level-normalized. */
     private void onTurnAudio(short[] pcm, int off, int n, long now, boolean countSpeech) {
+        // A cloud turn hears (Silero) and uplinks the denoised audio when the model is present.
+        if (phase == CLOUD && config.denoiseSpeech && liveDenoiser != null) {
+            if (liveDenoiseForWake) {
+                liveDenoiser.reset();
+                liveDenoiseForWake = false;
+            }
+            int m = denoiseLive(pcm, off, n);
+            if (m <= 0) return;
+            pcm = denoised;
+            off = 0;
+            n = m;
+        }
         float rms = rms(pcm, off, n);
         overlay.setLevel(Math.min(1f, rms / 3000f));
         if (countSpeech) {
@@ -952,12 +1333,73 @@ final class VoiceEngine implements PcmSink {
                 }
             }
         } else if (phase == CLOUD) {
-            if (uLen > 0 && session != null && sessionStreaming) session.sendPcm16k(pcm, uOff, uLen);
+            if (uLen > 0) uplink(pcm, uOff, uLen);
         }
+    }
+
+    /**
+     * Cloud uplink. After the engine sent the end of speech the uplink waits for the next speech
+     * (Silero) instead of streaming music or road noise into the provider's turn; that speech goes
+     * up with a lead from the turn ring.
+     */
+    private void uplink(short[] pcm, int off, int n) {
+        rememberCloud(pcm, off, n);
+        if (session == null || !sessionStreaming) return;
+        if (uplinkGated) {
+            if (lastSpeechSample <= gatedAtSample) return;
+            reopenUplink();
+            short[] lead = cloudTail(REOPEN_LEAD_SAMPLES + n);
+            session.sendPcm16k(lead, 0, lead.length);
+            return;
+        }
+        session.sendPcm16k(pcm, off, n);
+    }
+
+    private void rememberCloud(short[] pcm, int off, int n) {
+        for (int i = 0; i < n; ) {
+            int run = Math.min(n - i, cloudPcm.length - cloudPcmPos);
+            System.arraycopy(pcm, off + i, cloudPcm, cloudPcmPos, run);
+            i += run;
+            cloudPcmPos += run;
+            if (cloudPcmPos == cloudPcm.length) {
+                cloudPcmPos = 0;
+                cloudPcmFull = true;
+            }
+        }
+    }
+
+    /** The last {@code samples} of uplinked turn audio, oldest first. */
+    private short[] cloudTail(int samples) {
+        int have = Math.min(samples, cloudPcmFull ? cloudPcm.length : cloudPcmPos);
+        short[] out = new short[have];
+        int from = cloudPcmPos - have;
+        if (from < 0) {
+            int head = -from;
+            System.arraycopy(cloudPcm, cloudPcm.length - head, out, 0, head);
+            System.arraycopy(cloudPcm, 0, out, head, cloudPcmPos);
+        } else {
+            System.arraycopy(cloudPcm, from, out, 0, have);
+        }
+        return out;
+    }
+
+    /** Streaming GTCRN on its own thread: queues this audio, takes what is denoised so far (in order). */
+    private int denoiseLive(short[] pcm, int off, int n) {
+        // Room for twice the input, so output that arrives in a burst drains within a few chunks.
+        int need = 2 * n + 4 * liveDenoiser.frameShift();
+        if (denoised.length < need) denoised = new short[need];
+        return liveDenoiser.process(pcm, off, n, denoised);
     }
 
     private void tick(long now) {
         servicePrompts(now);
+        pollEcho(now);
+        // A worker transcript that never came back: the window decides without it.
+        if (asrPending != 0 && now > asrDeadline) {
+            Log.w(TAG, "speech-to-text did not return in " + ASR_TIMEOUT_MS + " ms");
+            onTurnAsr(turn, asrPending, null, null, 0, -1);
+        }
+        if (briefAsrPending && now > briefAsrDeadline) onBriefTranscript(turn, briefReplyId, utteranceLen, null, 0, true);
         if (phase == ARMED) {
             maybeStartEnroll();
         } else if (phase == ENROLL) {
@@ -1001,6 +1443,7 @@ final class VoiceEngine implements PcmSink {
     }
 
     private void remember(short[] chunk, int n) {
+        historyWritten += n;
         for (int i = 0; i < n; ) {
             int run = Math.min(n - i, history.length - historyPos);
             System.arraycopy(chunk, i, history, historyPos, run);
@@ -1013,10 +1456,49 @@ final class VoiceEngine implements PcmSink {
         }
     }
 
+    /** One stage-2 check: inputs copied on the consumer, verified on the worker, verdict posted back. */
+    private static final class WakeCheck {
+        int turnAt;
+        /** historyWritten at the copy: the check window [endPos - n, endPos). */
+        long endPos;
+        short[] pcm;
+        int n;
+        float level;
+        float peak;
+        float echo = Float.NaN;
+        boolean media;
+        boolean weak;
+        boolean guarded;
+        boolean healthy;
+        boolean candidate;
+        boolean sttOnly;
+        boolean sttAllowed;
+        int budgetUsedMs;
+        LocalCommandSpotter kws;
+        CommandTranscriber stt;
+        PhoneDecoder phones;
+        VoiceMatch match;
+        short[] feats;
+        int featFrames;
+        // Verdict (worker).
+        float tmplD = Float.NaN;
+        float tmplThr = Float.NaN;
+        int end = LocalCommandSpotter.WAKE_NOT_HEARD;
+        boolean heard;
+        String by;
+        String text;
+        float gain = 1f;
+        int tookMs;
+        int queuedMs;
+        long firedAtMs;
+        volatile boolean cancelled;
+    }
+
     /**
      * Second stage: the keyword spotter must also hear "OverDrive" in the last 2.2 s, brought to
-     * speech level. On success the turn replays everything from just before the word's end, so
-     * nothing said after it is lost to the check's latency.
+     * speech level. The consumer only copies the window and applies the cheap gates (budget, level,
+     * echo likeness); the worker verifies it and the turn then replays the history from just
+     * before the word's end, so nothing said after it is lost to the check's latency.
      */
     private void checkWake() {
         long started = SystemClock.elapsedRealtime();
@@ -1024,64 +1506,159 @@ final class VoiceEngine implements PcmSink {
             verifyWindowStart = started;
             verifyMsUsed = 0;
         }
-        // Under media the keyword verifier alone decides: Moonshine would transcribe the podcast.
-        // The car microphones cancel the speakers' own sound, so there the media is not heard.
+        // Under media the keyword verifier alone decides (Moonshine would transcribe the music),
+        // whatever the echo canceller does; only its measured health drops the refractory.
         boolean media = mediaActive;
-        boolean echoFree = echoFree();
+        boolean healthy = echoHealthy();
         // A trigger only an enrolled or media cutoff let through is confirmed the same way.
         boolean weak = triggerPeak < wake.modelCutoff();
-        boolean guarded = (media && !echoFree) || weak;
-        int n = copyHistoryTail(verifyBuf);
-        float level = speechLevel(verifyBuf, n);
+        boolean guarded = (media && !healthy) || weak;
+        WakeCheck c = new WakeCheck();
+        c.pcm = new short[VERIFY_SAMPLES];
+        c.n = copyHistoryTail(c.pcm);
+        c.endPos = historyWritten;
+        c.level = speechLevel(c.pcm, c.n);
         // Candidate mode spends the budget on weak candidates only (mostly residue and noise): a
         // near-silent one, or any over budget, is dropped, and a strong one is always checked in full.
         boolean candidate = wake.candidateMode();
-        if (weak && candidate && (level < WEAK_CANDIDATE_MIN_LEVEL || verifyMsUsed > VERIFY_BUDGET_MS)) {
+        if (weak && candidate && (c.level < WEAK_CANDIDATE_MIN_LEVEL || verifyMsUsed > VERIFY_BUDGET_MS)) {
             return;
         }
+        c.echo = media ? echoLikeness(Math.min(c.n, ECHO_WINDOW_SAMPLES)) : Float.NaN;
+        if (MediaWakeGate.rejectAsEcho(media, c.echo, config.echoRejectLikeness)) {
+            // The speakers explain the trigger: rejected before any verifier runs.
+            c.by = "echo";
+            c.media = true;
+            c.guarded = guarded;
+            c.healthy = healthy;
+            c.turnAt = turn;
+            c.peak = triggerPeak;
+            onWakeVerdict(c);
+            return;
+        }
+        boolean noStt = media || weak;
         // Over budget: keep only the cheaper check rather than stopping wake detection.
-        boolean sttOnly = MediaWakeGate.sttOnly(guarded, verifyMsUsed > VERIFY_BUDGET_MS)
+        c.sttOnly = MediaWakeGate.sttOnly(noStt, verifyMsUsed > VERIFY_BUDGET_MS)
                 && transcriber != null && englishSpeech() && !candidate;
-        float gain = Math.max(MIN_GAIN, Math.min(MAX_GAIN, TARGET_SPEECH_RMS / Math.max(level, 1f)));
-        applyGain(verifyBuf, 0, n, gain, verifyBuf);
-        int end = spotter == null || n == 0 || sttOnly
-                ? LocalCommandSpotter.WAKE_NOT_HEARD : spotter.verifyWake(verifyBuf, 0, n);
+        c.sttAllowed = MediaWakeGate.sttFallbackAllowed(noStt) && englishSpeech();
+        c.media = media;
+        c.weak = weak;
+        c.guarded = guarded;
+        c.healthy = healthy;
+        c.candidate = candidate;
+        c.peak = triggerPeak;
+        c.firedAtMs = triggerAtMs;
+        c.budgetUsedMs = verifyMsUsed;
+        c.kws = spotter;
+        c.stt = transcriber;
+        c.phones = wakePhones;
+        c.turnAt = turn;
+        // Voice match: stage 1's own frames of the window, for a confident enough trigger with speech in it.
+        VoiceMatch match = voiceMatch;
+        if (match != null && c.peak >= wake.toModel(VoiceMatch.GATE_P_REF) - 1e-4f
+                && dbfs(c.level) >= VoiceMatch.MIN_LEVEL_DBFS) {
+            c.match = match;
+            c.feats = new short[VoiceMatch.WINDOW_FRAMES * com.overdrive.app.voice.wake.MicroFrontend.NUM_CHANNELS];
+            c.featFrames = wake.copyFeatures(c.feats, VoiceMatch.WINDOW_FRAMES);
+        }
+        WakeCheck running = runningCheck;
+        if (running != null && c.peak >= running.peak + PREEMPT_PEAK_MARGIN) running.cancelled = true;
+        if (!worker.submit(StageWorker.KIND_WAKE, queued -> {
+            c.queuedMs = (int) Math.min(60_000L, queued);
+            runningCheck = c;
+            try {
+                verifyOnWorker(c);
+            } finally {
+                runningCheck = null;
+            }
+            post(() -> onWakeVerdict(c));
+        })) {
+            Log.w(TAG, "wake check dropped: worker closed or full");
+        }
+    }
+
+    /** Worker: level-normalize, keyword verifier, speech-to-text fallback, then the second look. */
+    private static void verifyOnWorker(WakeCheck c) {
+        long started = SystemClock.elapsedRealtime();
+        int n = c.n;
+        // The second look's raw tail, before the window is brought to speech level.
+        int m = Math.min(VERIFY_SHORT_SAMPLES, n);
+        short[] tail = java.util.Arrays.copyOfRange(c.pcm, n - m, n);
+        c.gain = Math.max(MIN_GAIN, Math.min(MAX_GAIN, TARGET_SPEECH_RMS / Math.max(c.level, 1f)));
+        applyGain(c.pcm, 0, n, c.gain, c.pcm);
+        LocalCommandSpotter kws = c.kws;
+        java.util.function.BooleanSupplier cancel = () -> c.cancelled;
+        int end = kws == null || n == 0 || c.sttOnly
+                ? LocalCommandSpotter.WAKE_NOT_HEARD : kws.verifyWake(c.pcm, 0, n, cancel);
         boolean heard = end != LocalCommandSpotter.WAKE_NOT_HEARD;
-        String by = heard ? (spotter.lastWakeWasPersonal() ? "kwsp" : "kws") : null;
-        String text = null;
-        // Accents the keyword model misses are often transcribed correctly; either one is enough.
-        if (!heard && n > 0 && MediaWakeGate.sttFallbackAllowed(guarded)) {
-            CommandTranscriber t = transcriber;
-            if (t != null && englishSpeech()) {
-                boolean[] said = new boolean[1];
-                text = t.hearsWakeWord(verifyBuf, 0, n, said);
-                if (said[0]) {
+        c.by = heard ? (kws.lastWakeWasPersonal() ? "kwsp" : "kws") : null;
+        long firstMs = SystemClock.elapsedRealtime() - started;
+        // The enrolled people's own takes: a few ms of DTW over stage 1's frames, allowed under media too.
+        if (!heard && !c.cancelled && c.match != null && c.featFrames > 0) {
+            VoiceMatch.Verdict v = c.match.check(c.feats, c.featFrames, cancel);
+            if (v != null) {
+                c.tmplD = v.distance;
+                c.tmplThr = v.threshold;
+                if (v.accepted) {
                     heard = true;
-                    by = "stt";
+                    c.by = "tmpl";
                     end = LocalCommandSpotter.WAKE_END_UNKNOWN;
                 }
             }
         }
-        if (!heard && n > 0 && spotter != null && !sttOnly && ((candidate && !weak)
-                || verifyMsUsed + (SystemClock.elapsedRealtime() - started) <= VERIFY_BUDGET_MS)) {
-            int longEnd = secondLook(n);
+        // Accents the keyword model misses are often transcribed correctly; either one is enough.
+        if (!heard && !c.cancelled && n > 0 && c.sttAllowed && c.stt != null) {
+            boolean[] said = new boolean[1];
+            c.text = c.stt.hearsWakeWord(c.pcm, 0, n, said);
+            if (said[0]) {
+                heard = true;
+                c.by = "stt";
+                end = LocalCommandSpotter.WAKE_END_UNKNOWN;
+            }
+        }
+        // The keyword lines miss some speakers ("ord-ez", "over-d"): their free phone decode lands within
+        // a few edits of a wake line (eval: +12 points on accented voices, no added false wake).
+        if (!heard && !c.cancelled && n > 0 && c.phones != null && !c.sttOnly
+                && PhoneDecoder.wakeDistance(c.phones.decode(c.pcm, 0, n)) <= (c.peak >= STRONG_TRIGGER_PEAK
+                        ? PhoneDecoder.WAKE_MAX_DISTANCE_STRONG : PhoneDecoder.WAKE_MAX_DISTANCE) + 1e-4f) {
+            heard = true;
+            c.by = "ped";
+            end = LocalCommandSpotter.WAKE_END_UNKNOWN;
+        }
+        long elapsed = SystemClock.elapsedRealtime() - started;
+        // The second look costs about 0.8 of the first decode: skipped when it would overrun.
+        if (!heard && !c.cancelled && n > 0 && kws != null && !c.sttOnly
+                && elapsed + firstMs * 4 / 5 <= SECOND_LOOK_DEADLINE_MS && ((c.candidate && !c.weak)
+                || c.budgetUsedMs + elapsed <= VERIFY_BUDGET_MS)) {
+            int longEnd = secondLook(kws, tail, m, n, cancel);
             if (longEnd != LocalCommandSpotter.WAKE_NOT_HEARD) {
                 heard = true;
-                by = spotter.lastWakeWasPersonal() ? "kwsaltp" : "kwsalt";
+                c.by = kws.lastWakeWasPersonal() ? "kwsaltp" : "kwsalt";
                 end = longEnd;
             }
         }
-        int tookMs = (int) (SystemClock.elapsedRealtime() - started);
-        verifyMsUsed += tookMs;
-        noteCheck(heard, by, level, gain, tookMs, heard && !"stt".equals(by) ? null : CommandTranscriber.logSafe(text, 40), media);
+        if (!heard && c.cancelled) c.by = "preempt";
+        c.heard = heard;
+        c.end = end;
+        c.tookMs = (int) (SystemClock.elapsedRealtime() - started);
+    }
+
+    /** Consumer: the verdict of a check, dropped when the engine left ARMED (or re-armed) meanwhile. */
+    private void onWakeVerdict(WakeCheck c) {
+        verifyMsUsed += c.tookMs;
+        if (!running || c.turnAt != turn || phase != ARMED || wake == null) return;
+        boolean heard = c.heard;
+        String by = c.by;
+        noteCheck(heard, by, c.level, c.gain, c.tookMs,
+                heard && !"stt".equals(by) ? null : CommandTranscriber.logSafe(c.text, 40), c.media,
+                c.peak, c.echo, c.queuedMs, c.tmplD, c.tmplThr);
         if (!heard) {
             rejectedWakes.incrementAndGet();
             // Under media a rejected check is followed by a short refractory so the verifier is
             // not re-entered every 2-3 s by the media itself; without media nothing changes.
-            long hold = MediaWakeGate.refractoryAfterRejectMs(guarded);
-            // With the car microphones the music is cancelled; on 2026-10-14 its residue still
-            // triggered a check every ~5 s and the hold after each one kept the driver unheard.
-            if (echoFree) hold = 0;
+            // With a healthy (measured) echo canceller the music is cancelled; on 2026-10-14 its
+            // residue still triggered a check every ~5 s and a hold after each kept the driver unheard.
+            long hold = "preempt".equals(by) ? 0 : MediaWakeGate.refractoryAfterRejectMs(c.guarded, c.healthy);
             if (hold > 0) refractoryUntil = SystemClock.elapsedRealtime() + hold;
             host.onActivity();
             return;
@@ -1091,6 +1668,9 @@ final class VoiceEngine implements PcmSink {
             host.onActivity();
             return;
         }
+        int n = c.n;
+        int end = c.end;
+        float gain = c.gain;
         micGain = gain;
         turnGainMeasured = true;
         int start;
@@ -1105,6 +1685,8 @@ final class VoiceEngine implements PcmSink {
         start = Math.max(Math.max(0, n - MAX_PREROLL_SAMPLES), Math.min(start, n));
         speechFrom = Math.max(start, Math.min(speechFrom, n));
         beginTurn(false, gain);
+        turnVerifyQueueMs = c.queuedMs;
+        turnWakeMs = c.firedAtMs > 0 ? (int) Math.min(60_000L, Math.max(0L, SystemClock.elapsedRealtime() - c.firedAtMs)) : -1;
         wakeEndTurnSample = end == LocalCommandSpotter.WAKE_END_UNKNOWN
                 ? speechFrom - start : Math.max(0, end - start);
         wakeWordEndSample = end == LocalCommandSpotter.WAKE_END_UNKNOWN ? 0 : wakeEndTurnSample;
@@ -1112,13 +1694,10 @@ final class VoiceEngine implements PcmSink {
         utteranceSkipSamples = end == LocalCommandSpotter.WAKE_END_UNKNOWN
                 ? 0 : Math.max(0, Math.min(end, n) - UTTERANCE_LEAD_SAMPLES - start);
         wakeTailPossible = end == LocalCommandSpotter.WAKE_END_UNKNOWN;
-        long now = SystemClock.elapsedRealtime();
-        for (int off = start; off < n && phase != ARMED; ) {
-            int limit = off < speechFrom ? speechFrom : n;
-            int len = Math.min(1024, limit - off);
-            onTurnAudio(verifyBuf, off, len, now, off >= speechFrom);
-            off += len;
-        }
+        // Replays the check window from the command's start, then everything the consumer heard
+        // while the worker verified it, at the wake word's gain.
+        long base = c.endPos - n;
+        replayHistory(base + start, base + speechFrom, gain);
         // The replay and the ring backlog were captured before the chime; listening starts after it.
         if (phase != ARMED) {
             cueStartSample = turnSamples + cueBacklogSamples;
@@ -1126,18 +1705,43 @@ final class VoiceEngine implements PcmSink {
         }
     }
 
+    /** History [from, historyWritten) into the turn at {@code gain}; speech counts from {@code speechFromPos}. */
+    private void replayHistory(long from, long speechFromPos, float gain) {
+        long oldest = historyWritten - (historyFull ? history.length : historyPos);
+        long pos = Math.max(from, oldest);
+        if (pos > from) Log.w(TAG, "wake replay lost " + (pos - from) * 1000 / RATE + " ms of history");
+        long now = SystemClock.elapsedRealtime();
+        short[] chunk = new short[1024];
+        while (pos < historyWritten && phase != ARMED) {
+            long limit = pos < speechFromPos ? speechFromPos : historyWritten;
+            int len = (int) Math.min(chunk.length, limit - pos);
+            copyHistory(pos, chunk, len);
+            applyGain(chunk, 0, len, gain, chunk);
+            onTurnAudio(chunk, 0, len, now, pos >= speechFromPos);
+            pos += len;
+        }
+    }
+
+    /** {@code len} history samples starting at absolute position {@code pos} (must still be held). */
+    private void copyHistory(long pos, short[] dst, int len) {
+        int index = (int) Math.floorMod(historyPos - (historyWritten - pos), (long) history.length);
+        int first = Math.min(len, history.length - index);
+        System.arraycopy(history, index, dst, 0, first);
+        if (first < len) System.arraycopy(history, 0, dst, first, len - first);
+    }
+
     /**
-     * The second look: the last 1.8 s of the history at their own speech level. Returns the wake
-     * word's end on the {@code n} samples of {@link #verifyBuf} (they end at the same sample),
+     * The second look: the last 1.8 s of the window at their own speech level. Returns the wake
+     * word's end on the {@code n}-sample window (they end at the same sample),
      * {@code WAKE_END_UNKNOWN} or {@code WAKE_NOT_HEARD}.
      */
-    private int secondLook(int n) {
-        int m = copyHistoryTail(verifyShortBuf);
+    private static int secondLook(LocalCommandSpotter kws, short[] tail, int m, int n,
+                                  java.util.function.BooleanSupplier cancel) {
         if (m <= 0 || m >= n) return LocalCommandSpotter.WAKE_NOT_HEARD;
-        float level = speechLevel(verifyShortBuf, m);
+        float level = speechLevel(tail, m);
         float gain = Math.max(MIN_GAIN, Math.min(MAX_GAIN, TARGET_SPEECH_RMS / Math.max(level, 1f)));
-        applyGain(verifyShortBuf, 0, m, gain, verifyShortBuf);
-        int end = spotter.verifyWake(verifyShortBuf, 0, m);
+        applyGain(tail, 0, m, gain, tail);
+        int end = kws.verifyWake(tail, 0, m, cancel);
         if (end == LocalCommandSpotter.WAKE_NOT_HEARD || end == LocalCommandSpotter.WAKE_END_UNKNOWN) return end;
         return end + (n - m);
     }
@@ -1258,9 +1862,10 @@ final class VoiceEngine implements PcmSink {
         return n;
     }
 
-    /** 95th-percentile 32 ms frame RMS (DC removed): the loud speech frames, not the pauses. */
-    private float speechLevel(short[] pcm, int n) {
+    /** 95th-percentile 32 ms frame RMS (DC removed): the loud speech frames, not the pauses. Any thread. */
+    private static float speechLevel(short[] pcm, int n) {
         int available = n / LEVEL_FRAME;
+        float[] frameLevels = new float[VERIFY_SAMPLES / LEVEL_FRAME + 1];
         int frames = Math.min(frameLevels.length, available);
         if (frames == 0) return rms(pcm, 0, n);
         // Longer buffers are sampled across their whole length, not just the first 2.2 s.
@@ -1281,10 +1886,68 @@ final class VoiceEngine implements PcmSink {
         return frameLevels[(int) (0.95f * (frames - 1))];
     }
 
-    /** The car microphones' input, whose echo canceller removes the cabin speakers' own sound. */
-    private static boolean echoFree() {
-        return VoiceAssistantConfig.MIC_SOURCE_CAR_ARRAY.equals(
-                com.overdrive.app.audio.AppAudioCaptureController.activeMicSource());
+    /**
+     * The car array's echo canceller is MEASURED healthy right now (converged, refs active, ERLE
+     * above its threshold): only then is media treated as removed from the mic. The car array
+     * without a fresh measurement counts as unhealthy; other inputs have no echo state at all.
+     */
+    private boolean echoHealthy() {
+        return echoState == MediaTurnPolicy.ECHO_HEALTHY;
+    }
+
+    /** Refreshes the echo state twice a second; a change re-applies the stage-1 media cutoff. */
+    private void pollEcho(long now) {
+        if (now - echoPolledAt < ECHO_POLL_MS) return;
+        echoPolledAt = now;
+        EchoHealth h = AppAudioCaptureController.echoHealth();
+        int state;
+        if (h != null) {
+            boolean fresh = now - h.atElapsedMs <= ECHO_STALE_MS;
+            // Media playing with idle references: the car plays audio the canceller never sees.
+            boolean blind = mediaActive && !h.refActive;
+            state = fresh && h.healthy && !blind ? MediaTurnPolicy.ECHO_HEALTHY : MediaTurnPolicy.ECHO_UNHEALTHY;
+        } else {
+            state = VoiceAssistantConfig.MIC_SOURCE_CAR_ARRAY.equals(AppAudioCaptureController.activeMicSource())
+                    ? MediaTurnPolicy.ECHO_UNHEALTHY : MediaTurnPolicy.ECHO_NONE;
+        }
+        echoLast = h;
+        // Car microphones only: wake checks and speech-to-text on the fast cluster.
+        worker.setFastCores(state != MediaTurnPolicy.ECHO_NONE);
+        if (state != echoState) {
+            echoState = state;
+            applyWakeCutoff();
+        }
+        updateFullDuplex();
+    }
+
+    /**
+     * Barge-in only while the canceller removes our own reply: healthy, and ERLE >= bargeInMinErleDb
+     * measured with the references playing. Idle references keep the current choice.
+     */
+    private void updateFullDuplex() {
+        if (phase != CLOUD || session == null || !sessionStreaming) return;
+        boolean on = fullDuplexTurn;
+        EchoHealth h = echoLast;
+        if (!config.fullDuplex || !echoHealthy() || h == null) {
+            on = false;
+        } else if (h.refActive) {
+            on = h.erleDb >= config.bargeInMinErleDb;
+        }
+        if (on == fullDuplexTurn) return;
+        fullDuplexTurn = on;
+        session.setFullDuplex(on);
+    }
+
+    /** How much of the last {@code samples} consumed the speaker references explain (0..1), NaN unknown. */
+    private float echoLikeness(int samples) {
+        if (!clockValid || echoState == MediaTurnPolicy.ECHO_NONE) return Float.NaN;
+        long end = ring.readPosition() + clockOffset;
+        if (end <= samples) return Float.NaN;
+        try {
+            return AppAudioCaptureController.echoLikeness(end - samples, end);
+        } catch (Throwable t) {
+            return Float.NaN;
+        }
     }
 
     /** Returns true when any sample had to be clipped. */
@@ -1379,6 +2042,7 @@ final class VoiceEngine implements PcmSink {
         mediaHoldUntilSample = -1;
         holdAudioUntilSample = -1;
         turnReplyHeard = false;
+        resetTurnDiagnostics();
         wakeIgnoreUntilSample = 0;
         lastSpeechSample = 0;
         utteranceFull = false;
@@ -1402,11 +2066,7 @@ final class VoiceEngine implements PcmSink {
         // (the isMusicActive() fallback, used only when the daemon cannot see the sessions).
         turnMedia = mediaPlayingForTurn(now);
         // A cabin duck still held from the previous turn keeps its channel (duck() keeps the hold).
-        if (!cabinDucked) {
-            cabinDuckTurn = MediaTurnPolicy.cabinDuck(cabinDuckAvailable,
-                    config.pauseMediaWhileListening, config.resumeMediaAfterListening);
-            turnChannel = cabinDuckTurn ? duckedChannel() : null;
-        }
+        decideMediaHold(config);
         try {
             cueVolume = audioManager == null ? -1 : audioManager.getStreamVolume(Earcons.streamFor(channel()));
         } catch (Throwable ignored) {
@@ -1442,6 +2102,33 @@ final class VoiceEngine implements PcmSink {
             finishTurn(VoiceOrbView.STATE_ERROR, R.string.voice_overlay_failed, Earcons.FAILURE,
                     VoicePrompts.FAILED);
         }
+    }
+
+    private void resetTurnDiagnostics() {
+        turnVerifyQueueMs = -1;
+        turnWakeMs = -1;
+        turnMaxLagSamples = 0;
+        cloudSilent = false;
+        cloudFallback = null;
+        turnCloudFail = null;
+        understoodText = null;
+        eosBy = null;
+        eosMs = -1;
+        eosCls = null;
+        inputTranscript = null;
+        hintForSample = -1;
+        hintTranscript = null;
+        hintCls = null;
+        turnInterrupts = 0;
+        turnInputChars = 0;
+        turnToolCalls = 0;
+        turnAnswered = false;
+        asrQueueMs = -1;
+        asrPending = 0;
+        turnHoldWhy = null;
+        turnEcho = MediaTurnPolicy.ECHO_NONE;
+        turnErleDb = Float.NaN;
+        fullDuplexTurn = false;
     }
 
     // No speech yet, and nothing loud for a quarter second (the voice detector declares speech late) of audio
@@ -1546,7 +2233,7 @@ final class VoiceEngine implements PcmSink {
         long leadingMs = leadingMsOf(m, phraseStartSample);
         boolean trailingLoud = lastLoudSample >= 0
                 && turnSamples - lastLoudSample < CommandWindowGate.TRAILING_LOUD_FOR_HOLD_SAMPLES;
-        // Holding only pays off when understandLocally() can confirm the hit at window close;
+        // Holding only pays off when the window's transcript can confirm the hit at close;
         // otherwise a non-English UI (or a still-loading Moonshine) would turn every hit inside
         // a sentence into "not understood", so the gate falls back to the no-transcript rule.
         boolean canValidate = transcriber != null && config.commandSttAllowed(locale());
@@ -1578,16 +2265,21 @@ final class VoiceEngine implements PcmSink {
         localWindowClosed = true;
         if (speechStartAt != 0 && speechEndAt == 0) speechEndAt = System.currentTimeMillis();
         if (spotter != null) spotter.end();
-        boolean hybrid = VoiceAssistantConfig.MODE_HYBRID.equals(config.mode);
         if (!held.isEmpty()) {
-            validateHeld(hybrid);
+            validateHeld();
             return;
         }
-        int extraWords = -1;
-        if (matches.isEmpty() && speechStartAt != 0) {
-            extraWords = understandLocally();
-            if (phase != LOCAL) return;
+        // Nothing spotted: speech-to-text on the worker decides (decideLocalWindow on its result).
+        if (matches.isEmpty() && speechStartAt != 0 && asrUsable()) {
+            requestTurnAsr(ASR_UNDERSTAND);
+            return;
         }
+        decideLocalWindow(-1);
+    }
+
+    /** The window's outcome once its phrases (and any transcript, {@code extraWords} >= 0) are known. */
+    private void decideLocalWindow(int extraWords) {
+        boolean hybrid = VoiceAssistantConfig.MODE_HYBRID.equals(config.mode);
         if (matches.isEmpty()) {
             if (speechStartAt == 0) {
                 closeSessionQuietly();
@@ -1612,24 +2304,33 @@ final class VoiceEngine implements PcmSink {
                 long leading = Math.max(0, speechMsAtFirstMatch - firstMatchWords * WORD_MS);
                 // a negation heard before it: without a transcript only the AI can tell "don't open the windows"
                 cloud = negationHeard || trailing > TRAILING_SPEECH_FOR_CLOUD_MS || leading > LEADING_SPEECH_FOR_CLOUD_MS;
-                // Something said before the phrase, or music over it: nothing runs before window close here anyway,
-                // so a transcript that says "don't" (or "not", "never" …) hands the turn to the AI too.
                 // Nothing runs before window close here anyway: a transcript that says "don't" (or "not", "never" …)
                 // anywhere — before the phrase, run straight on, or a "no, don't" after it — hands the turn to the AI.
-                if (!cloud && CommandTranscriber.saysNegation(transcriptOnly())) {
-                    cloud = true;
+                if (!cloud && asrUsable()) {
+                    requestTurnAsr(ASR_NEGATION);
+                    return;
                 }
             }
-            if (cloud) {
-                startCloud(true);
-                return;
+            // A transcript-confirmed phrase with no negation runs locally if the cloud then cannot answer.
+            if (cloud && extraWords >= 0 && !negationHeard && !CommandTranscriber.saysNegation(understoodText)) {
+                cloudFallback = new ArrayList<>(matches);
             }
-            closeSessionQuietly();
-            for (LocalCommandSpotter.Match m : matches) dispatch(m);
+            finishHybridWindow(cloud);
+            return;
         } else if (extraWords >= 0) {
             // Local mode dispatches spotted phrases at once; transcribed ones only exist now.
             for (LocalCommandSpotter.Match m : matches) dispatch(m);
         }
+        if (pendingResults == 0) completeLocalTurn();
+    }
+
+    private void finishHybridWindow(boolean cloud) {
+        if (cloud) {
+            startCloud(true);
+            return;
+        }
+        closeSessionQuietly();
+        for (LocalCommandSpotter.Match m : matches) dispatch(m);
         if (pendingResults == 0) completeLocalTurn();
     }
 
@@ -1640,7 +2341,7 @@ final class VoiceEngine implements PcmSink {
      * runs; the driver hears the not-understood prompt (or GenAI takes the turn in hybrid),
      * unless a clean hit already ran on the instant path, whose result the turn then reports.
      */
-    private void validateHeld(boolean hybrid) {
+    private void validateHeld() {
         // The held hits leave the list; only what the transcript confirms comes back.
         List<LocalCommandSpotter.Match> executed = new ArrayList<>(matches);
         executed.removeAll(held);
@@ -1651,8 +2352,23 @@ final class VoiceEngine implements PcmSink {
         matches.addAll(executed);
         held.clear();
         lastTranscript = null;
-        boolean transcribed = understandLocally() >= 0;
-        if (phase != LOCAL) return;
+        heldExecuted = executed;
+        heldLate = late;
+        if (asrUsable()) {
+            requestTurnAsr(ASR_VALIDATE);
+            return;
+        }
+        finishValidateHeld(false);
+    }
+
+    private void finishValidateHeld(boolean transcribed) {
+        boolean hybrid = VoiceAssistantConfig.MODE_HYBRID.equals(config.mode);
+        List<LocalCommandSpotter.Match> executed = heldExecuted;
+        List<LocalCommandSpotter.Match> late = heldLate;
+        heldExecuted = null;
+        heldLate = null;
+        if (executed == null) executed = new ArrayList<>();
+        if (late == null) late = new ArrayList<>();
         turnBy = "kwsasr";
         if (!transcribed) {
             if (hybrid) {
@@ -1703,36 +2419,72 @@ final class VoiceEngine implements PcmSink {
         return false;
     }
 
-    /** The turn's transcript (English only), or null; nothing is matched or dispatched from it. */
-    private String transcriptOnly() {
-        CommandTranscriber t = transcriber;
-        if (t == null || utteranceLen < RATE / 4 || !config.commandSttAllowed(locale())) return null;
-        float level = speechLevel(utterance, utteranceLen);
-        float gain = Math.max(MIN_GAIN, Math.min(MAX_GAIN, TARGET_SPEECH_RMS / Math.max(level, 1f)));
-        if (gain < 0.91f || gain > 1.1f) applyGain(utterance, 0, utteranceLen, gain, utterance);
-        long started = SystemClock.elapsedRealtime();
-        String text = t.transcript(utterance, 0, utteranceLen);
-        // in the turn log, like the other transcript passes
-        turnAsrMs = (int) (SystemClock.elapsedRealtime() - started);
-        turnText = CommandTranscriber.logSafe(text, 60);
-        return text;
+    /** English speech-to-text can run on this turn's utterance. */
+    private boolean asrUsable() {
+        return transcriber != null && utteranceLen >= RATE / 4 && config.commandSttAllowed(locale());
     }
 
     /**
-     * Speech-to-text over the turn's audio (English only): when no phrase was spotted, or to
-     * validate held ones. Appends the matched phrases and returns the leftover word count, or -1
-     * when nothing matched.
+     * Speech-to-text over the turn's audio on the worker (English only): ASR_UNDERSTAND when no
+     * phrase was spotted, ASR_VALIDATE for held ones, ASR_NEGATION for the hybrid "don't" check.
+     * The utterance is brought to speech level in place (the cloud replay keeps that, as before)
+     * and copied; the worker denoises the copy when the model is present.
      */
-    private int understandLocally() {
-        CommandTranscriber t = transcriber;
-        if (t == null || utteranceLen < RATE / 4 || !config.commandSttAllowed(locale())) return -1;
-        // Speech-to-text is level-sensitive too, so the buffer is brought to speech level first.
+    private void requestTurnAsr(int purpose) {
         float level = speechLevel(utterance, utteranceLen);
         float gain = Math.max(MIN_GAIN, Math.min(MAX_GAIN, TARGET_SPEECH_RMS / Math.max(level, 1f)));
         if (gain < 0.91f || gain > 1.1f) applyGain(utterance, 0, utteranceLen, gain, utterance);
-        long started = SystemClock.elapsedRealtime();
-        CommandTranscriber.Understood u = t.understand(utterance, 0, utteranceLen, !turnManual && wakeTailPossible);
-        turnAsrMs = (int) (SystemClock.elapsedRealtime() - started);
+        final short[] copy = java.util.Arrays.copyOf(utterance, utteranceLen);
+        final CommandTranscriber t = transcriber;
+        final SpeechDenoiser d = config.denoiseSpeech ? asrDenoiser : null;
+        final boolean afterWake = !turnManual && wakeTailPossible;
+        final int at = turn;
+        asrPending = purpose;
+        asrDeadline = SystemClock.elapsedRealtime() + ASR_TIMEOUT_MS;
+        boolean queued = worker.submit(StageWorker.KIND_OTHER, q -> {
+            long started = SystemClock.elapsedRealtime();
+            short[] in = denoiseCopy(d, copy);
+            CommandTranscriber.Understood u = null;
+            String text = null;
+            if (purpose == ASR_NEGATION) {
+                text = t.transcript(in, 0, in.length);
+            } else {
+                u = t.understand(in, 0, in.length, afterWake);
+            }
+            int ms = (int) (SystemClock.elapsedRealtime() - started);
+            final CommandTranscriber.Understood fu = u;
+            final String ft = text;
+            post(() -> onTurnAsr(at, purpose, fu, ft, ms, (int) Math.min(60_000L, q)));
+        });
+        if (!queued) onTurnAsr(at, purpose, null, null, 0, -1);
+    }
+
+    /** Consumer: a worker transcript for the closed window; stale or late ones are dropped. */
+    private void onTurnAsr(int forTurn, int purpose, CommandTranscriber.Understood u, String text,
+                           int ms, int queuedMs) {
+        if (forTurn != turn || phase != LOCAL || asrPending != purpose) return;
+        asrPending = 0;
+        turnAsrMs = ms;
+        asrQueueMs = queuedMs;
+        if (purpose == ASR_NEGATION) {
+            turnText = CommandTranscriber.logSafe(text, 60);
+            finishHybridWindow(CommandTranscriber.saysNegation(text));
+            return;
+        }
+        int extraWords = applyUnderstood(u);
+        if (phase != LOCAL) return;
+        if (purpose == ASR_VALIDATE) {
+            finishValidateHeld(extraWords >= 0);
+        } else {
+            decideLocalWindow(extraWords);
+        }
+    }
+
+    /**
+     * A transcript's phrases join the turn: returns the leftover word count, or -1 when nothing
+     * matched (or there was no transcript). An "assistant.cancel" in it cancels the turn.
+     */
+    private int applyUnderstood(CommandTranscriber.Understood u) {
         turnWakeTail = u == null ? 0 : u.wakeTail;
         if (u == null || u.matches.isEmpty()) {
             // The transcript is the only way to tell "misheard" from "not in the catalog".
@@ -1747,9 +2499,47 @@ final class VoiceEngine implements PcmSink {
             }
         }
         matches.addAll(u.matches);
+        understoodText = u.text;
         turnBy = "asr";
         asrHits.incrementAndGet();
         return u.extraWords;
+    }
+
+    /**
+     * Worker: a GTCRN-denoised copy aligned with its input (the model's latency dropped), or the
+     * input itself without a denoiser or on any failure.
+     */
+    private static short[] denoiseCopy(SpeechDenoiser d, short[] pcm) {
+        if (d == null || pcm.length == 0) return pcm;
+        try {
+            d.reset();
+            int latency = Math.max(0, d.latencySamples());
+            int shift = Math.max(1, d.frameShift());
+            short[] out = new short[pcm.length + latency + 2 * shift];
+            short[] buf = new short[4096 + 2 * shift];
+            int have = 0;
+            for (int off = 0; off < pcm.length; off += 4096) {
+                int n = Math.min(4096, pcm.length - off);
+                int m = d.process(pcm, off, n, buf);
+                if (m < 0) return pcm;
+                int keep = Math.min(m, out.length - have);
+                System.arraycopy(buf, 0, out, have, keep);
+                have += keep;
+            }
+            // Flush the model's lookahead with silence.
+            short[] zeros = new short[latency + shift];
+            int m = d.process(zeros, 0, zeros.length, buf);
+            if (m < 0) return pcm;
+            int keep = Math.min(m, out.length - have);
+            System.arraycopy(buf, 0, out, have, keep);
+            have += keep;
+            if (have < latency + pcm.length / 2) return pcm;
+            short[] aligned = new short[pcm.length];
+            System.arraycopy(out, latency, aligned, 0, Math.min(pcm.length, have - latency));
+            return aligned;
+        } catch (Throwable t) {
+            return pcm;
+        }
     }
 
     private void dispatch(LocalCommandSpotter.Match m) {
@@ -1798,7 +2588,8 @@ final class VoiceEngine implements PcmSink {
                 failureKey = VoicePrompts.FAILED;
             }
         }
-        if (localWindowClosed && pendingResults == 0) completeLocalTurn();
+        // A transcript still on the worker decides first; it completes the turn itself.
+        if (localWindowClosed && pendingResults == 0 && asrPending == 0) completeLocalTurn();
     }
 
     private void completeLocalTurn() {
@@ -1858,9 +2649,11 @@ final class VoiceEngine implements PcmSink {
 
     private void openSession() {
         if (session != null) return;
+        if (dry != null && !dry.allowCloud()) throw new IllegalStateException("dry engine opened a cloud session");
         final int gen = ++sessionGeneration;
         sessionStreaming = false;
         sessionLive = false;
+        sessionProvider = "";
         // Today's local rules apply until the daemon names the provider.
         deadline.setProviderEndpoints(false);
         session = VoiceSessionClient.open(app, locale(), channel(), config.uplinkFrameMs,
@@ -1884,15 +2677,115 @@ final class VoiceEngine implements PcmSink {
         followUpUntil = 0;
         cloudStartedAt = now;
         lastCloudActivityAt = now;
+        cloudSilent = false;
         deadline.reset();
         if (replayUtterance) deadline.awaitFrom(now);
         if (session == null) openSession();
         sessionStreaming = true;
+        eosLang = EndOfSpeechHint.languageFor(config.commandLanguage, locale());
+        resetEndpoint();
+        cloudPcmPos = 0;
+        cloudPcmFull = false;
+        if (liveDenoiser != null) {
+            liveDenoiser.reset();
+            liveDenoiseForWake = false;
+        }
+        // Each turn starts half duplex; updateFullDuplex() opens barge-in once the canceller is
+        // measured removing the speakers well enough.
+        fullDuplexTurn = false;
+        session.setFullDuplex(false);
+        updateFullDuplex();
         if (replayUtterance) {
             speechStartAt = 0;
             lastSpeechAt = 0;
-            if (utteranceLen > 0) session.sendPcm16k(utterance, 0, utteranceLen);
+            if (utteranceLen > 0) {
+                session.sendPcm16k(utterance, 0, utteranceLen);
+                rememberCloud(utterance, 0, utteranceLen);
+            }
             overlay.show(VoiceOrbView.STATE_THINKING, overlay.text(R.string.voice_overlay_thinking));
+            // The local window already heard the end of speech: the provider gets it at once.
+            endpoint(now, "replay", 0);
+        }
+    }
+
+    private void resetEndpoint() {
+        endpointSent = false;
+        uplinkGated = false;
+        gatedAtSample = 0;
+        segmentStartedAt = 0;
+    }
+
+    /** The engine, not the provider, ends the user's turn: Gemini (and a provider not named yet). */
+    private boolean engineEndpoints() {
+        return session != null && sessionStreaming && !deadline.providerEndpoints();
+    }
+
+    /**
+     * Hybrid end of speech: the patience's Silero silence ends the turn ("timer"); if the provider's
+     * transcript so far ends unfinished (EndOfSpeechHint) it waits up to the adaptive cap ("adaptive").
+     * Gemini's own VAD is the fallback ("server"); 8 s of speech with no pause (noise) ends it too.
+     */
+    private void checkEndOfSpeech(long now) {
+        long silence = turnSamples - lastSpeechSample;
+        if (silence < SEGMENT_GAP_SAMPLES) {
+            if (segmentStartedAt == 0) {
+                segmentStartedAt = now;
+            } else if (now - segmentStartedAt > CloudDeadline.CONTINUOUS_SPEECH_MS) {
+                endpoint(now, "max_speech", 0);
+            }
+            return;
+        }
+        segmentStartedAt = 0;
+        String patience = config.endOfSpeechPatience;
+        if (silence < (long) VoiceAssistantConfig.patienceMs(patience) * RATE / 1000) return;
+        // Judged once per pause, again only when a newer transcript arrives: no work on most ticks.
+        String text = inputTranscript;
+        if (hintForSample != lastSpeechSample || hintTranscript != text) {
+            hintForSample = lastSpeechSample;
+            hintTranscript = text;
+            hintCls = EndOfSpeechHint.classify(text, eosLang);
+        }
+        if (!EndOfSpeechHint.unfinished(hintCls)) {
+            eosCls = hintCls;
+            endpoint(now, "timer", silence);
+        } else if (silence >= (long) VoiceAssistantConfig.adaptiveCapMs(patience) * RATE / 1000) {
+            eosCls = hintCls;
+            endpoint(now, "adaptive", silence);
+        }
+    }
+
+    /**
+     * Sends the end of the user's speech (Gemini audioStreamEnd), restarts the response deadline
+     * from now and, with Silero, holds the uplink until the next speech.
+     */
+    private void endpoint(long now, String why, long silenceSamples) {
+        endpointSent = true;
+        segmentStartedAt = 0;
+        eosBy = why;
+        eosMs = (int) Math.min(60_000L, Math.max(0L, silenceSamples) * 1000 / RATE);
+        gatedAtSample = turnSamples;
+        if (session != null) session.endOfUserSpeech();
+        deadline.userTurnEnded(now);
+        if (vad != null && "gemini".equals(sessionProvider)) uplinkGated = true;
+        if (speechStartAt != 0 && speechEndAt == 0) speechEndAt = System.currentTimeMillis();
+        if (!thinkingShown && !replySpeaking) {
+            thinkingShown = true;
+            overlay.show(VoiceOrbView.STATE_THINKING, overlay.text(R.string.voice_overlay_thinking));
+        }
+    }
+
+    /** Speech after the end of speech (a pause that was not the end, or a follow-up): a new user segment. */
+    private void reopenUplink() {
+        uplinkGated = false;
+        endpointSent = false;
+        cloudSilent = false;
+        // The client holds its uplink after audioStreamEnd; local speech releases it.
+        if (session != null) session.userSpeechResumed();
+        segmentStartedAt = 0;
+        deadline.userResumed();
+        if (!replySpeaking) {
+            thinkingShown = false;
+            overlay.show(VoiceOrbView.STATE_LISTENING, overlay.text(R.string.voice_overlay_listening));
         }
     }
 
@@ -1905,28 +2798,40 @@ final class VoiceEngine implements PcmSink {
                 turnComplete = false;
                 thinkingShown = false;
                 deadline.reset();
-                lastCloudActivityAt = now;
+                endpointSent = false;
+                segmentStartedAt = 0;
+                        lastCloudActivityAt = now;
             } else if (now > followUpUntil) {
                 closeSession("cloud");
             }
             return;
         }
         boolean userSpoke = speechStartAt > 0;
-        if (userSpoke && !thinkingShown && now - lastSpeechAt > END_OF_SPEECH_MS) {
+        if (engineEndpoints()) {
+            // Without the uplink hold, speech after an end of speech starts the next user segment here.
+            if (endpointSent && !uplinkGated && lastSpeechSample > gatedAtSample) reopenUplink();
+            if (userSpoke && !endpointSent) checkEndOfSpeech(now);
+        } else if (userSpoke && !thinkingShown && now - lastSpeechAt > END_OF_SPEECH_MS) {
             thinkingShown = true;
             deadline.localSpeechEnded(now);
             overlay.show(VoiceOrbView.STATE_THINKING, overlay.text(R.string.voice_overlay_thinking));
         }
-        // Cabin noise can look like endless speech, so 8 s of it also starts the wait (Gemini
-        // only; OpenAI anchors the wait on its own speech_stopped instead).
-        if (userSpoke) deadline.speechContinues(now, speechStartAt);
+        // Cabin noise can look like endless speech, so 8 s of it also starts the wait (OpenAI
+        // anchors on its own speech_stopped; the engine's end of speech covers it for Gemini).
+        if (userSpoke && !engineEndpoints()) deadline.speechContinues(now, speechStartAt);
         if (deadline.timedOut(now)) {
             // Field log 2026-10-11: Gemini answered (reply audio played, turnComplete arrived),
             // the follow-up window re-armed the wait on local "speech" the provider never
             // answered, and 8 s later the answered turn ended as cloud_no_response with the
             // offline prompt. A turn whose reply was heard ends as answered instead.
-            if (turnReplyHeard) {
+            // Also a turn the provider answered by a tool call alone (confirmed with a cue).
+            if (turnReplyHeard || turnAnswered) {
                 closeSession("cloud");
+                return;
+            }
+            // Live, heard our end of speech, then not one event (2026-11-28: overloaded): busy, not "not understood".
+            if (sessionLive && cloudSilent) {
+                cloudUnavailable("cloud_busy");
                 return;
             }
             failures.incrementAndGet();
@@ -1978,12 +2883,18 @@ final class VoiceEngine implements PcmSink {
         sessionStreaming = false;
         sessionLive = false;
         replySpeaking = false;
+        sessionProvider = "";
+        resetEndpoint();
         sessionGeneration++;
         if (s != null) s.close();
     }
 
     /** Ends the cloud turn as a failure; no new clips, so connect failures speak the offline prompt. */
     private void failCloudTurn(String reason) {
+        if ("cloud_busy".equals(reason) || "cloud_quota".equals(reason)) {
+            cloudUnavailable(reason);
+            return;
+        }
         failures.incrementAndGet();
         if ("busy".equals(reason)) {
             noteTurn("busy");
@@ -2006,6 +2917,30 @@ final class VoiceEngine implements PcmSink {
         }
     }
 
+    /**
+     * The provider is overloaded or out of quota: in hybrid a phrase the window matched runs
+     * locally (I7 still holds: the session is closed first), else the service-busy prompt.
+     */
+    private void cloudUnavailable(String outcome) {
+        turnCloudFail = outcome;
+        List<LocalCommandSpotter.Match> local = cloudFallback;
+        cloudFallback = null;
+        if (local != null && !local.isEmpty() && (phase == CLOUD || phase == LOCAL)) {
+            closeSessionQuietly();
+            phase = LOCAL;
+            turnBy = "fallback";
+            for (LocalCommandSpotter.Match m : local) dispatch(m);
+            if (pendingResults == 0) completeLocalTurn();
+            return;
+        }
+        turnCloudFail = null;
+        failures.incrementAndGet();
+        noteTurn(outcome);
+        // The busy clip is new; until it is generated the offline one says the same thing less precisely.
+        String clip = prompts.has(VoicePrompts.SERVICE_BUSY, locale()) ? VoicePrompts.SERVICE_BUSY : VoicePrompts.OFFLINE;
+        finishTurn(VoiceOrbView.STATE_ERROR, R.string.voice_overlay_offline, Earcons.FAILURE, clip);
+    }
+
     private void onSessionEnded(String reason) {
         session = null;
         sessionStreaming = false;
@@ -2015,13 +2950,15 @@ final class VoiceEngine implements PcmSink {
             // A hybrid pre-warm that died is remembered so the replay fails at speech end instead
             // of re-dialling. A busy pre-warm is not: the other session may be gone by then.
             if ("unavailable".equals(reason) || "failed".equals(reason) || "connect_failed".equals(reason)
-                    || "setup_failed".equals(reason)) {
+                    || "setup_failed".equals(reason) || "cloud_busy".equals(reason)
+                    || "cloud_quota".equals(reason)) {
                 preWarmFailed = reason;
             }
             return;
         }
         if ("busy".equals(reason) || "unavailable".equals(reason) || "failed".equals(reason)
-                || "connect_failed".equals(reason) || "setup_failed".equals(reason)) {
+                || "connect_failed".equals(reason) || "setup_failed".equals(reason)
+                || "cloud_busy".equals(reason) || "cloud_quota".equals(reason)) {
             failCloudTurn(reason);
         } else {
             noteTurn("cloud");
@@ -2033,6 +2970,7 @@ final class VoiceEngine implements PcmSink {
     private void onProposal(JSONObject proposal) {
         if (session == null) return;
         String kind = VoiceSessionClient.proposalKind(proposal);
+        turnToolCalls++;
         if ("climate_temperature".equals(kind) || "sunshade".equals(kind)
                 || "run_automation".equals(kind)) {
             session.approveProposal(proposal);
@@ -2087,6 +3025,9 @@ final class VoiceEngine implements PcmSink {
         matches.clear();
         held.clear();
         localWindowClosed = false;
+        asrPending = 0;
+        heldExecuted = null;
+        heldLate = null;
         turnGain = 1f;
         verifyDueAt = -1;
         closeSessionQuietly();
@@ -2161,6 +3102,7 @@ final class VoiceEngine implements PcmSink {
         speechEndAt = 0;
         firstDispatchAt = 0;
         firstReplyAt = 0;
+        resetTurnDiagnostics();
         pauseMs = MediaTurnPolicy.PAUSE_NONE;
         mediaHoldPhase = MEDIA_HOLD_NONE;
         mediaHoldUntilSample = -1;
@@ -2177,11 +3119,7 @@ final class VoiceEngine implements PcmSink {
         briefDeadline = deadline;
         // The cabin audio is held as for a command turn: paused or ducked, our sound kept audible.
         turnMedia = mediaPlayingForTurn(now);
-        if (!cabinDucked) {
-            cabinDuckTurn = MediaTurnPolicy.cabinDuck(cabinDuckAvailable,
-                    c.pauseMediaWhileListening, c.resumeMediaAfterListening);
-            turnChannel = cabinDuckTurn ? duckedChannel() : null;
-        }
+        decideMediaHold(c);
         duck();
         host.onActivity();
         // (a follow-up has no reply mode: hybrid's AI would hear it as the directions question)
@@ -2389,6 +3327,7 @@ final class VoiceEngine implements PcmSink {
 
     /** Up to 6 s (and never past the ask's own timeout); closes at the end of speech like a command window. */
     private void tickBriefWindow(long now) {
+        if (briefAsrPending) return;
         if (!briefWindowOpen) {
             if (now < mutedUntil) return;
             // Whatever was captured while the question and the cue played is not the answer.
@@ -2428,6 +3367,17 @@ final class VoiceEngine implements PcmSink {
         briefWindowOpen = false;
         endBriefSpotting();
         if (speechStartAt != 0 && speechEndAt == 0) speechEndAt = System.currentTimeMillis();
+        // The reply's transcript comes from the worker; the window stays shut until it does.
+        if (requestBriefTranscript(() -> decideBriefWindow(SystemClock.elapsedRealtime(), cut))) {
+            briefAsrPending = true;
+            briefAsrDeadline = now + ASR_TIMEOUT_MS;
+            return;
+        }
+        decideBriefWindow(now, cut);
+    }
+
+    private void decideBriefWindow(long now, boolean cut) {
+        briefAsrPending = false;
         BriefingAnswers.Answer a = hearBrief();
         if (cut && a != null && !isBriefNo(a.answer)) a = null;
         if (a != null) {
@@ -2459,6 +3409,7 @@ final class VoiceEngine implements PcmSink {
         briefHitSpans.clear();
         briefLoudRuns.clear();
         briefHeard = null;
+        briefReplyId++;
         // As a button turn: seeded from the last measured gain, re-measured on the first speech.
         turnGain = micGain;
         turnGainMeasured = false;
@@ -2586,12 +3537,18 @@ final class VoiceEngine implements PcmSink {
         boolean hitsCount = true;
         CommandTranscriber t = transcriber;
         if (t != null && utteranceLen >= RATE / 4 && config.commandSttAllowed(locale())) {
-            float level = speechLevel(utterance, utteranceLen);
-            float gain = Math.max(MIN_GAIN, Math.min(MAX_GAIN, TARGET_SPEECH_RMS / Math.max(level, 1f)));
-            if (gain < 0.91f || gain > 1.1f) applyGain(utterance, 0, utteranceLen, gain, utterance);
-            long started = SystemClock.elapsedRealtime();
-            String text = t.transcript(utterance, 0, utteranceLen);
-            turnAsrMs = (int) (SystemClock.elapsedRealtime() - started);
+            String text;
+            if (briefTextReply == briefReplyId && briefTextLen == utteranceLen) {
+                // The worker already transcribed exactly this reply.
+                text = briefText;
+            } else {
+                // Rare race (the reply changed under a worker transcript): transcribed here as before.
+                normalizeUtterance();
+                long started = SystemClock.elapsedRealtime();
+                text = t.transcript(utterance, 0, utteranceLen);
+                turnAsrMs = (int) (SystemClock.elapsedRealtime() - started);
+                cacheBriefText(briefReplyId, utteranceLen, text);
+            }
             briefLastText = text;
             if (BriefingAnswers.namesPlace(text, brief.destLabel)) briefNamedPlace = true;
             BriefingAnswers.Answer a = BriefingAnswers.fromTranscript(text, brief.apps, brief.destLabel);
@@ -2618,6 +3575,68 @@ final class VoiceEngine implements PcmSink {
         BriefingAnswers.Answer a = BriefingAnswers.fromHits(hits, brief.apps, briefUncoveredMs());
         if (a != null) turnBy = "kws";
         return a;
+    }
+
+    /** The utterance brought to about -17 dBFS in place (the cloud replay keeps that level). */
+    private void normalizeUtterance() {
+        float level = speechLevel(utterance, utteranceLen);
+        float gain = Math.max(MIN_GAIN, Math.min(MAX_GAIN, TARGET_SPEECH_RMS / Math.max(level, 1f)));
+        if (gain < 0.91f || gain > 1.1f) applyGain(utterance, 0, utteranceLen, gain, utterance);
+    }
+
+    private void cacheBriefText(int reply, int len, String text) {
+        briefTextReply = reply;
+        briefTextLen = len;
+        briefText = text;
+    }
+
+    /**
+     * Transcribes the current reply on the worker and runs {@code then} with it cached; false (and
+     * nothing queued) when hearBrief() would not transcribe, so the caller decides at once.
+     */
+    private boolean requestBriefTranscript(Runnable then) {
+        CommandTranscriber t = transcriber;
+        if (speechStartAt == 0 || brief == null || t == null || utteranceLen < RATE / 4
+                || !config.commandSttAllowed(locale())) {
+            return false;
+        }
+        if (briefTextReply == briefReplyId && briefTextLen == utteranceLen) return false;
+        normalizeUtterance();
+        final short[] copy = java.util.Arrays.copyOf(utterance, utteranceLen);
+        final SpeechDenoiser d = config.denoiseSpeech ? asrDenoiser : null;
+        final int at = turn;
+        final int reply = briefReplyId;
+        final int len = utteranceLen;
+        final int request = ++briefThenId;
+        briefThen = then;
+        return worker.submit(StageWorker.KIND_OTHER, q -> {
+            long started = SystemClock.elapsedRealtime();
+            String text = t.transcript(denoiseCopy(d, copy), 0, copy.length);
+            int ms = (int) (SystemClock.elapsedRealtime() - started);
+            post(() -> {
+                if (request == briefThenId) onBriefTranscript(at, reply, len, text, ms, false);
+            });
+        });
+    }
+
+    /** What runs once the latest briefing transcript request is in (engine thread). */
+    private Runnable briefThen;
+    private int briefThenId;
+
+    /** Consumer: a worker transcript of a reply; kept only for the reply it heard, then the waiter runs. */
+    private void onBriefTranscript(int forTurn, int reply, int len, String text, int ms, boolean timedOut) {
+        if (forTurn != turn || phase != BRIEF) return;
+        if (!timedOut) {
+            turnAsrMs = ms;
+            if (reply == briefReplyId && len == utteranceLen) cacheBriefText(reply, len, text);
+        } else {
+            // No transcript in time: the reply is decided as if nothing was transcribed.
+            Log.w(TAG, "briefing speech-to-text did not return in " + ASR_TIMEOUT_MS + " ms");
+            cacheBriefText(briefReplyId, utteranceLen, null);
+        }
+        Runnable then = briefThen;
+        briefThen = null;
+        if (then != null) then.run();
     }
 
     /**
@@ -2675,6 +3694,7 @@ final class VoiceEngine implements PcmSink {
     }
 
     private void openBriefSession(String mode) {
+        if (dry != null && !dry.allowCloud()) throw new IllegalStateException("dry engine opened a cloud session");
         closeBriefSession();
         final int gen = ++briefSessionGen;
         briefAiActivityAt = SystemClock.elapsedRealtime();
@@ -2734,8 +3754,17 @@ final class VoiceEngine implements PcmSink {
         long now = SystemClock.elapsedRealtime();
         briefAiActivityAt = now;
         if (speaking) {
-            // The driver's reply is complete once the AI answers it: read it for a plain "no".
-            if (!briefReplySpeaking && briefAnswer == null && briefHeard == null) briefHeard = hearBrief();
+            // The driver's reply is complete once the AI answers it: read it for a plain "no"
+            // (transcribed on the worker; the later readers fall back to it or decide at once).
+            if (!briefReplySpeaking && briefAnswer == null && briefHeard == null) {
+                final int reply = briefReplyId;
+                Runnable read = () -> {
+                    if (phase == BRIEF && reply == briefReplyId && briefAnswer == null && briefHeard == null) {
+                        briefHeard = hearBrief();
+                    }
+                };
+                if (!requestBriefTranscript(read)) read.run();
+            }
             briefReplySpeaking = true;
             // hybrid's AI asking again counts as asking: the reply to it can then be a yes
             if (briefStep == BRIEF_AI || (briefStep == BRIEF_CLOUD && briefAnswer == null)) briefAiAsked = true;
@@ -2910,6 +3939,10 @@ final class VoiceEngine implements PcmSink {
     private void releaseBrief() {
         brief = null;
         briefSink = null;
+        briefAsrPending = false;
+        briefThen = null;
+        briefTextReply = -1;
+        briefText = null;
         closeBriefSession();
         endBriefSpotting();
         if (briefSpeech != null) {
@@ -3022,12 +4055,12 @@ final class VoiceEngine implements PcmSink {
         enrollSeenId = id;
         long age = System.currentTimeMillis() - c.enrollRequestedAt;
         if (Math.abs(age) > ENROLL_REQUEST_MAX_AGE_MS) {
-            postEnrollEnd(id, null, "expired", false);
+            postEnrollEnd(id, null, "expired", false, null);
             return;
         }
         if (wake == null || spotter == null) {
             noteEnroll(id, "failed", 0, "unavailable");
-            postEnrollEnd(id, null, "unavailable", false);
+            postEnrollEnd(id, null, "unavailable", false, null);
             return;
         }
         long now = SystemClock.elapsedRealtime();
@@ -3038,18 +4071,18 @@ final class VoiceEngine implements PcmSink {
         enrollMusic = c.enrollRequestMusic;
         VoiceAssistantConfig.PersonalVoice prior = VoiceAssistantConfig.findVoice(c.personalVoices, c.enrollRequestVoice);
         enrollPrevious = prior == null ? java.util.Collections.<String>emptyList() : prior.lines;
+        enrollMatchAt = prior == null ? 0L : prior.matchAt;
+        enrollVoice = c.enrollRequestVoice;
+        enrollPriorCutoff = prior != null && prior.model.equals(wake.modelId()) ? prior.cutoff : Double.NaN;
         enrollTakes.clear();
         enrollPeaks.clear();
+        enrollMatchTakes.clear();
         enrollPrompts = 0;
         if (!enrollMusic) startDecoderLoad();
         // Takes are recorded with media held exactly as a command turn holds it, except over music.
         if (!enrollMusic) {
             turnMedia = mediaPlayingForTurn(now);
-            if (!cabinDucked) {
-                cabinDuckTurn = MediaTurnPolicy.cabinDuck(cabinDuckAvailable,
-                        config.pauseMediaWhileListening, config.resumeMediaAfterListening);
-                turnChannel = cabinDuckTurn ? duckedChannel() : null;
-            }
+            decideMediaHold(config);
             duck();
         }
         lastAudioAt = now;
@@ -3083,7 +4116,8 @@ final class VoiceEngine implements PcmSink {
         float p = 0f;
         if (wake != null) {
             wake.process(chunk, 0, n);
-            p = wake.lastChunkPeak();
+            // Reference units: the stored cutoff is rescaled to whichever model loads it.
+            p = wake.toReference(wake.lastChunkPeak());
         }
         if (enrollLen < 0 || muted) return;
         boolean loud = rms > Math.max(noiseFloor * 3f, 150f);
@@ -3130,6 +4164,8 @@ final class VoiceEngine implements PcmSink {
             int end = Math.min(enrollLen, enrollLastLoud + ENROLL_TAIL_SAMPLES);
             enrollTakes.add(java.util.Arrays.copyOf(enrollBuf, end));
             enrollPeaks.add(enrollTakePeak);
+            VoiceMatch.Take t = enrollMatchTake(end);
+            if (t != null) enrollMatchTakes.add(t);
             enrollWaitFrom = now;
         }
         // A click or a cough is not a take: keep listening for the same one, no new chime.
@@ -3147,6 +4183,48 @@ final class VoiceEngine implements PcmSink {
                 overlay.text(R.string.voice_enroll_next, take, WakeEnrollment.TAKES));
         noteEnroll(enrollId, "recording", take, null);
         host.onActivity();
+    }
+
+    /**
+     * The take's stage-1 frames: the detector heard every enrollment chunk, so the take's {@code enrollLen}
+     * samples are its newest frames, less the ones after {@code end}.
+     */
+    private VoiceMatch.Take enrollMatchTake(int end) {
+        if (wake == null) return null;
+        int step = com.overdrive.app.voice.wake.MicroFrontend.SAMPLE_RATE / 100;
+        int frames = Math.min(WakeWordDetector.FEATURE_RING_FRAMES, Math.max(0, (enrollLen - 2 * step) / step));
+        short[] f = new short[frames * com.overdrive.app.voice.wake.MicroFrontend.NUM_CHANNELS];
+        int got = wake.copyFeatures(f, frames);
+        int keep = got - (enrollLen - end) / step;
+        return keep <= 0 ? null : VoiceMatch.Take.of(f, keep, enrollMusic ? VoiceMatch.KIND_MUSIC : VoiceMatch.KIND_QUIET);
+    }
+
+    /**
+     * This training's templates merged with the voice's earlier ones of the other kind, calibrated and
+     * written to the app-private file the voice record will reference; null when too few takes or no threshold.
+     */
+    private VoiceMatch.Saved learnMatch(String voice, long priorAt, List<VoiceMatch.Take> fresh) {
+        if (fresh.size() < WakeEnrollment.MIN_TAKES) return null;
+        VoiceMatch.Saved prior = priorAt > 0 ? readMatch(voice, priorAt) : null;
+        List<VoiceMatch.Take> takes = VoiceMatch.merge(fresh,
+                prior == null ? java.util.Collections.<VoiceMatch.Take>emptyList() : prior.takes);
+        float thr = VoiceMatch.calibrate(takes);
+        if (Float.isNaN(thr)) return null;
+        VoiceMatch.Saved saved = new VoiceMatch.Saved(voice, System.currentTimeMillis(), thr, takes);
+        if (dry != null) return saved;
+        File dir = matchDir();
+        try {
+            if (!dir.isDirectory() && !dir.mkdirs()) return null;
+            File tmp = new File(dir, voice + "-" + saved.at + ".tmp");
+            try (java.io.FileOutputStream out = new java.io.FileOutputStream(tmp)) {
+                out.write(saved.encode());
+                out.getFD().sync();
+            }
+            return tmp.renameTo(new File(dir, voice + "-" + saved.at + ".bin")) ? saved : null;
+        } catch (Exception e) {
+            Log.w(TAG, "voice match save failed: " + e.getMessage());
+            return null;
+        }
     }
 
     private void tickEnroll(long now) {
@@ -3177,13 +4255,26 @@ final class VoiceEngine implements PcmSink {
         final List<short[]> raw = new ArrayList<>(enrollTakes);
         final float[] peaks = new float[enrollTakes.size()];
         for (int i = 0; i < peaks.length; i++) peaks[i] = enrollPeaks.get(i);
+        final String id = enrollId;
+        final String voice = enrollVoice;
+        final long priorAt = enrollMatchAt;
+        final List<VoiceMatch.Take> fresh = new ArrayList<>(enrollMatchTakes);
         if (enrollMusic) {
             WakeEnrollment.Result music = WakeEnrollment.overMusic(enrollPeaks);
             submitMedia(() -> dumpEnrollTakes(raw, peaks, music, true));
-            endEnroll(music, music.reason);
+            if (!music.ok()) {
+                endEnroll(music, music.reason);
+                return;
+            }
+            // The takes over music become this voice's music templates (file I/O off this thread).
+            submitMedia(() -> {
+                VoiceMatch.Saved saved = learnMatch(voice, priorAt, fresh);
+                post(() -> {
+                    if (phase == ENROLL && id.equals(enrollId)) endEnroll(music, null, saved);
+                });
+            });
             return;
         }
-        final String id = enrollId;
         final List<short[]> normed = new ArrayList<>();
         for (int i = 0; i < enrollTakes.size(); i++) {
             short[] pcm = enrollTakes.get(i).clone();
@@ -3195,6 +4286,7 @@ final class VoiceEngine implements PcmSink {
         final LocalCommandSpotter kws = spotter;
         final DecoderLoad load = enrollDecoderLoad;
         final List<String> previous = enrollPrevious;
+        final double priorCutoff = enrollPriorCutoff;
         // Its own thread: the io executor keeps renewing the media duck meanwhile.
         Thread learn = new Thread(() -> {
             WakeEnrollment.Result result = null;
@@ -3220,11 +4312,18 @@ final class VoiceEngine implements PcmSink {
             } finally {
                 if (load != null) load.abandon();
             }
+            // Takes no keyword line hears still teach voice match: saved keeping the voice's earlier lines and cutoff.
+            VoiceMatch.Saved saved = null;
+            if (result != null && (result.ok() || WakeEnrollment.REASON_INCONSISTENT.equals(result.reason))) {
+                saved = learnMatch(voice, priorAt, fresh);
+                if (saved != null && !result.ok()) result = result.voiceMatchOnly(previous, priorCutoff);
+            }
             dumpEnrollTakes(raw, peaks, result, false);
             final WakeEnrollment.Result done = result;
+            final VoiceMatch.Saved match = saved;
             post(() -> {
                 if (phase == ENROLL && id.equals(enrollId)) {
-                    endEnroll(done, done == null ? "unavailable" : done.reason);
+                    endEnroll(done, done == null ? "unavailable" : done.reason, match);
                 }
             });
         }, "VoiceEnrollLearn");
@@ -3294,6 +4393,10 @@ final class VoiceEngine implements PcmSink {
 
     /** Applies and reports a result (or a failure) and returns to listening for the wake word. */
     private void endEnroll(WakeEnrollment.Result result, String reason) {
+        endEnroll(result, reason, null);
+    }
+
+    private void endEnroll(WakeEnrollment.Result result, String reason, VoiceMatch.Saved match) {
         if (phase != ENROLL) return;
         String id = enrollId;
         long now = SystemClock.elapsedRealtime();
@@ -3302,7 +4405,7 @@ final class VoiceEngine implements PcmSink {
             spotter.setPersonalWake(String.join("/", result.lines));
             wake.setCutoffOverride(Double.isNaN(result.cutoff) ? Float.NaN : (float) result.cutoff);
         }
-        postEnrollEnd(id, result, ok ? null : reason, enrollMusic);
+        postEnrollEnd(id, result, ok ? null : reason, enrollMusic, ok ? match : null);
         int text = ok ? R.string.voice_enroll_done
                 : "cancelled".equals(reason) ? R.string.voice_overlay_cancelled : R.string.voice_enroll_failed;
         overlay.finish(ok ? VoiceOrbView.STATE_SUCCESS : VoiceOrbView.STATE_ERROR, overlay.text(text), 2500);
@@ -3311,6 +4414,7 @@ final class VoiceEngine implements PcmSink {
         noteEnroll(id, ok ? "saved" : "failed", enrollTakes.size(), ok ? null : reason);
         enrollTakes.clear();
         enrollPeaks.clear();
+        enrollMatchTakes.clear();
         enrollId = null;
         enrollMusic = false;
         if (enrollDecoderLoad != null) {
@@ -3345,11 +4449,13 @@ final class VoiceEngine implements PcmSink {
     }
 
     /** {@code save} with the learned lines, or {@code fail} with the reason, to the daemon. */
-    private void postEnrollEnd(String id, WakeEnrollment.Result result, String reason, boolean music) {
+    private void postEnrollEnd(String id, WakeEnrollment.Result result, String reason, boolean music,
+                               VoiceMatch.Saved match) {
         if (id == null || id.isEmpty()) return;
         JSONObject body = new JSONObject();
         try {
             body.put("id", id);
+            if (wake != null) body.put("model", wake.modelId());
             if (result != null && result.ok() && music) {
                 body.put("action", "save")
                         .put("mediaCutoff", result.cutoff)
@@ -3371,7 +4477,15 @@ final class VoiceEngine implements PcmSink {
                 for (Float f : result.peaks) peaks.put(round2(f));
                 body.put("decodes", new JSONArray(result.decodes)).put("peaks", peaks);
             }
+            if (match != null) {
+                body.put("match", new JSONObject().put("at", match.at).put("takes", match.takes.size())
+                        .put("thr", Math.round(match.threshold * 1000f) / 1000.0));
+            }
         } catch (Exception e) {
+            return;
+        }
+        if (dry != null) {
+            dry.wouldDo("enroll " + body.optString("action"));
             return;
         }
         submitMedia(() -> {
@@ -3442,6 +4556,11 @@ final class VoiceEngine implements PcmSink {
      * turn is kept as it is.
      */
     private void duck() {
+        if (dry != null) {
+            dry.wouldDo("media_hold " + (cabinDuckTurn ? "cabin_duck" : MediaTurnPolicy.forTurn(audioManager != null,
+                    turnMedia, config.pauseMediaWhileListening)) + " why=" + turnHoldWhy);
+            return;
+        }
         if (cabinDucked) return;
         if (ducked) return;
         if (cabinDuckTurn) {
@@ -3490,6 +4609,23 @@ final class VoiceEngine implements PcmSink {
                 if (available != null) cabinDuckAvailable = available;
             });
         });
+    }
+
+    /**
+     * Cabin duck or pause for the hold about to start, from the media state and the car array's
+     * measured echo health; the reason goes to the turn log. A duck still held keeps its channel.
+     */
+    private void decideMediaHold(VoiceAssistantConfig c) {
+        int echo = echoState;
+        turnEcho = echo;
+        EchoHealth h = echoLast;
+        turnErleDb = h == null ? Float.NaN : h.erleDb;
+        if (!cabinDucked) {
+            cabinDuckTurn = MediaTurnPolicy.cabinDuck(cabinDuckAvailable,
+                    c.pauseMediaWhileListening, c.resumeMediaAfterListening, turnMedia, echo);
+            turnChannel = cabinDuckTurn ? duckedChannel() : null;
+        }
+        turnHoldWhy = MediaTurnPolicy.holdReason(turnMedia, c.pauseMediaWhileListening, cabinDuckTurn, echo);
     }
 
     /** OverDrive's own sound: the configured channel, or the one the cabin duck leaves audible. */
@@ -3665,6 +4801,9 @@ final class VoiceEngine implements PcmSink {
         mediaSessionPlaying = state.playing;
         mediaStateAt = SystemClock.elapsedRealtime();
         mediaActive = MediaTurnPolicy.mediaPlaying(state.source, state.playing, musicActive);
+        // Media with idle references is unhealthy: re-judge the echo state now, not at the next poll.
+        echoPolledAt = 0;
+        pollEcho(mediaStateAt);
         applyWakeCutoff();
     }
 
@@ -3684,14 +4823,21 @@ final class VoiceEngine implements PcmSink {
     private void applyWakeCutoff() {
         if (wake != null) {
             VoiceAssistantConfig c = config;
-            double underMedia = c.wakeCutoffUnderMedia;
-            // High sensitivity lowers the media cutoff by the same step as the normal one.
-            if (VoiceAssistantConfig.SENSITIVITY_HIGH.equals(c.sensitivity)
-                    && underMedia < VoiceAssistantConfig.WAKE_CUTOFF_UNDER_MEDIA_MAX - 1e-6) {
-                underMedia -= WakeWordDetector.HIGH_DELTA;
-            }
-            wake.setMediaCutoff(MediaWakeGate.stage1MediaCutoff(mediaActive, underMedia));
+            double underMedia = highSensitivity(c, c.wakeCutoffUnderMedia);
+            double personal = highSensitivity(c, personalCutoff(c, true));
+            // With a measured-healthy echo canceller the music is removed: no lowering beyond a
+            // voice's own Train-with-music cutoff. Otherwise today's bounded media cutoff.
+            wake.setMediaCutoff(MediaWakeGate.stage1MediaCutoff(mediaActive, underMedia, echoHealthy(), personal));
         }
+    }
+
+    /** High sensitivity lowers a media cutoff by the same step as the normal one. */
+    private static double highSensitivity(VoiceAssistantConfig c, double cutoff) {
+        if (VoiceAssistantConfig.SENSITIVITY_HIGH.equals(c.sensitivity) && !Double.isNaN(cutoff)
+                && cutoff < VoiceAssistantConfig.WAKE_CUTOFF_UNDER_MEDIA_MAX - 1e-6) {
+            return cutoff - WakeWordDetector.HIGH_DELTA;
+        }
+        return cutoff;
     }
 
     /** Stage-1 diagnostics after each fed chunk: near misses under media, last/peak for the status. */
@@ -3749,10 +4895,23 @@ final class VoiceEngine implements PcmSink {
             try { spotter.close(); } catch (Throwable ignored) {}
             spotter = null;
         }
+        if (wakePhones != null) {
+            try { wakePhones.close(); } catch (Throwable ignored) {}
+            wakePhones = null;
+        }
         if (vad != null) {
             try { vad.close(); } catch (Throwable ignored) {}
             vad = null;
         }
+        if (liveDenoiser != null) {
+            try { liveDenoiser.close(); } catch (Throwable ignored) {}
+            liveDenoiser = null;
+        }
+        if (asrDenoiser != null) {
+            try { asrDenoiser.close(); } catch (Throwable ignored) {}
+            asrDenoiser = null;
+        }
+        closeAll(loadedSpeech.getAndSet(null));
         if (transcriber != null) {
             try { transcriber.close(); } catch (Throwable ignored) {}
             transcriber = null;
@@ -3773,6 +4932,15 @@ final class VoiceEngine implements PcmSink {
     }
 
     private JSONObject executeIntent(LocalCommandSpotter.Match m, String uid, String loc) {
+        if (dry != null) {
+            dry.wouldDo("intent " + m.intent + " " + (m.slots == null ? "{}" : m.slots.toString()));
+            try {
+                return new JSONObject().put("ok", true).put("code", "done").put("tier", "dry_run")
+                        .put("message", "dry run");
+            } catch (org.json.JSONException e) {
+                return null;
+            }
+        }
         HttpURLConnection conn = null;
         try {
             JSONObject req = new JSONObject();
@@ -3841,7 +5009,7 @@ final class VoiceEngine implements PcmSink {
     }
 
     private void noteCheck(boolean heard, String by, float level, float gain, int ms, String text,
-                           boolean media) {
+                           boolean media, float peak, float echo, int queuedMs, float tmplD, float tmplThr) {
         try {
             JSONObject check = new JSONObject()
                     .put("at", System.currentTimeMillis())
@@ -3852,7 +5020,15 @@ final class VoiceEngine implements PcmSink {
                     .put("ms", ms);
             if (text != null) check.put("text", text);
             if (media) check.put("media", true);
-            check.put("p", round2(triggerPeak));
+            check.put("p", round2(peak));
+            // Echo likeness of the trigger window (car array under media) and the worker queue wait.
+            if (!Float.isNaN(echo)) check.put("echo", round2(echo));
+            if (queuedMs > 0) check.put("qMs", queuedMs);
+            // Voice match: the best voice's distance (capped) and its threshold.
+            if (!Float.isNaN(tmplD)) {
+                check.put("tmplD", Math.round(Math.min(tmplD, 9.99f) * 1000f) / 1000.0)
+                        .put("tmplThr", Math.round(tmplThr * 1000f) / 1000.0);
+            }
             synchronized (diagLock) {
                 lastCheck = check;
                 if (checkLog.size() >= MAX_QUEUED_CHECKS) {
@@ -3896,6 +5072,26 @@ final class VoiceEngine implements PcmSink {
             String pkg = mediaPaused ? MediaSessionClient.shortPackage(mediaPkg) : null;
             if (pkg != null) t.put("mediaPkg", pkg);
             if (pauseMs != MediaTurnPolicy.PAUSE_NONE) t.put("pauseMs", pauseMs);
+            // Echo health at turn start (car array only), the media decision and why.
+            if (turnEcho != MediaTurnPolicy.ECHO_NONE) {
+                t.put("echo", echoName(turnEcho));
+                if (!Float.isNaN(turnErleDb)) t.put("erleDb", Math.round(turnErleDb));
+            }
+            if (turnHoldWhy != null) t.put("holdWhy", turnHoldWhy);
+            // Cloud end of speech: how, and after how much silence.
+            if (turnCloudFail != null) t.put("cloudFail", turnCloudFail);
+            if (eosBy != null) t.put("eosBy", eosBy);
+            if (eosMs >= 0) t.put("eosMs", eosMs);
+            if (eosCls != null) t.put("eosCls", eosCls);
+            if (fullDuplexTurn) t.put("duplex", true);
+            if (turnInterrupts > 0) t.put("interrupts", turnInterrupts);
+            if (turnInputChars > 0) t.put("inChars", turnInputChars);
+            if (turnToolCalls > 0) t.put("tools", turnToolCalls);
+            // Worker queue wait of the wake check and of the window's speech-to-text; consumer lag.
+            if (turnVerifyQueueMs >= 0) t.put("vqMs", turnVerifyQueueMs);
+            if (turnWakeMs >= 0) t.put("wakeMs", turnWakeMs);
+            if (asrQueueMs >= 0) t.put("asrQMs", asrQueueMs);
+            t.put("lagMs", turnMaxLagSamples * 1000 / RATE);
             if (turnText != null && turnIntents == null) t.put("text", turnText);
             if (turnIntentDetail != null) t.put("intentDetail", turnIntentDetail);
             if (speechEndAt > 0) t.put("speechEndAt", speechEndAt);
@@ -3935,7 +5131,10 @@ final class VoiceEngine implements PcmSink {
         @Override
         public void onConnected(String provider) {
             // OpenAI ends the user's turn itself, so its deadline starts at that report.
-            deliver(() -> deadline.setProviderEndpoints("openai".equals(provider)));
+            deliver(() -> {
+                sessionProvider = provider == null ? "" : provider;
+                deadline.setProviderEndpoints("openai".equals(provider));
+            });
         }
 
         @Override
@@ -3955,7 +5154,17 @@ final class VoiceEngine implements PcmSink {
                 long now = SystemClock.elapsedRealtime();
                 deadline.providerSpeechStopped(now);
                 lastCloudActivityAt = now;
+                // Gemini's own activity end came first: the engine's end of speech follows it.
+                if (phase == CLOUD && engineEndpoints() && !endpointSent && speechStartAt > 0) {
+                    eosCls = EndOfSpeechHint.classify(inputTranscript, eosLang);
+                    endpoint(now, "server", turnSamples - lastSpeechSample);
+                }
             });
+        }
+
+        @Override
+        public void onProviderSilent() {
+            deliver(() -> cloudSilent = true);
         }
 
         @Override
@@ -3977,8 +5186,12 @@ final class VoiceEngine implements PcmSink {
                 if (speaking) {
                     overlay.show(VoiceOrbView.STATE_SPEAKING, overlay.text(R.string.voice_overlay_speaking));
                 } else {
-                    mutedUntil = now + ECHO_TAIL_MS;
-                    ring.skipToLatest();
+                    // Half duplex: the reply's echo tail and what was captured under it are dropped.
+                    // Full duplex keeps them: the canceller removed the reply, the driver may be talking.
+                    if (!fullDuplexTurn) {
+                        mutedUntil = now + ECHO_TAIL_MS;
+                        ring.skipToLatest();
+                    }
                     if (turnComplete) startFollowUp();
                 }
             });
@@ -3987,9 +5200,54 @@ final class VoiceEngine implements PcmSink {
         @Override
         public void onTurnComplete() {
             deliver(() -> {
+                long now = SystemClock.elapsedRealtime();
                 turnComplete = true;
-                lastCloudActivityAt = SystemClock.elapsedRealtime();
+                lastCloudActivityAt = now;
+                // The next user turn gets its own transcript.
+                inputTranscript = null;
+                // A turn answered by a tool call alone (no reply audio) is confirmed with the success
+                // cue and counts as answered, never as cloud_no_response.
+                if (phase == CLOUD && !turnReplyHeard && turnToolCalls > 0 && !turnAnswered) {
+                    turnAnswered = true;
+                    mutedUntil = Math.max(mutedUntil, now + earcons.play(Earcons.SUCCESS, channel()) + 120);
+                    overlay.show(VoiceOrbView.STATE_SUCCESS, overlay.text(R.string.voice_overlay_done));
+                }
+                if (turnReplyHeard) turnAnswered = true;
                 if (!replySpeaking) startFollowUp();
+            });
+        }
+
+        @Override
+        public void onServerInterrupted() {
+            // Barge-in: the client already flushed the reply; local playback state ends with it.
+            deliver(() -> {
+                if (phase != CLOUD) return;
+                replySpeaking = false;
+                turnComplete = false;
+                thinkingShown = false;
+                followUpUntil = 0;
+                turnInterrupts++;
+                deadline.reset();
+                resetEndpoint();
+                lastCloudActivityAt = SystemClock.elapsedRealtime();
+                overlay.show(VoiceOrbView.STATE_LISTENING, overlay.text(R.string.voice_overlay_listening));
+            });
+        }
+
+        @Override
+        public void onInputTranscript(String partial, boolean done) {
+            // The provider heard the driver: the overlay shows the words; only their count is logged.
+            deliver(() -> {
+                if (phase != CLOUD || partial == null) return;
+                String text = partial.trim();
+                if (text.isEmpty()) return;
+                turnInputChars = Math.max(turnInputChars, text.length());
+                inputTranscript = text;
+                lastCloudActivityAt = SystemClock.elapsedRealtime();
+                if (!replySpeaking) {
+                    overlay.show(thinkingShown ? VoiceOrbView.STATE_THINKING : VoiceOrbView.STATE_LISTENING,
+                            text.length() <= 80 ? text : "…" + text.substring(text.length() - 79));
+                }
             });
         }
 
@@ -4002,6 +5260,7 @@ final class VoiceEngine implements PcmSink {
         public void onContextRequest(JSONObject request) {
             deliver(() -> {
                 // The location mode follows the location toggle, every other mode the live-status one.
+                turnToolCalls++;
                 if (session != null) {
                     session.answerContext(request, config.sharesContext(request.optString("mode", "")));
                 }

@@ -20,8 +20,10 @@ import org.json.JSONObject;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.nio.charset.StandardCharsets;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -34,6 +36,8 @@ public final class VoiceAssistantRuntime {
     private static final String TAG = "VoiceAssistant";
     private static final long ACTIVITY_REPORT_MIN_MS = 2000;
     private static final long HEARTBEAT_MS = 5 * 60_000L;
+    /** Live status (engine lag, echo, car mic levels) while the engine runs; never logged by the daemon. */
+    private static final long LIVE_REPORT_MS = 2000;
     // One poll can misread ACC (field missing, mid-transition); a real ACC off is still off next poll.
     private static final long STOP_DEBOUNCE_MS = 5000;
     private static long stopPendingSince;
@@ -54,7 +58,8 @@ public final class VoiceAssistantRuntime {
     private static volatile Handler mainHandler;
 
     private static final Object REPORT_LOCK = new Object();
-    private static ExecutorService reporter;
+    private static ScheduledExecutorService reporter;
+    private static ScheduledFuture<?> liveReports;
     private static String reportedState;
     private static String currentState = "off";
     private static String currentMessage;
@@ -113,6 +118,7 @@ public final class VoiceAssistantRuntime {
                     lastReportAt = SystemClock.elapsedRealtime();
                 }
                 engine.start();
+                startLiveReports();
                 Log.i(TAG, "Voice assistant started (mode=" + cfg.mode + ")");
             } else {
                 engine.updateConfig(cfg);
@@ -345,14 +351,13 @@ public final class VoiceAssistantRuntime {
                 if (aec != null) body.put("aecAvailable", aec);
                 Boolean aecOn = AppAudioCaptureController.echoCancelerEnabled();
                 if (aecOn != null) body.put("aecEnabled", aecOn);
-                int[] channels = AppAudioCaptureController.carArrayChannelsDb();
-                if (channels != null) body.put("arrayChannelsDb", new org.json.JSONArray(channels));
+                putCarArray(body);
                 if (source != null) {
                     JSONObject snap = source.snapshot();
                     body.put("counters", snap.optJSONObject("counters"));
                     if (snap.has("lastWakeAt")) body.put("lastWakeAt", snap.optLong("lastWakeAt"));
                     for (String key : new String[] {"lastVerify", "lastTurn", "mic", "checks", "turns",
-                            "checksDropped", "nearMisses", "stage1", "enroll"}) {
+                            "checksDropped", "nearMisses", "stage1", "enroll", "engine", "echo"}) {
                         Object value = snap.opt(key);
                         if (value != null) body.put(key, value);
                     }
@@ -361,20 +366,78 @@ public final class VoiceAssistantRuntime {
             }
             reportedState = state;
             lastReportAt = SystemClock.elapsedRealtime();
-            if (reporter == null) {
-                reporter = Executors.newSingleThreadExecutor(r -> {
-                    Thread t = new Thread(r, "VoiceReport");
-                    t.setDaemon(true);
-                    return t;
-                });
-            }
-            reporter.execute(() -> post(body));
+            reporterLocked().execute(() -> post(body));
             if (finalReport) {
+                // Cancels the live reports; the final report still goes out.
                 reporter.shutdown();
                 reporter = null;
+                liveReports = null;
                 if ("off".equals(state)) reportedState = null;
             }
         }
+    }
+
+    private static ScheduledExecutorService reporterLocked() {
+        if (reporter == null) {
+            reporter = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "VoiceReport");
+                t.setDaemon(true);
+                return t;
+            });
+        }
+        return reporter;
+    }
+
+    private static void startLiveReports() {
+        synchronized (REPORT_LOCK) {
+            if (liveReports != null) liveReports.cancel(false);
+            liveReports = reporterLocked().scheduleAtFixedRate(VoiceAssistantRuntime::liveReport,
+                    LIVE_REPORT_MS, LIVE_REPORT_MS, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /** On the report thread: fresh lag/echo/levels only; the check, turn and mic logs stay for report(). */
+    private static void liveReport() {
+        VoiceEngine e = engine;
+        if (e == null) return;
+        JSONObject body = new JSONObject();
+        try {
+            synchronized (REPORT_LOCK) {
+                if (e != engine || reportedState == null) return;
+                body.put("state", reportedState);
+            }
+            body.put("live", true);
+            body.put("micSource", AppAudioCaptureController.activeMicSource());
+            putCarArray(body);
+            JSONObject live = e.liveStats();
+            for (String key : new String[] {"engine", "echo"}) {
+                Object value = live.opt(key);
+                if (value != null) body.put(key, value);
+            }
+        } catch (Throwable t) {
+            return;
+        }
+        post(body);
+    }
+
+    /** The car array's raw channel levels and canceller state, when it runs. */
+    private static void putCarArray(JSONObject body) throws org.json.JSONException {
+        int[] channels = AppAudioCaptureController.carArrayChannelsDb();
+        if (channels != null) body.put("arrayChannelsDb", new org.json.JSONArray(channels));
+        com.overdrive.app.audio.EchoHealth echo = AppAudioCaptureController.echoHealth();
+        if (echo == null) return;
+        JSONObject e = new JSONObject();
+        e.put("ref", echo.refActive);
+        e.put("erleDb", Math.round(echo.erleDb));
+        e.put("delayMs", echo.delayMs);
+        if (echo.delayAgeMs >= 0) e.put("delayAgeMs", echo.delayAgeMs);
+        if (!Float.isNaN(echo.echoToNoiseDb)) e.put("enrDb", Math.round(echo.echoToNoiseDb));
+        if (echo.echoBelowNoise) e.put("belowNoise", true);
+        e.put("residualPct", Math.round(echo.residualEchoRatio * 100));
+        e.put("healthy", echo.healthy);
+        e.put("overruns", AppAudioCaptureController.carArrayOverruns());
+        e.put("ageMs", Math.max(0L, SystemClock.elapsedRealtime() - echo.atElapsedMs));
+        body.put("arrayEcho", e);
     }
 
     private static void post(JSONObject body) {

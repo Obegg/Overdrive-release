@@ -4,12 +4,13 @@
   "author": "irshsay",
   "website": "https://github.com/yourname",
   "model": "overdrive.tflite",
+  "model_id": "overdrive-r4-20261128",
   "trained_languages": [
     "en"
   ],
   "version": 2,
   "micro": {
-    "probability_cutoff": 0.45,
+    "probability_cutoff": 0.2,
     "feature_step_size": 10,
     "sliding_window_size": 5,
     "tensor_arena_size": 50000,

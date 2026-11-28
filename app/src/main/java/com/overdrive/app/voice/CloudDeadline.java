@@ -5,8 +5,8 @@ package com.overdrive.app.voice;
  * the per-provider rules are testable without the engine.
  *
  * <p>Gemini has no server-side turn detection the client can see, so the wait starts from the
- * local end-of-speech (or after 8 s of what looks like continuous speech, since cabin noise can
- * read as endless talking). OpenAI reports its own {@code speech_stopped}; anchoring the wait
+ * engine's own end of speech (Silero silence, sent as audioStreamEnd), or after 8 s of what
+ * looks like continuous speech, since cabin noise can read as endless talking. OpenAI reports its own {@code speech_stopped}; anchoring the wait
  * there keeps a long request from being ended as "offline" while the user is still talking.
  */
 final class CloudDeadline {
@@ -54,6 +54,21 @@ final class CloudDeadline {
     void providerSpeechStopped(long now) {
         if (!providerEndpoints) return;
         if (awaitingSince == 0) awaitingSince = now;
+    }
+
+    /**
+     * The engine sent the provider the end of the user's speech (hybrid endpointing): the wait
+     * restarts from this moment, so a long candidate silence is not counted against the provider.
+     */
+    void userTurnEnded(long now) {
+        if (providerEndpoints || responded) return;
+        awaitingSince = now;
+    }
+
+    /** The user spoke again after an end of speech the provider had not answered yet. */
+    void userResumed() {
+        if (providerEndpoints || responded) return;
+        awaitingSince = 0;
     }
 
     /** The provider started its reply: there is nothing left to time out. */

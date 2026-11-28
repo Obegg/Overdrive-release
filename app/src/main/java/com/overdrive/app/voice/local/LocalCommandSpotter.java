@@ -423,7 +423,13 @@ public final class LocalCommandSpotter implements AutoCloseable {
      * the {@code WAKE_} codes. Zero false wakes in 5.4 h of LibriSpeech.
      */
     public synchronized int verifyWake(short[] pcm, int offset, int length) {
-        return verifyWith(pcm, offset, length, wakeKeywords());
+        return verifyWith(pcm, offset, length, wakeKeywords(), null);
+    }
+
+    /** As {@link #verifyWake(short[], int, int)}, stopping with WAKE_NOT_HEARD once {@code cancel} reads true. */
+    public synchronized int verifyWake(short[] pcm, int offset, int length,
+                                       java.util.function.BooleanSupplier cancel) {
+        return verifyWith(pcm, offset, length, wakeKeywords(), cancel);
     }
 
     /**
@@ -479,10 +485,11 @@ public final class LocalCommandSpotter implements AutoCloseable {
     /** {@link #verifyWake} against the given keyword lines only (enrollment cross-checks its takes). */
     public synchronized boolean hearsWake(short[] pcm, int offset, int length, String keywords) {
         return keywords != null && !keywords.isEmpty()
-                && verifyWith(pcm, offset, length, keywords) != WAKE_NOT_HEARD;
+                && verifyWith(pcm, offset, length, keywords, null) != WAKE_NOT_HEARD;
     }
 
-    private int verifyWith(short[] pcm, int offset, int length, String keywords) {
+    private int verifyWith(short[] pcm, int offset, int length, String keywords,
+                           java.util.function.BooleanSupplier cancel) {
         lastWakePersonal = false;
         if (closed || pcm == null || length <= 0 || offset < 0 || offset > pcm.length - length) {
             return WAKE_NOT_HEARD;
@@ -497,6 +504,7 @@ public final class LocalCommandSpotter implements AutoCloseable {
             s.inputFinished();
             boolean reset = false;
             while (spotter.isReady(s)) {
+                if (cancel != null && cancel.getAsBoolean()) return WAKE_NOT_HEARD;
                 spotter.decode(s);
                 KeywordSpotterResult result = spotter.getResult(s);
                 String tag = result.getKeyword();

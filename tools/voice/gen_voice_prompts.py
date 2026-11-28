@@ -89,6 +89,8 @@ def prompts():
     p["status_not_understood"] = ("Sorry, I didn't catch that.", "抱歉，我没听清。")
     p["status_offline"] = ("The AI assistant is unavailable right now.", "智能助手暂时不可用。")
     p["status_busy"] = ("The assistant is busy.", "助手正忙。")
+    p["status_service_busy"] = ("The assistant service is busy right now. Try again in a moment.",
+                                "助手服务现在很忙，请稍后再试。")
     p["brief_cluster_offer"] = ("Show it on the cluster too?", "也在仪表盘上显示吗？")
     return p
 

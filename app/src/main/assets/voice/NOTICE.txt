@@ -6,11 +6,14 @@ TensorFlow Lite Micro audio front-end (ported to Java in voice/wake/MicroFronten
 KISS FFT (fixed-point real FFT, ported in voice/wake/MicroFrontend.java)
   Copyright 2003-2010 Mark Borgerding. BSD-3-Clause.
 
-sherpa-onnx v1.13.8 (lib/arm64-v8a/libsherpa-onnx-jni.so, com.k2fsa.sherpa.onnx Kotlin API)
+sherpa-onnx v2.0.3 (lib/arm64-v8a/libsherpa-onnx-jni.so, com.k2fsa.sherpa.onnx Kotlin API)
   Copyright Xiaomi Corporation and the k2-fsa contributors. Apache License 2.0.
   https://github.com/k2-fsa/sherpa-onnx
+  Built from source by tools/voice/native/build_sherpa.sh with its bundled kaldi-native-fbank,
+  kaldi-native-io, kaldi-hmm-gmm, kaldi-decoder, kaldifst, simple-sentencepiece, OpenFst (Apache
+  License 2.0), KISS FFT (BSD-3-Clause), utf8proc (MIT), nlohmann/json (MIT) and Eigen (MPL 2.0).
 
-ONNX Runtime (statically linked into libsherpa-onnx-jni.so)
+ONNX Runtime 1.28.2, reduced-operator build (statically linked into libsherpa-onnx-jni.so)
   Copyright Microsoft Corporation. MIT License.
 
 Keyword model voice/kws/ (sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20)
@@ -26,6 +29,16 @@ Speech-to-text model voice/asr/moonshine-tiny-en/ (sherpa-onnx-moonshine-tiny-en
 SpeexDSP 1.2.1 echo canceller and preprocessor (lib/arm64-v8a/libvoice_frontend.so)
   Copyright Jean-Marc Valin, Xiph.Org Foundation and contributors. BSD-3-Clause.
   https://github.com/xiph/speexdsp
+WebRTC audio processing (AEC3 incl. its delay estimator, noise suppression, high-pass) from
+webrtc-audio-processing 2.1 (lib/arm64-v8a/libvoice_frontend.so)
+  Copyright The WebRTC project authors. BSD-3-Clause, with the WebRTC patent grant.
+  https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing
+  PFFFT: Copyright Julien Pommier, FFTPACK-derived BSD-style license.
+  Abseil (headers): Copyright The Abseil Authors. Apache-2.0. https://github.com/abseil/abseil-cpp
 Voice activity model voice/vad/silero_vad.onnx (Silero VAD, via the sherpa-onnx "asr-models" release)
   Copyright Silero Team (snakers4/silero-vad). MIT License.
   https://github.com/snakers4/silero-vad
+Speech enhancement model voice/denoise/gtcrn_simple.opt.onnx (GTCRN, via the sherpa-onnx
+  "speech-enhancement-models" release; re-saved by ONNX Runtime, tools/voice/native/optimize_gtcrn.py)
+  Copyright (c) 2024 Rong Xiaobin. MIT License.
+  https://github.com/Xiaobin-Rong/gtcrn

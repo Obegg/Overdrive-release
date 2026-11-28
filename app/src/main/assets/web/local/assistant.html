@@ -1026,6 +1026,8 @@
                                 <div class="ai-runtime-item"><span data-i18n="voice_assistant.local_engine">Local commands</span><strong id="voiceLocalEngine">—</strong></div>
                                 <div class="ai-runtime-item"><span data-i18n="voice_assistant.wakes">Wake-ups</span><strong id="voiceWakes">—</strong></div>
                                 <div class="ai-runtime-item"><span data-i18n="voice_assistant.handled">Commands</span><strong id="voiceHandled">—</strong></div>
+                                <div class="ai-runtime-item" id="voiceEngineItem" hidden><span data-i18n="voice_assistant.engine_health">Audio engine</span><strong id="voiceEngineHealth">—</strong></div>
+                                <div class="ai-runtime-item" id="voiceEchoItem" hidden><span data-i18n="voice_assistant.echo_health">Echo cancelling</span><strong id="voiceEchoHealth">—</strong></div>
                             </div>
                             <div class="ai-inline-note" id="voiceRuntimeNote" hidden></div>
 
@@ -1127,6 +1129,17 @@
                                         <label class="md-label" for="voiceFollowUp" data-i18n="voice_assistant.follow_up">Follow-up window</label>
                                     </div>
                                     <span class="md-supporting" data-i18n="voice_assistant.follow_up_hint">How long OverDrive keeps listening for another command without the wake word.</span>
+                                </div>
+                                <div class="md-field">
+                                    <div class="md-field-box">
+                                        <select class="md-input" id="voicePatience" disabled>
+                                            <option value="quick" data-i18n="voice_assistant.patience_quick">Quick</option>
+                                            <option value="normal" data-i18n="voice_assistant.patience_normal">Normal</option>
+                                            <option value="relaxed" data-i18n="voice_assistant.patience_relaxed">Relaxed</option>
+                                        </select>
+                                        <label class="md-label" for="voicePatience" data-i18n="voice_assistant.patience">Wait before answering</label>
+                                    </div>
+                                    <span class="md-supporting" data-i18n="voice_assistant.patience_hint">How long a pause ends your request. Choose Relaxed if OverDrive answers before you finish.</span>
                                 </div>
                                 <div class="md-field">
                                     <div class="md-field-box">
@@ -1288,7 +1301,7 @@
     <script src="../shared/core.js?v=31"></script>
     <script src="../shared/update-flow.js?v=6"></script>
     <script src="../shared/genai.js?v=19"></script>
-    <script src="../shared/voice-assistant.js?v=11"></script>
+    <script src="../shared/voice-assistant.js?v=12"></script>
     <script src="../shared/trip-briefing.js?v=3"></script>
     <script>
         function toggleSidebar() {
