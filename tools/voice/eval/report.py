@@ -10,7 +10,7 @@ import numpy as np
 
 COND_ORDER = ['quiet', 'road20', 'road10', 'road5', 'road0', 'music_ser+10', 'music_ser0', 'music_ser-10',
               'music_field', 'music_untracked', 'roomir_road15']
-SCENES = ['libri_direct', 'libri_car', 'music', 'talk_radio']
+SCENES = ['libri_direct', 'libri_car', 'music', 'talk_radio', 'car_music']
 
 
 def pct(a, b):
@@ -57,6 +57,11 @@ def summarize(results, bench=None):
             r = S['recall'][fe].setdefault(b['cond'], {'n': 0, 'wake': 0, 'stage1': 0, 'kinds': defaultdict(lambda: [0, 0]),
                                                        'gap_fa': 0, 'gap_hours': 0.0, 'by': defaultdict(int)})
             for u in b['fe'][fe]['utts']:
+                if u.get('group') == 'accented':
+                    # eval-only accented group: reported on its own, kept out of the condition rows
+                    groups[(b['cond'], 'accented')][0] += u['wake']
+                    groups[(b['cond'], 'accented')][1] += 1
+                    continue
                 r['n'] += 1
                 r['wake'] += u['wake']
                 r['stage1'] += u['stage1']
@@ -169,7 +174,7 @@ def render(S):
                                     for k in ('wake', 'wake_cmd_runon', 'wake_cmd_pause')) + ' |')
     w('')
     w('### Recall by voice source (quiet / road10 / music_ser0)\n')
-    keys = ['say', 'piper', 'kokoro', 'en_IN']
+    keys = ['say', 'piper', 'kokoro', 'en_IN', 'accented']
     w('| front-end | ' + ' | '.join(keys) + ' |')
     w('|---|' + '---|' * len(keys))
     for fe in fes:

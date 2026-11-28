@@ -31,6 +31,10 @@ WAKE_TAGS = ('overdrive', 'overdrive_p')
 REFRACTORY_MS, SECOND_CHANCE_MS = 1500, 3000
 MIN_SLICES_BEFORE_DETECTION = 100
 SECOND_CHANCE_BAND, SECOND_CHANCE_DROP = 0.1, 0.05
+CANDIDATE_SETTLE_SLICES, CANDIDATE_MAX_SLICES, CANDIDATE_RISE = 25, 150, 0.10
+CANDIDATE_VERIFY_DELAY_SAMPLES = RATE // 10
+# VoiceEngine.WEAK_CANDIDATE_MIN_LEVEL: a weak candidate quieter than this is dropped unchecked
+WEAK_CANDIDATE_MIN_LEVEL = 58.0
 
 
 def wake_keywords_from_source(repo):
@@ -42,9 +46,14 @@ def wake_keywords_from_source(repo):
 
 
 class WakeDecider:
-    """Port of voice/wake/WakeDecider.java (fire-and-reset mode; candidate mode is not used at 0.45)."""
+    """Port of voice/wake/WakeDecider.java: fire-and-reset, or candidate mode (an enrolled or media cutoff
+    below the model's own: a crossing is reported once its mean stops rising, with that peak)."""
 
-    def __init__(self, window, refractory, second_chance, cutoff):
+    def __init__(self, window, refractory, second_chance, cutoff, candidates=False):
+        self.candidates = candidates
+        self.in_cand = False
+        self.rearm_below = False
+        self.last_cand_peak = 0.0
         self.n = window
         self.vals = [0] * window
         self.idx = 0
@@ -67,6 +76,8 @@ class WakeDecider:
         self.second = 0
         self.in_band = False
         self.tainted = False
+        self.in_cand = False
+        self.rearm_below = False
 
     def reset(self):
         self._clear()
@@ -75,6 +86,24 @@ class WakeDecider:
 
     def above(self, c):
         return self.sum > c * self.n
+
+    def _cand_slice(self, fresh):
+        self.cand_age += 1
+        if fresh and self.smoothed > self.cand_peak:
+            self.cand_peak = self.smoothed
+            self.since_peak = 0
+        else:
+            self.since_peak += 1
+        if self.since_peak < CANDIDATE_SETTLE_SLICES and self.cand_age < CANDIDATE_MAX_SLICES:
+            return False
+        self.in_cand = False
+        self.rearm_below = True
+        self.last_cand_peak = self.cand_peak
+        self.fired_at = self.cand_peak
+        self.second = 0
+        self.in_band = False
+        self.tainted = False
+        return True
 
     def slice(self, fresh, u8):
         if self.refractory > 0:
@@ -90,14 +119,24 @@ class WakeDecider:
             self.smoothed = self.sum / (255.0 * self.n)
         if self.ignore < 0 and self.vals[self.idx] < self.cu8:
             self.ignore += 1
+        if self.in_cand:
+            return self._cand_slice(fresh)
         if not fresh:
             return False
-        blocked = self.ignore < 0 or self.refractory > 0
+        if self.rearm_below and (not self.above(self.cu8) or self.smoothed > self.last_cand_peak + CANDIDATE_RISE):
+            self.rearm_below = False
+        blocked = self.ignore < 0 or self.refractory > 0 or self.rearm_below
         above = self.above(self.lu8 if self.second > 0 else self.cu8)
         if not blocked:
             if self.smoothed > self.peak:
                 self.peak = self.smoothed
             if above:
+                if self.candidates:
+                    self.in_cand = True
+                    self.cand_peak = self.smoothed
+                    self.since_peak = 0
+                    self.cand_age = 0
+                    return False
                 self.fired_at = self.smoothed
                 self._clear()
                 return True
@@ -117,12 +156,18 @@ class WakeDecider:
 class Stage1:
     """Streaming microWakeWord detector (WakeWordDetector + TfliteStreamingModel)."""
 
-    def __init__(self, model_path, manifest_path, cutoff=None):
+    def __init__(self, model_path, manifest_path, cutoff=None, candidates=None):
         from ai_edge_litert.interpreter import Interpreter, OpResolverType
         self._Interpreter, self._resolver = Interpreter, OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES
         self.model_bytes = open(model_path, 'rb').read()
         man = json.load(open(manifest_path))['micro']
-        self.cutoff = float(cutoff if cutoff is not None else man['probability_cutoff'])
+        self.manifest_cutoff = float(man['probability_cutoff'])
+        # OD_CUTOFF (model units): an enrolled or media cutoff; below the model's own it runs candidate mode
+        env = os.environ.get('OD_CUTOFF')
+        self.cutoff = float(cutoff if cutoff is not None else (env if env else self.manifest_cutoff))
+        self.candidates = (self.cutoff < self.manifest_cutoff - 1e-4) if candidates is None else candidates
+        # VoiceEngine's weak trigger: below WakeWordDetector.modelCutoff()
+        self.model_cutoff = self.manifest_cutoff - SECOND_CHANCE_DROP - 0.01
         self.window = int(man.get('sliding_window_size', man.get('sliding_window_average_size', 5)))
         self.step_ms = int(man.get('feature_step_size', 10))
         self._new()
@@ -155,7 +200,7 @@ class Stage1:
         sample before which the engine would not be listening (a turn after an accept), or None."""
         feats = mf.quantize(mf.MicroFrontend().process(pcm), self.divisor, self.zero_point)
         dec = WakeDecider(self.window, round(REFRACTORY_MS / self.step_ms), round(SECOND_CHANCE_MS / self.step_ms),
-                          self.cutoff)
+                          self.cutoff, self.candidates)
         self._new()
         dirty = False
         step, last = 0, 0
@@ -198,7 +243,14 @@ class Stage1:
                     if until is not None and until > chunk_end:
                         paused_until = until
                         continue
-            if fired:
+            if fired and self.candidates:
+                # candidate mode keeps the model running; the check follows the report by 0.1 s
+                if pending is None and resolved_chunk != chunk_end:
+                    due = chunk_end + CANDIDATE_VERIFY_DELAY_SAMPLES
+                    pending = {'fire': chunk_end, 'check': -(-due // ENGINE_CHUNK) * ENGINE_CHUNK,
+                               'peak': round(dec.fired_at, 3), 'weak': dec.fired_at < self.model_cutoff}
+                recent_peak = 0.0
+            elif fired:
                 step, last = 0, 0
                 if dirty:
                     self._new()
@@ -248,6 +300,7 @@ class Stage2:
 
     def __init__(self, repo, use_stt=True, extra_wake_lines=''):
         import sherpa_onnx
+        self.repo = repo
         kws = os.path.join(repo, 'app/src/main/assets/voice/kws')
         self.keywords = wake_keywords_from_source(repo)
         if extra_wake_lines:
@@ -266,12 +319,20 @@ class Stage2:
                 tokens=os.path.join(asr, 'tokens.txt'), num_threads=2)
         self.ms = {'kws': 0.0, 'stt': 0.0}
         self.calls = {'kws': 0, 'stt': 0}
+        # PhoneDecoder.WAKE_MAX_DISTANCE (absent in older trees = no phone step; OD_PHONE_D overrides, <0 = off)
+        self.phone_d = float(os.environ.get('OD_PHONE_D', java_float(repo, PHONE_SRC, 'WAKE_MAX_DISTANCE', -1)))
+        self.phone_d_strong = java_float(repo, PHONE_SRC, 'WAKE_MAX_DISTANCE_STRONG', self.phone_d)
+        self.strong_p = java_float(repo, ENGINE_SRC, 'STRONG_TRIGGER_PEAK', 2.0)
+        # PhoneDecoder matches the core lines only (#0.10)
+        self.lines = [wake_phone_lines(line)[0] for line in self.keywords.split('/') if '#0.10' in line]
+        self.features = os.environ.get('OD_FEATURES') == '1'
+        self._phones = None
 
-    def verify(self, pcm):
+    def verify(self, pcm, keywords=None):
         """Returns the wake word's end (samples), -2 when heard without timestamps, -1 when not heard."""
         t0 = time.perf_counter()
         try:
-            s = self.spotter.create_stream(self.keywords)
+            s = self.spotter.create_stream(keywords or self.keywords)
             s.accept_waveform(RATE, pcm.astype(np.float32) / 32768.0)
             s.accept_waveform(RATE, np.zeros(RATE // 2, dtype=np.float32))
             s.input_finished()
@@ -305,24 +366,132 @@ class Stage2:
             self.ms['stt'] += (time.perf_counter() - t0) * 1000
             self.calls['stt'] += 1
 
-    def check(self, history):
-        """VoiceEngine.checkWake on ``history`` (audio up to the check, any length). Returns (heard, by, text)."""
+    def phones(self, pcm):
+        """PhoneDecoder: free greedy decode with the keyword model's own transducer (features only)."""
+        if self._phones is None:
+            import sherpa_onnx
+            kws = os.path.join(self.repo, 'app/src/main/assets/voice/kws')
+            self._phones = sherpa_onnx.OnlineRecognizer.from_transducer(
+                tokens=os.path.join(kws, 'tokens.txt'), encoder=os.path.join(kws, KWS_ENCODER),
+                decoder=os.path.join(kws, KWS_DECODER), joiner=os.path.join(kws, KWS_JOINER), num_threads=1,
+                sample_rate=RATE, feature_dim=80, decoding_method='greedy_search', model_type='zipformer2')
+        r = self._phones
+        s = r.create_stream()
+        s.accept_waveform(RATE, pcm.astype(np.float32) / 32768.0)
+        s.accept_waveform(RATE, np.zeros(RATE // 2, dtype=np.float32))
+        s.input_finished()
+        while r.is_ready(s):
+            r.decode_stream(s)
+        return [t.strip() for t in r.get_result_all(s).tokens if t.strip()]
+
+    def check(self, history, peak=0.0, media=False, weak=False):
+        """VoiceEngine.verifyOnWorker on ``history`` (audio up to the check, any length): (heard, by, text).
+        KWS, speech-to-text (never under media), the phone decode within phone_d of a wake line, then the
+        1.8 s second look. With OD_FEATURES=1 every variant runs and self.last_features holds them."""
         buf = history[-VERIFY_SAMPLES:]
         if len(buf) == 0:
             return False, None, None
+        if weak and speech_level(buf) < WEAK_CANDIDATE_MIN_LEVEL:
+            return False, None, None
+        # a weak candidate (below the model's own cutoff) is never transcribed
+        media = media or weak
         g = apply_gain(buf, gain_for(buf))
+        short = history[-VERIFY_SHORT_SAMPLES:]
+        gs = apply_gain(short, gain_for(short)) if 0 < len(short) < len(buf) else None
+        if self.features:
+            return self._features(g, gs, peak, media, buf)
         if self.verify(g) != -1:
             return True, 'kws', None
         text = None
-        if self.stt is not None:
+        if self.stt is not None and not media:
             text = self.transcribe(g)
             if says_wake_word(text):
                 return True, 'stt', text
-        short = history[-VERIFY_SHORT_SAMPLES:]
-        if 0 < len(short) < len(buf):
-            if self.verify(apply_gain(short, gain_for(short))) != -1:
-                return True, 'kwsalt', text
+        if self.phone_d >= 0:
+            t = time.perf_counter()
+            ph = self.phones(g)
+            self.ms['kws'] += (time.perf_counter() - t) * 1000
+            d = self.phone_d_strong if peak >= self.strong_p else self.phone_d
+            if min(phone_distance(ph, line) for line in self.lines) <= d + 1e-4:
+                return True, 'ped', text
+        if gs is not None and self.verify(gs) != -1:
+            return True, 'kwsalt', text
         return False, None, text
+
+    def _features(self, g, gs, peak, media, buf):
+        f = {'peak': round(float(peak), 3), 'media': bool(media),
+             'lvl': round(20 * np.log10(max(speech_level(buf), 1.0) / 32768), 1)}
+        t = time.perf_counter()
+        f['k22'] = self.verify(g) != -1
+        f['k22_ms'] = round((time.perf_counter() - t) * 1000, 1)
+        t = time.perf_counter()
+        f['k18'] = gs is not None and self.verify(gs) != -1
+        f['k18_ms'] = round((time.perf_counter() - t) * 1000, 1)
+        for thr in RELAX_SWEEP:
+            f[f'r{int(round(thr * 100)):02d}'] = self.verify(g, relax_lines(self.keywords, thr)) != -1
+        f['r04s'] = gs is not None and self.verify(gs, relax_lines(self.keywords, 0.04)) != -1
+        text = None
+        if self.stt is not None:
+            text = self.transcribe(g)
+            f['stt'] = says_wake_word(text)
+        ph = self.phones(g)
+        f['ped'] = round(min(phone_distance(ph, line) for line in wake_phone_lines(self.keywords)), 3)
+        f['ph'] = ' '.join(ph)[:80]
+        self.last_features = f
+        heard = f['k22'] or (f.get('stt', False) and not media) or f['k18']
+        by = 'kws' if f['k22'] else ('stt' if f.get('stt') and not media else ('kwsalt' if f['k18'] else None))
+        return heard, by, text
+
+
+RELAX_SWEEP = (0.06, 0.04, 0.02)
+
+
+def relax_lines(keywords, thr):
+    """The wake lines with every per-line threshold (#x) set to ``thr``."""
+    return re.sub(r'#[0-9.]+', f'#{thr:g}', keywords)
+
+
+PHONE_SRC = 'app/src/main/java/com/overdrive/app/voice/local/PhoneDecoder.java'
+ENGINE_SRC = 'app/src/main/java/com/overdrive/app/voice/VoiceEngine.java'
+
+
+def java_float(repo, path, name, default):
+    """A float constant from the app's source (default when absent: older trees run as they shipped)."""
+    try:
+        src = open(os.path.join(repo, path)).read()
+    except OSError:
+        return float(default)
+    m = re.search(name + r'\s*=\s*([0-9.]+)f?;', src)
+    return float(m.group(1)) if m else float(default)
+
+
+def wake_phone_lines(keywords):
+    out = []
+    for line in keywords.split('/'):
+        toks = [t for t in line.split() if not t.startswith((':', '#', '@'))]
+        if toks:
+            out.append(toks)
+    return out
+
+
+def phone_distance(decoded, line):
+    """Semi-global edit distance of ``line`` inside ``decoded`` (stress ignored), over the line length."""
+    a = [re.sub(r'\d', '', t) for t in line]
+    b = [re.sub(r'\d', '', t) for t in decoded]
+    if not b:
+        return 1.0
+    prev = list(range(len(a) + 1))
+    best = len(a)
+    # rows over decoded tokens: a free start and end anywhere in the decode
+    col = [0] * (len(b) + 1)
+    d = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+    for i in range(1, len(a) + 1):
+        d[i][0] = i
+        for j in range(1, len(b) + 1):
+            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] != b[j - 1]))
+    best = min(d[len(a)])
+    del prev, col
+    return best / len(a)
 
 
 # ---- WakePhraseMatcher.java ----

@@ -36,7 +36,11 @@ POS_CONDITIONS = {
     'music_field':    dict(snr=10, ser=0, field=True),
     'music_untracked': dict(snr=15, ser=0, untracked=True),
     'roomir_road15':  dict(snr=15, ir='real'),
+    # semi-real double talk: the real car music echo (refs + mics of car/loud.raw4 at the field's levels)
+    # plus the talker through a cabin response
+    'car_doubletalk': dict(car='loud.raw4'),
 }
+MEDIA_SCENES = ('music', 'talk_radio', 'car_music')
 
 G = {}
 
@@ -67,14 +71,17 @@ def load_mono(path):
     return x if x.ndim == 1 else x.mean(axis=1)
 
 
-def run_cascade(pcm, utt_windows=None):
-    """Stage 1 + stage 2 over one processed stream. Returns per-trigger records and timing."""
+def run_cascade(pcm, utt_windows=None, media=False):
+    """Stage 1 + stage 2 over one processed stream. Returns per-trigger records and timing. ``media``: media
+    plays (speech-to-text never runs on a wake trigger, as in VoiceEngine.checkWake)."""
     s1, s2 = G['s1'], G['s2']
     accepted = []
 
     def skip(ev):
-        heard, by, text = s2.check(pcm[:ev['check']])
+        heard, by, text = s2.check(pcm[:ev['check']], peak=ev['peak'], media=media, weak=ev.get('weak', False))
         ev.update(heard=heard, by=by, text=(text or '')[:60])
+        if s2.features:
+            ev['f'] = s2.last_features
         if heard:
             accepted.append(ev)
             return ev['check'] + TURN_SKIP
@@ -98,7 +105,7 @@ def positive_mix(data, c, utts, seed, noise_bank, music_bank):
     rng = np.random.default_rng(seed)
     irs = cs.IRBank(data, seed)
     talker = irs.talker('driver', c.get('ir', 'cabin'))
-    lead = 8 * RATE if 'ser' in c else 3 * RATE
+    lead = 8 * RATE if ('ser' in c or 'car' in c) else 3 * RATE
     layout, pos = [], lead
     clips = []
     for u in utts:
@@ -108,6 +115,8 @@ def positive_mix(data, c, utts, seed, noise_bank, music_bank):
         pos += len(x) + int(rng.uniform(6.5, 8.0) * RATE)  # > TURN_SKIP after a late accept
     n = pos
     speech = [(x, p) for x, (p, _) in zip(clips, layout)]
+    if c.get('car'):
+        return car_doubletalk_mix(data, c, rng, n, speech, talker, layout)
     level = float(rng.uniform(-36, -28))
     kw = dict(speech=speech, talker_ir=talker, speech_dbfs=level)
     noise, nsrc = noise_bank.get(rng, n, c.get('noise', 'car'))
@@ -144,22 +153,59 @@ def positive_mix(data, c, utts, seed, noise_bank, music_bank):
     return x4, layout, info
 
 
+def car_loop(data, name, rng, n, mic_db, ref_db):
+    """A real 4-channel car capture looped from a random offset to n samples, mics and refs scaled so their
+    active levels read mic_db / ref_db (the echo path stays the measured one)."""
+    x = cs.read4(os.path.join(data, 'car', name)).astype(np.float64) / 32768
+    off = int(rng.integers(0, len(x)))
+    idx = (off + np.arange(n)) % len(x)
+    y = x[idx]
+    for ch, target in ((slice(0, 2), mic_db), (slice(2, 4), ref_db)):
+        p = cs.active_power(y[:, ch.start]) + 1e-20
+        y[:, ch] *= cs.db(target) / np.sqrt(p)
+    return y
+
+
+def car_doubletalk_mix(data, c, rng, n, speech, talker, layout):
+    """Talker (cabin response) over the real car music echo at the field's levels: mics -38..-34 dBFS of
+    music, refs -32..-26, speech -40..-32 dBFS active at the mics (SER about -6..+6 dB)."""
+    mic_db, ref_db = float(rng.uniform(-38, -34)), float(rng.uniform(-32, -26))
+    level = float(rng.uniform(-40, -32))
+    sp4, mi = cs.mix(rng, n, speech=speech, talker_ir=talker, speech_dbfs=level)
+    car = car_loop(data, c['car'], rng, n, mic_db, ref_db)
+    x = car.copy()
+    x[:, :2] += sp4[:, :2].astype(np.float64) / 32768
+    x4 = np.clip(np.round(x * 32767), -32768, 32767).astype(np.int16)
+    info = {'speech_dbfs': level, 'car_mic_dbfs': mic_db, 'car_ref_dbfs': ref_db, 'ser_db': level - mic_db,
+            'capture': c['car']}
+    return x4, layout, info
+
+
 def positives_block(task):
     cond, block, utts, seed = task['cond'], task['block'], task['utts'], task['seed']
     x4, layout, info = positive_mix(G['data'], POS_CONDITIONS[cond], utts, seed, G['noise'], G['music'])
     n = len(x4)
     out = {'scene': 'positives', 'cond': cond, 'block': block, 'seconds': n / RATE, 'info': info, 'fe': {}}
+    cond_c = POS_CONDITIONS[cond]
+    media = cond_c.get('ser') is not None or bool(cond_c.get('car'))
     for fe in G['fes']:
         mono, fe_s, _ = fe.run(x4)
-        events, timing = run_cascade(mono)
+        events, timing = run_cascade(mono, media=media)
         res_utts = []
         for u, (p, ln) in zip(utts, layout):
             a, b = p + u['speech_start'], p + u['speech_end']
             s1_hit = any(a - RATE // 4 <= e['fire'] <= b + RATE // 2 for e in events)
             acc = [e for e in events if e['heard'] and a <= e['check'] <= b + int(1.6 * RATE)]
             r = {'id': u['path'], 'kind': u['kind'], 'engine': u['engine'].split(':')[0], 'accent': u['accent'],
+                 'group': u.get('group', u['engine'].split(':')[0]),
                  'stage1': bool(s1_hit), 'wake': bool(acc), 'by': acc[0]['by'] if acc else None,
                  'latency_ms': int((acc[0]['check'] - b) * 1000 / RATE) if acc else None}
+            if G['s2'].features:
+                r['ev'] = [e['f'] for e in events if 'f' in e and a <= e['check'] <= b + int(1.6 * RATE)]
+            if mono is not None:
+                # processed speech level of the utterance (near-end suppression check)
+                seg = mono[a:b].astype(np.float64)
+                r['out_dbfs'] = round(10 * np.log10(cs.active_power(seg / 32768) + 1e-12), 1) if len(seg) else None
             if u['kind'] != 'wake':
                 seg = mono[p:min(len(mono), b + 3 * RATE)]
                 from cascade import apply_gain, gain_for
@@ -183,6 +229,11 @@ def negative_mix(data, scene, seed, seconds, files, noise_bank, music_bank):
     n = int(seconds * RATE)
     info = {}
     pcm = None
+    if scene == 'car_music':
+        # the real car music echo at the field's levels, no talker
+        y = car_loop(data, 'loud.raw4', rng, n, float(rng.uniform(-38, -30)), float(rng.uniform(-32, -24)))
+        x4 = np.clip(np.round(y * 32767), -32768, 32767).astype(np.int16)
+        return x4, None, {'capture': 'loud.raw4'}, n
     if scene in ('libri_direct', 'libri_car', 'talk_radio'):
         pcm, pos = np.zeros(n), 0
         for f in files:
@@ -238,7 +289,7 @@ def stream_block(task):
         if scene == 'erle':
             out['fe'][fe.name] = {'fe_s': fe_s, **erle(x4, mono)}
             continue
-        events, timing = run_cascade(mono)
+        events, timing = run_cascade(mono, media=scene in MEDIA_SCENES)
         out['fe'][fe.name] = summarize(events, timing, fe_s, mono)
     return out
 
@@ -260,7 +311,8 @@ def summarize(events, timing, fe_s, mono):
     acc = [e for e in events if e['heard']]
     return {'triggers': len(events), 'false_accepts': len(acc), 'fa_by': [e['by'] for e in acc],
             'fa_text': [e['text'] for e in acc][:10], 'trigger_peaks': [e['peak'] for e in events][:2000],
-            'trigger_checks': [int(e['check']) for e in events][:2000], 'fe_s': fe_s, **timing}
+            'trigger_checks': [int(e['check']) for e in events][:2000], 'fe_s': fe_s,
+            'trigger_feats': [e['f'] for e in events if 'f' in e][:2000], **timing}
 
 
 def run_task(task):
@@ -277,6 +329,11 @@ def plan(a):
     pos = [m for m in man if m['split'] == 'eval' and m['kind'] in ('wake', 'wake_cmd_runon', 'wake_cmd_pause')]
     rng.shuffle(pos)
     pos = pos[:a.positives]
+    if a.accented:
+        # eval-only accented group (gen_accented.py), appended as its own blocks
+        acc = [dict(json.loads(line), group='accented')
+               for line in open(os.path.join(a.data, 'tts', 'accented_manifest.jsonl'))]
+        pos = pos + acc
     # seeds hang off each condition's/scene's fixed index, so any subset reproduces the same mixes
     for ci, cond in enumerate(POS_CONDITIONS):
         if a.conditions and cond not in a.conditions.split(','):
@@ -286,7 +343,7 @@ def plan(a):
                           'seed': a.seed * 1000 + ci * 100 + b // BLOCK_UTTS})
     block_s = 600.0
     clean, other = libri_files(a.data, 'test-clean'), libri_files(a.data, 'test-other')
-    for si, scene in enumerate(('libri_direct', 'libri_car', 'music', 'talk_radio', 'erle')):
+    for si, scene in enumerate(('libri_direct', 'libri_car', 'music', 'talk_radio', 'erle', 'car_music')):
         if a.scenes and scene not in a.scenes.split(','):
             continue
         hours = {'libri_direct': a.libri_hours, 'erle': 0.05}.get(scene, a.fa_hours)
@@ -313,6 +370,7 @@ def main():
     ap.add_argument('--libri-hours', type=float, default=5.4)
     ap.add_argument('--fa-hours', type=float, default=1.0, help='hours each of libri_car / music / talk_radio')
     ap.add_argument('--no-stt', action='store_true')
+    ap.add_argument('--accented', action='store_true', help='add the accented eval group (gen_accented.py)')
     ap.add_argument('--no-smart-turn', action='store_true')
     ap.add_argument('--jobs', type=int, default=4)
     ap.add_argument('--seed', type=int, default=7)
