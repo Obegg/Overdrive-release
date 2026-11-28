@@ -4,10 +4,8 @@ import com.overdrive.app.automation.AutomationAction;
 import com.overdrive.app.automation.AutomationCondition;
 import com.overdrive.app.automation.Automations;
 import com.overdrive.app.automation.condition.EventData;
-import com.overdrive.app.automation.type.DynamicIntType;
 import com.overdrive.app.automation.type.EnumType;
 import com.overdrive.app.automation.type.IntType;
-import com.overdrive.app.automation.type.SignalAddressType;
 import com.overdrive.app.automation.value.IntValue;
 import com.overdrive.app.automation.value.Label;
 
@@ -47,38 +45,28 @@ public class LoopAction extends DeclaredAction {
                 // LHS = an ADDRESS into the shared condition catalog (all ~58 conditions,
                 // attributed ones included) instead of a hardcoded signal list. Legacy stored
                 // ids still resolve — see AutomationCondition.resolveSignalAddress.
-                new SignalAddressType(new Label("event", "automation.wait_signal")),
+                FlowActionSupport.signalField(),
                 IntValue.COMPARATORS,
-                new DynamicIntType(new Label("value", "automation.value"), -540, 1000)));
+                FlowActionSupport.comparisonField()));
     }
 
     /** This action carries a nested loop-body action list. */
     @Override public boolean hasChildActions() { return true; }
 
-    /**
-     * Resolve the stored LHS address to the state key it names. Delegates to
-     * {@link AutomationCondition#resolveSignalAddress}, the single home of the address
-     * grammar (shared with the condition RHS), so this action covers the whole condition
-     * catalog — attributed signals included — with no local mapping table, and the
-     * pre-catalog ids saved automations still hold resolve to the same signals as before.
-     */
-    private static EventData resolveEvent(String id) {
-        return AutomationCondition.resolveSignalAddress(id);
-    }
-
     public void trigger(AutomationAction automationAction) {
         Map<String, Object> vars = automationAction.getVariables();
-        String mode = str(vars.get("mode"));
+        String mode = FlowActionSupport.str(vars.get("mode"));
         if (mode == null) mode = "count";
         List<AutomationAction> body = automationAction.getChildActions();
         if (body.isEmpty()) return; // nothing to loop
 
-        int cap = clamp(toInt(vars.get("count"), 1), 1, MAX_ITERATIONS);
+        int cap = clamp(FlowActionSupport.toInt(vars.get("count"), 1), 1, MAX_ITERATIONS);
         // while/until condition parts (ignored in count mode). The RHS `value` may be a
         // constant OR a dynamic ${var:…}/${signal:…} token — kept raw and evaluated
         // through the shared condition path each iteration.
-        EventData event = resolveEvent(str(vars.get("event")));
-        String comparator = str(vars.get("comparator"));
+        EventData event = AutomationCondition.resolveSignalAddress(
+                FlowActionSupport.str(vars.get("event")));
+        String comparator = FlowActionSupport.str(vars.get("comparator"));
         Object target = vars.get("value");
         boolean condMode = "while".equals(mode) || "until".equals(mode);
         if (condMode && (event == null || comparator == null || target == null)) {
@@ -125,11 +113,4 @@ public class LoopAction extends DeclaredAction {
     }
 
     private static int clamp(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
-    private static String str(Object o) { return o == null ? null : o.toString(); }
-
-    private static int toInt(Object o, int def) {
-        if (o == null) return def;
-        if (o instanceof Number) return ((Number) o).intValue();
-        try { return Integer.parseInt(o.toString().trim()); } catch (Exception e) { return def; }
-    }
 }

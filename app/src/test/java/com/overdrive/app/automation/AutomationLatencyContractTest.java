@@ -29,6 +29,7 @@ public class AutomationLatencyContractTest {
         String pause = source("automation/action/PauseAction.java");
         String wait = source("automation/action/WaitUntilAction.java");
         String waitState = source("automation/action/WaitUntilStateAction.java");
+        String flow = source("automation/action/FlowActionSupport.java");
 
         assertTrue(automations.contains("!queuedYieldAllowed()"));
         assertTrue(automations.contains("commitQueuedYield(cursor, action, actionCompleted);"));
@@ -36,9 +37,11 @@ public class AutomationLatencyContractTest {
         assertTrue(queue.contains("item.startTime = Math.max(System.nanoTime(), resumeAtNanos)"));
         assertTrue(pause.indexOf("if (Automations.deferQueuedAction")
                 < pause.indexOf("Thread.sleep(ms)"));
-        assertTrue(wait.contains("queuedWaitDeadlineNanos"));
-        assertTrue(wait.contains("deferQueuedAction(automationAction, pollMs, false)"));
-        assertTrue(waitState.contains("deferQueuedAction(automationAction, pollMs, false)"));
+        assertTrue(wait.contains("FlowActionSupport.awaitCondition(automationAction"));
+        assertTrue(waitState.contains("FlowActionSupport.awaitCondition(automationAction"));
+        assertTrue(flow.contains("queuedWaitDeadlineNanos(action, timeoutS * 1000L)"));
+        assertTrue(flow.contains("deferQueuedAction(action, pollMs, false)"));
+        assertTrue(flow.indexOf("Automations.deferQueuedAction") < flow.indexOf("Thread.sleep(pollMs)"));
     }
 
     @Test

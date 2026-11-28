@@ -4,8 +4,6 @@ import com.overdrive.app.automation.AutomationAction;
 import com.overdrive.app.automation.AutomationCondition;
 import com.overdrive.app.automation.Automations;
 import com.overdrive.app.automation.condition.EventData;
-import com.overdrive.app.automation.type.DynamicIntType;
-import com.overdrive.app.automation.type.SignalAddressType;
 import com.overdrive.app.automation.type.StringType;
 import com.overdrive.app.automation.value.IntValue;
 import com.overdrive.app.automation.value.Label;
@@ -51,9 +49,9 @@ public class IfAction extends DeclaredAction {
                 // seat or light) instead of the 9 signals this action used to hardcode. The
                 // legacy ids remain readable — see AutomationCondition.resolveSignalAddress.
                 // "variable" still addresses a user variable via the bespoke "name" field.
-                new SignalAddressType(new Label("event", "automation.wait_signal")),
+                FlowActionSupport.signalField(),
                 IntValue.COMPARATORS,
-                new DynamicIntType(new Label("value", "automation.value"), -540, 1000)));
+                FlowActionSupport.comparisonField()));
     }
 
     /** Carries then/else nested action lists. */
@@ -126,9 +124,9 @@ public class IfAction extends DeclaredAction {
 
     public void trigger(AutomationAction automationAction) {
         Map<String, Object> vars = automationAction.getVariables();
-        String eventId = str(vars.get("event"));
-        EventData event = resolveEvent(eventId, str(vars.get("name")));
-        String comparator = str(vars.get("comparator"));
+        String eventId = FlowActionSupport.str(vars.get("event"));
+        EventData event = resolveEvent(eventId, FlowActionSupport.str(vars.get("name")));
+        String comparator = FlowActionSupport.str(vars.get("comparator"));
         Object target = vars.get("value");   // constant (Integer/String) OR ${var:…}/${signal:…}
         if (event == null || comparator == null || target == null) {
             logger.warn("IfAction: missing/invalid condition — skipping (running nothing)");
@@ -151,6 +149,4 @@ public class IfAction extends DeclaredAction {
         if (Automations.queuedDeferralPending()) return;
         logger.info("IfAction: " + event.getType() + " " + comparator + " " + target + " → " + (held ? "then" : "else"));
     }
-
-    private static String str(Object o) { return o == null ? null : o.toString(); }
 }
