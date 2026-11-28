@@ -64,9 +64,6 @@ class ZrokLauncher(
         // Unique name file - stores the generated unique name
         private val ZROK_UNIQUE_NAME_FILE: String get() = com.overdrive.app.util.ScratchRoot.path(".zrok/unique_name")
         
-        // Process name for identification
-        private const val ZROK_PROCESS = "zrok"
-        
         // Default enable token - can be overridden via setEnableToken()
         // This is loaded from unified storage at runtime
         var zrokToken: String = ""
