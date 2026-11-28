@@ -53,6 +53,22 @@ final class VoiceEngine implements PcmSink {
         void onStatus(String state, String message);
 
         void onActivity();
+
+        /** Test hook for the debug harness: non-null runs the engine dry. The app's own host keeps null. */
+        default DryRun dryRun() {
+            return null;
+        }
+    }
+
+    /**
+     * A dry engine actuates nothing: no intent reaches the daemon, no media is held, ducked or paused,
+     * no cue or prompt sounds, the mic is never attached and no enrollment is saved; each is recorded.
+     */
+    interface DryRun {
+        /** Cloud sessions may open; their tool calls then run in the daemon for real. Otherwise turns stay local. */
+        boolean allowCloud();
+
+        void wouldDo(String action);
     }
 
     private static final String TAG = "VoiceEngine";
@@ -103,6 +119,8 @@ final class VoiceEngine implements PcmSink {
     private final VoiceOverlay overlay;
     private final Earcons earcons = new Earcons();
     private final VoicePrompts prompts;
+    /** Debug harness only (see {@link DryRun}); null in the app. */
+    private final DryRun dry;
     private final java.util.ArrayDeque<String> promptQueue = new java.util.ArrayDeque<>();
     // Room for a slow stage-2 check on a loaded head unit without dropping post-wake audio.
     private final PcmRing ring = new PcmRing(RATE * 8);
@@ -603,10 +621,15 @@ final class VoiceEngine implements PcmSink {
 
     VoiceEngine(Context context, VoiceAssistantConfig config, Host host) {
         this.app = context.getApplicationContext();
-        this.config = config;
         this.host = host;
+        this.dry = host.dryRun();
+        this.config = dryConfig(config);
         this.overlay = new VoiceOverlay(app);
         this.prompts = new VoicePrompts(app);
+        if (dry != null) {
+            prompts.silence();
+            earcons.silence();
+        }
         this.audioManager = (AudioManager) app.getSystemService(Context.AUDIO_SERVICE);
         this.io = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "VoiceIO");
@@ -624,7 +647,18 @@ final class VoiceEngine implements PcmSink {
         thread.start();
     }
 
-    void updateConfig(VoiceAssistantConfig cfg) {
+    /** A dry engine without cloud runs every turn locally. */
+    private VoiceAssistantConfig dryConfig(VoiceAssistantConfig cfg) {
+        if (dry == null || dry.allowCloud() || VoiceAssistantConfig.MODE_LOCAL.equals(cfg.mode)) return cfg;
+        try {
+            return VoiceAssistantConfig.from(cfg.toJson().put("mode", VoiceAssistantConfig.MODE_LOCAL));
+        } catch (org.json.JSONException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    void updateConfig(VoiceAssistantConfig next) {
+        VoiceAssistantConfig cfg = dryConfig(next);
         VoiceAssistantConfig old = config;
         config = cfg;
         if (!cfg.sameRuntimeShape(old)) post(() -> applyConfig(cfg));
@@ -735,6 +769,14 @@ final class VoiceEngine implements PcmSink {
         return out;
     }
 
+    /** Engine and echo-gate status only (the live report every 2 s); drains no check or turn logs. */
+    JSONObject liveStats() throws org.json.JSONException {
+        JSONObject out = new JSONObject().put("engine", engineStats());
+        JSONObject echo = echoStats();
+        if (echo != null) out.put("echo", echo);
+        return out;
+    }
+
     /** Consumer lag now and at most since the last report, ring drops per minute, worker load. */
     private synchronized JSONObject engineStats() throws org.json.JSONException {
         long now = SystemClock.elapsedRealtime();
@@ -765,17 +807,11 @@ final class VoiceEngine implements PcmSink {
         if (state == MediaTurnPolicy.ECHO_NONE) return null;
         EchoHealth h = echoLast;
         JSONObject e = new JSONObject().put("state", echoName(state));
-    /** Engine and echo-gate status only (the live report every 2 s); drains no check or turn logs. */
-    JSONObject liveStats() throws org.json.JSONException {
-        JSONObject out = new JSONObject().put("engine", engineStats());
-        JSONObject echo = echoStats();
-        if (echo != null) out.put("echo", echo);
-        return out;
-    }
-
         if (h != null) {
             if (!Float.isNaN(h.erleDb)) e.put("erleDb", Math.round(h.erleDb));
             e.put("delayMs", h.delayMs).put("refActive", h.refActive);
+            if (h.delayAgeMs >= 0) e.put("delayAgeMs", h.delayAgeMs);
+            if (h.echoBelowNoise) e.put("belowNoise", true);
         }
         return e;
     }
@@ -806,8 +842,6 @@ final class VoiceEngine implements PcmSink {
         LockSupport.unpark(thread);
         boolean onEngineThread = Thread.currentThread() == thread;
         if (!onEngineThread) {
-            if (h.delayAgeMs >= 0) e.put("delayAgeMs", h.delayAgeMs);
-            if (h.echoBelowNoise) e.put("belowNoise", true);
             try {
                 thread.join(800);
             } catch (InterruptedException e) {
@@ -845,8 +879,29 @@ final class VoiceEngine implements PcmSink {
         ring.write(capOut, 0, m);
     }
 
+    /** The car array's samples, without the byte round trip. */
+    @Override
+    public void onPcm16(short[] pcm, int samples, int sampleRate) {
+        if (!running) return;
+        if (sampleRate == RATE) {
+            write16k(pcm, samples);
+            return;
+        }
+        PcmSink.super.onPcm16(pcm, samples, sampleRate);
+    }
+
+    private void write16k(short[] pcm, int n) {
+        ring.write(pcm, 0, n);
+        // The car array delivers 16 kHz: ring positions map to its sample clock (echo likeness).
+        long clock = AppAudioCaptureController.sampleClock();
+        clockValid = clock > 0;
+        if (clock > 0) clockOffset = clock - ring.writtenSamples();
+    }
+
     private boolean captureOn() {
         synchronized (captureLock) {
+            // A dry engine hears only what its harness feeds it.
+            if (dry != null) return running;
             return running && AppAudioCaptureController.setWakeSink(this);
         }
     }
@@ -885,25 +940,6 @@ final class VoiceEngine implements PcmSink {
             short[] chunk = new short[1024];
             while (running) {
                 Runnable r;
-    /** The car array's samples, without the byte round trip. */
-    @Override
-    public void onPcm16(short[] pcm, int samples, int sampleRate) {
-        if (!running) return;
-        if (sampleRate == RATE) {
-            write16k(pcm, samples);
-            return;
-        }
-        PcmSink.super.onPcm16(pcm, samples, sampleRate);
-    }
-
-    private void write16k(short[] pcm, int n) {
-        ring.write(pcm, 0, n);
-        // The car array delivers 16 kHz: ring positions map to its sample clock (echo likeness).
-        long clock = AppAudioCaptureController.sampleClock();
-        clockValid = clock > 0;
-        if (clock > 0) clockOffset = clock - ring.writtenSamples();
-    }
-
                 while (running && (r = events.poll()) != null) r.run();
                 if (!running) break;
                 int n = ring.read(chunk, 0, chunk.length);
@@ -2456,6 +2492,7 @@ final class VoiceEngine implements PcmSink {
 
     private void openSession() {
         if (session != null) return;
+        if (dry != null && !dry.allowCloud()) throw new IllegalStateException("dry engine opened a cloud session");
         final int gen = ++sessionGeneration;
         sessionStreaming = false;
         sessionLive = false;
@@ -3463,6 +3500,7 @@ final class VoiceEngine implements PcmSink {
     }
 
     private void openBriefSession(String mode) {
+        if (dry != null && !dry.allowCloud()) throw new IllegalStateException("dry engine opened a cloud session");
         closeBriefSession();
         final int gen = ++briefSessionGen;
         briefAiActivityAt = SystemClock.elapsedRealtime();
@@ -4173,6 +4211,10 @@ final class VoiceEngine implements PcmSink {
         } catch (Exception e) {
             return;
         }
+        if (dry != null) {
+            dry.wouldDo("enroll " + body.optString("action"));
+            return;
+        }
         submitMedia(() -> {
             HttpURLConnection conn = null;
             try {
@@ -4241,6 +4283,11 @@ final class VoiceEngine implements PcmSink {
      * turn is kept as it is.
      */
     private void duck() {
+        if (dry != null) {
+            dry.wouldDo("media_hold " + (cabinDuckTurn ? "cabin_duck" : MediaTurnPolicy.forTurn(audioManager != null,
+                    turnMedia, config.pauseMediaWhileListening)) + " why=" + turnHoldWhy);
+            return;
+        }
         if (cabinDucked) return;
         if (ducked) return;
         if (cabinDuckTurn) {
@@ -4608,6 +4655,15 @@ final class VoiceEngine implements PcmSink {
     }
 
     private JSONObject executeIntent(LocalCommandSpotter.Match m, String uid, String loc) {
+        if (dry != null) {
+            dry.wouldDo("intent " + m.intent + " " + (m.slots == null ? "{}" : m.slots.toString()));
+            try {
+                return new JSONObject().put("ok", true).put("code", "done").put("tier", "dry_run")
+                        .put("message", "dry run");
+            } catch (org.json.JSONException e) {
+                return null;
+            }
+        }
         HttpURLConnection conn = null;
         try {
             JSONObject req = new JSONObject();

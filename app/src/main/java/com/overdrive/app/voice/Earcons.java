@@ -25,10 +25,17 @@ final class Earcons {
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final short[][] cache = new short[4][];
+    /** Dry engine (debug harness): cues keep their durations but make no sound. */
+    private volatile boolean silent;
+
+    void silence() {
+        silent = true;
+    }
 
     /** Plays a cue and returns its duration in ms so the caller can mute the mic meanwhile. */
     int play(int cue, String channel) {
         short[] pcm = pcmFor(cue);
+        if (silent) return pcm.length * 1000 / RATE;
         AudioTrack track = null;
         try {
             track = openTrack(channel, pcm.length * 2);

@@ -32,6 +32,10 @@ import java.util.concurrent.TimeUnit;
  * "slots": {...}}}}) turns the run into an accuracy check: every clip's dispatched intents are
  * compared with the manifest and the wrong, missed and extra actions are counted. Dispatch and
  * daemon-reply latencies come from the turn's wall-clock marks and are summarised at DONE.
+ * SAFE BY DEFAULT: the engine runs dry (no intent reaches the daemon, no media hold, no sound, no
+ * cloud session, no mic); what it would have done is logged per clip. {@code --ez allowCloud true}
+ * permits cloud sessions (their tools run in the daemon for real); {@code --ez allowActuation true}
+ * restores the live engine, which actuates the car.
  */
 public final class VoiceEngineHarnessReceiver extends BroadcastReceiver {
 
@@ -46,15 +50,25 @@ public final class VoiceEngineHarnessReceiver extends BroadcastReceiver {
         String tag = intent.getStringExtra("tag");
         float gainDb = intent.getFloatExtra("gainDb", 0f);
         String sub = intent.getStringExtra("dir");
+        boolean actuate = intent.getBooleanExtra("allowActuation", false);
+        boolean cloud = actuate || intent.getBooleanExtra("allowCloud", false);
         File dir = new File(app.getExternalFilesDir(null), sub == null ? "vh" : sub);
         Thread t = new Thread(() -> run(app, dir, mode == null ? "local" : mode,
-                tag == null ? "run" : tag, gainDb), "VoiceHarness");
+                tag == null ? "run" : tag, gainDb, actuate, cloud), "VoiceHarness");
         t.start();
     }
 
-    private static void run(Context app, File dir, String mode, String tag, float gainDb) {
+    private static void run(Context app, File dir, String mode, String tag, float gainDb, boolean actuate,
+                            boolean cloud) {
         File out = new File(dir, "results-" + tag + ".txt");
+        String banner = actuate
+                ? "ACTUATION MODE: intents run on the car, media is held, cues/prompts play, cloud sessions open"
+                : "DRY RUN: no intents, no media hold, no sound, no mic; cloud sessions "
+                        + (cloud ? "ON (their tool calls run in the daemon for real)" : "off (turns stay local)");
+        Log.w(TAG, "harness start (" + tag + "): " + banner);
+        DryLog dryLog = actuate ? null : new DryLog(cloud);
         try (PrintWriter w = new PrintWriter(new FileOutputStream(out))) {
+            w.println("# " + banner);
             VoiceAssistantConfig cfg = VoiceAssistantConfig.from(
                     new JSONObject().put("enabled", true).put("mode", mode));
             CountDownLatch ready = new CountDownLatch(1);
@@ -68,10 +82,15 @@ public final class VoiceEngineHarnessReceiver extends BroadcastReceiver {
                 @Override
                 public void onActivity() {
                 }
+
+                @Override
+                public VoiceEngine.DryRun dryRun() {
+                    return dryLog;
+                }
             });
             engine.start();
             if (!ready.await(30, TimeUnit.SECONDS)) throw new IllegalStateException("engine not ready");
-            AppAudioCaptureController.setWakeSink(null);
+            if (actuate) AppAudioCaptureController.setWakeSink(null);
             Thread.sleep(500);
             File[] files = dir.listFiles((d, name) -> name.endsWith(".wav"));
             if (files == null) files = new File[0];
@@ -102,6 +121,7 @@ public final class VoiceEngineHarnessReceiver extends BroadcastReceiver {
                 }
                 feeder.silence(3.0);
                 String line = f.getName() + " " + describe(before, after);
+                if (dryLog != null) line += dryLog.drain();
                 if (after != null && turnAt(after) != turnAt(before)) {
                     line += tally.measure(after.optJSONObject("lastTurn"),
                             expected == null ? null : expected.optJSONObject(f.getName()));
@@ -118,6 +138,34 @@ public final class VoiceEngineHarnessReceiver extends BroadcastReceiver {
             Log.i(TAG, "DONE " + tally.summary(expected != null));
         } catch (Throwable e) {
             Log.e(TAG, "harness failed", e);
+        }
+    }
+
+    /** What a dry engine would have done, drained into each clip's result line. */
+    private static final class DryLog implements VoiceEngine.DryRun {
+        private final boolean cloud;
+        private final List<String> actions = new ArrayList<>();
+
+        DryLog(boolean cloud) {
+            this.cloud = cloud;
+        }
+
+        @Override
+        public boolean allowCloud() {
+            return cloud;
+        }
+
+        @Override
+        public synchronized void wouldDo(String action) {
+            actions.add(action);
+            Log.i(TAG, "dry run, not done: " + action);
+        }
+
+        synchronized String drain() {
+            if (actions.isEmpty()) return "";
+            String s = " dry=[" + String.join("; ", actions) + "]";
+            actions.clear();
+            return s;
         }
     }
 

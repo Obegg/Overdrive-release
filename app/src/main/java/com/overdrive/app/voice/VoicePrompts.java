@@ -30,6 +30,12 @@ final class VoicePrompts {
 
     private final Context app;
     private MediaPlayer player;
+    /** Dry engine (debug harness): clips keep their durations but are never started. */
+    private boolean silent;
+
+    void silence() {
+        silent = true;
+    }
 
     VoicePrompts(Context context) {
         app = context.getApplicationContext();
@@ -72,6 +78,10 @@ final class VoicePrompts {
             mp.setDataSource(fd.getFileDescriptor(), fd.getStartOffset(), fd.getLength());
             mp.prepare();
             int duration = mp.getDuration();
+            if (silent) {
+                mp.release();
+                return Math.max(0, duration);
+            }
             mp.start();
             player = mp;
             return Math.max(0, duration);
