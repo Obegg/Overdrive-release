@@ -73,6 +73,19 @@
                     </div>
                 </div>
 
+                <!-- Dashboard exposure preference (applied by wgproxy on restart) -->
+                <div class="card" style="margin-bottom:12px;">
+                    <div class="card-body">
+                        <label>
+                            <input type="checkbox" id="wgExpose" disabled onchange="WG.setExpose(this)"
+                                   aria-describedby="wgExposeWarning wgExposeRestart">
+                            <span data-i18n="wireguard.expose_label">Dashboard reachable over WireGuard</span>
+                        </label>
+                        <div class="hint" id="wgExposeWarning" data-i18n="wireguard.expose_warning">Every peer that can reach the car's tunnel address can open the login page. Restrict access on the WireGuard server.</div>
+                        <div class="hint" id="wgExposeRestart" data-i18n="wireguard.expose_restart">This is the saved preference, not live reachability. Restart WireGuard on the car to apply changes.</div>
+                    </div>
+                </div>
+
                 <!-- Config -->
                 <div class="card">
                     <div class="card-header">
@@ -114,7 +127,7 @@
     <script src="../shared/auth.js?v=18"></script>
     <script src="../shared/core.js?v=31"></script>
     <script src="../shared/update-flow.js?v=6"></script>
-    <script src="../shared/wireguard.js?v=1"></script>
+    <script src="../shared/wireguard.js?v=2"></script>
     <script>
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');

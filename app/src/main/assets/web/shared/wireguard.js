@@ -8,6 +8,10 @@ var WG = {
     MAX_BYTES: 16 * 1024,
     refreshInterval: null,
     saving: false,
+    exposeSaving: false,
+    exposeEnabled: null,
+    refreshGeneration: 0,
+    refreshPending: false,
 
     init: function () {
         var self = this;
@@ -35,10 +39,19 @@ var WG = {
 
     refresh: function () {
         var self = this;
-        fetch('/api/wireguard')
-            .then(function (resp) { return resp.json(); })
-            .then(function (data) { self.render(data); })
-            .catch(function () { self.render(null); });
+        if (this.exposeSaving || this.refreshPending) return;
+        this.refreshPending = true;
+        var generation = ++this.refreshGeneration;
+        return fetch('/api/wireguard')
+            .then(function (resp) { return resp.ok ? resp.json() : null; })
+            .then(function (data) {
+                if (generation === self.refreshGeneration) self.render(data);
+            })
+            .catch(function () {
+                if (generation === self.refreshGeneration) self.render(null);
+            }).then(function () {
+                if (generation === self.refreshGeneration) self.refreshPending = false;
+            });
     },
 
     render: function (data) {
@@ -46,6 +59,7 @@ var WG = {
         var state = document.getElementById('wgState');
         var detail = document.getElementById('wgDetail');
         var delBtn = document.getElementById('wgDeleteBtn');
+        this.renderExpose(data);
         if (!dot || !state || !detail) return;
 
         if (!data) {
@@ -108,6 +122,47 @@ var WG = {
         state.textContent = text;
         // textContent with newlines + pre-line keeps user data out of innerHTML.
         detail.textContent = lines.join('\n');
+    },
+
+    renderExpose: function (data) {
+        var input = document.getElementById('wgExpose');
+        if (!input || this.exposeSaving) return;
+        this.exposeEnabled = data && typeof data.expose_dashboard === 'boolean'
+            ? data.expose_dashboard : null;
+        input.checked = this.exposeEnabled === true;
+        input.disabled = this.exposeEnabled === null;
+    },
+
+    setExpose: function (input) {
+        var self = this;
+        if (this.exposeSaving || this.exposeEnabled === null || input.disabled) return;
+        var enabled = input.checked;
+        if (enabled === this.exposeEnabled) return;
+        this.exposeSaving = true;
+        input.disabled = true;
+        // Invalidate any status request started before the preference changed.
+        ++this.refreshGeneration;
+        this.refreshPending = false;
+        return fetch('/api/wireguard/expose', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: enabled })
+        }).then(function (resp) {
+            return resp.json().then(function (result) {
+                if (!resp.ok || !result || !result.success || result.expose_dashboard !== enabled) {
+                    throw new Error((result && result.error) || self.T('errors.save_failed', 'Save failed'));
+                }
+                self.exposeEnabled = enabled;
+                self.toast(self.T('wireguard.expose_saved', 'Preference saved. Restart WireGuard on the car to apply it.'), 'success');
+            });
+        }).catch(function (error) {
+            self.toast(error.message || self.T('errors.save_failed', 'Save failed'), 'error');
+        }).then(function () {
+            self.exposeSaving = false;
+            input.checked = self.exposeEnabled === true;
+            // Re-enable only after a fresh, authoritative read.
+            return self.refresh();
+        });
     },
 
     bestPeer: function (status) {
